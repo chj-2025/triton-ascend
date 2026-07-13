@@ -11,6 +11,12 @@ from triton.compiler.compiler import ASTSource
 from triton.compiler.code_generator import ast_to_ttir
 from triton._C.libtriton import ir
 from triton._C.libtriton.ascend import ir as ascend_ir
+from triton.backends.ascend.compiler import (
+    _analyze_auto_simt_scope_features,
+    _estimate_auto_simt_scope_decision,
+    _is_whole_body_void_simt_scope,
+    _wrap_whole_body_void_simt_scope,
+)
 
 
 class Options:
@@ -92,6 +98,17 @@ def kernel_scope_disable_auto_sync(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr
         tl.store(out_ptr + i, result, mask=i < n)
 
 
+@triton.jit
+def kernel_scope_vector_mode_simt(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    """Test vector_mode SIMT annotation."""
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    with al.scope(vector_mode="simt"):
+        x = tl.load(x_ptr + i, mask=i < n)
+        y = tl.load(y_ptr + i, mask=i < n)
+        result = x + y
+        tl.store(out_ptr + i, result, mask=i < n)
+
+
 # ============== Pytest tests ==============
 
 
@@ -141,6 +158,83 @@ def test_scope_disable_auto_sync():
     assert "scope.scope" in mlir
     # Check for disable auto sync attribute
     assert "hivm.disable_auto_sync" in mlir
+
+
+def test_scope_vector_mode_simt():
+    """Test vector_mode='simt' generates the canonical vec_mode attr."""
+    mlir = compile_kernel(
+        kernel_scope_vector_mode_simt,
+        {"x_ptr": "*fp32", "y_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"},
+        {"BLOCK": 256},
+    )
+    assert "scope.scope" in mlir
+    assert "vec_mode" in mlir
+    assert "simt" in mlir
+
+
+def test_auto_simt_scope_cost_model_selects_rank2_gather_reduce():
+    ttir = """
+module {
+  tt.func public @rank2_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: !tt.ptr<f32>) {
+    %c0 = arith.constant 0 : i32
+    %0 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
+    %1 = tt.expand_dims %0 {axis = 1 : i32} : tensor<8xi32> -> tensor<8x1xi32>
+    %2 = tt.broadcast %1 : tensor<8x1xi32> -> tensor<8x8xi32>
+    %3 = tt.addptr %arg0, %2 : !tt.ptr<f32>, tensor<8x8xi32>
+    %4 = tt.load %3 : tensor<8x8x!tt.ptr<f32>>
+    %5 = arith.cmpf olt, %4, %4 : tensor<8x8xf32>
+    %6 = tt.broadcast %5 : tensor<8x8xi1> -> tensor<8x8xi1>
+    %7 = "tt.reduce"(%4) ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.reduce.return %sum : f32
+    }) : (tensor<8x8xf32>) -> tensor<8xf32>
+    %8 = tt.addptr %arg2, %0 : !tt.ptr<f32>, tensor<8xi32>
+    tt.store %8, %7 : tensor<8x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+    features = _analyze_auto_simt_scope_features(ttir)
+    decision = _estimate_auto_simt_scope_decision(features)
+    assert decision["eligible"]
+    assert decision["choose_simt"]
+
+
+def test_auto_simt_scope_cost_model_keeps_rank1_vector_kernel():
+    ttir = """
+module {
+  tt.func public @rank1_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+    %0 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
+    %1 = tt.addptr %arg0, %0 : !tt.ptr<f32>, tensor<128xi32>
+    %2 = tt.load %1 : tensor<128x!tt.ptr<f32>>
+    %3 = arith.addf %2, %2 : tensor<128xf32>
+    %4 = tt.addptr %arg1, %0 : !tt.ptr<f32>, tensor<128xi32>
+    tt.store %4, %3 : tensor<128x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+    features = _analyze_auto_simt_scope_features(ttir)
+    decision = _estimate_auto_simt_scope_decision(features)
+    assert not decision["choose_simt"]
+    assert decision["reason"] == "rank1_or_scalar_kernel"
+
+
+def test_auto_simt_scope_wraps_whole_body_as_void_simt_scope():
+    ttir = """
+module {
+  tt.func public @wrap_kernel(%arg0: !tt.ptr<f32>) {
+    %cst = arith.constant 0.000000e+00 : f32
+    %0 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
+    tt.return
+  }
+}
+"""
+    scoped = _wrap_whole_body_void_simt_scope(ttir)
+    assert "scope.scope : () -> ()" in scoped
+    assert 'vec_mode = "simt"' in scoped
+    assert _is_whole_body_void_simt_scope(scoped)
 
 
 # ============== Main for manual testing ==============

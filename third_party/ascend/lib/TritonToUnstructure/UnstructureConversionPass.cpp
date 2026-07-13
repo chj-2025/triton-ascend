@@ -34,6 +34,7 @@
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
@@ -55,6 +56,68 @@ constexpr int64_t kBitsPerByte = 8;
 
 static constexpr const char *kRouteDiscreteMaskToSimtAttrName =
     "route_discrete_mask_to_simt";
+
+static bool hasScopeVectorMode(Operation *op, llvm::StringRef mode)
+{
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (auto vecModeAttr = parent->getAttrOfType<StringAttr>("vec_mode")) {
+      return vecModeAttr.getValue() == mode;
+    }
+  }
+  return false;
+}
+
+static void stripConsumedSimtScopeAttrs(Operation *root)
+{
+  root->walk([](Operation *op) {
+    auto vecModeAttr = op->getAttrOfType<StringAttr>("vec_mode");
+    if (vecModeAttr && vecModeAttr.getValue() == "simt") {
+      op->removeAttr("vec_mode");
+    }
+  });
+}
+
+static void inlineConsumedSimtScopes(Operation *root)
+{
+  SmallVector<Operation *> scopeOps;
+  root->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "scope.scope") {
+      return;
+    }
+    auto vecModeAttr = op->getAttrOfType<StringAttr>("vec_mode");
+    if (vecModeAttr && vecModeAttr.getValue() == "simt") {
+      scopeOps.push_back(op);
+    }
+  });
+
+  IRRewriter rewriter(root->getContext());
+  for (Operation *scopeOp : llvm::reverse(scopeOps)) {
+    if (scopeOp->getNumRegions() != 1 ||
+        !llvm::hasSingleElement(scopeOp->getRegion(0))) {
+      scopeOp->removeAttr("vec_mode");
+      continue;
+    }
+
+    Block &body = scopeOp->getRegion(0).front();
+    Operation *terminator = body.getTerminator();
+    if (!terminator || terminator->getName().getStringRef() != "scope.return" ||
+        terminator->getNumOperands() != scopeOp->getNumResults()) {
+      scopeOp->removeAttr("vec_mode");
+      continue;
+    }
+
+    for (auto [result, operand] :
+         llvm::zip_equal(scopeOp->getResults(), terminator->getOperands())) {
+      result.replaceAllUsesWith(operand);
+    }
+
+    rewriter.setInsertionPoint(scopeOp);
+    rewriter.eraseOp(terminator);
+    rewriter.inlineBlockBefore(&body, scopeOp);
+    rewriter.eraseOp(scopeOp);
+  }
+}
 
 static RankedTensorType resolvePtrTensorType(Value ptr)
 {
@@ -434,6 +497,8 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
   auto ptr = op.getPtr();
   auto ptrType = resolvePtrTensorType(ptr);
   auto routeDiscreteMaskToSimt = op->hasAttr(kRouteDiscreteMaskToSimtAttrName);
+  bool scopeForcesSimt = hasScopeVectorMode(op, "simt");
+  bool scopeForcesSimd = hasScopeVectorMode(op, "simd");
 
   if (!ptrType || op->hasAttr(ConverterUtils::discreteAttrName))
     return failure();
@@ -506,12 +571,17 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
     os << "ptrOffsetInfo.isStructured: " << ptrOffsetInfo.isStructured() << "\n";
     os << "compileOn91095Flag: " << compileOn91095Flag << "\n";
     os << "forceSimtTemplateFlag: " << forceSimtTemplateFlag << "\n";
+    os << "scopeForcesSimt: " << scopeForcesSimt << "\n";
+    os << "scopeForcesSimd: " << scopeForcesSimd << "\n";
   });
 
   // SIMT Indirect Fast-Path Lowering in 950 seiries
+  bool simtFastPathRequested =
+      (forceSimtTemplateFlag || scopeForcesSimt) && !scopeForcesSimd;
   bool indirectFastPathEnabled =
-      compileOn91095Flag && forceSimtTemplateFlag &&
-      ((!ptrOffsetInfo.isStructured() && sizeInByte < 64) || routeDiscreteMaskToSimt);
+      compileOn91095Flag && simtFastPathRequested &&
+      ((!ptrOffsetInfo.isStructured() && sizeInByte < 64) ||
+       routeDiscreteMaskToSimt);
   bool rankWithinIndirectLoadStoreFastPathLimit = resultShape.size() <= 5;
   if (indirectFastPathEnabled &&
       succeeded(tryRewriteIndirectFastPath(op, loc, srcPtr, ptrOffset,
@@ -869,6 +939,9 @@ void TritonToUnstructurePass::runOnOperation() {
     moduleOp->emitError("failed to apply Patterns");
     signalPassFailure();
   }
+
+  inlineConsumedSimtScopes(moduleOp);
+  stripConsumedSimtScopeAttrs(moduleOp);
 
   PassManager pm(&getContext(), moduleOp.getOperationName());
   pm.addPass(createCSEPass());

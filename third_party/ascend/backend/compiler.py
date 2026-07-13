@@ -22,11 +22,12 @@ import ctypes
 import functools
 import hashlib
 import glob
+import json
 import os
 import re
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple, Union
@@ -143,6 +144,14 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
     # use triton_adapter to lower Triton-MLIR to linalg
     # Get Triton-MLIR as string
     ttir_code = str(mod)
+    ttir_code = _maybe_apply_auto_simt_scope(ttir_code, metadata, opt)
+    if metadata.get("compile_mode") == "simd_simt" and _is_whole_body_void_simt_scope(ttir_code):
+        metadata["scope_pure_simt_auto"] = True
+        metadata["force_simt_only"] = True
+        metadata["parallel_mode"] = "simt"
+        metadata["shared_mem_dynamic_size"] = 122880
+        return _inline_void_simt_scopes_for_pure_simt(ttir_code)
+
     auto_map_parallel_blocks_enabled = _is_auto_map_parallel_blocks_enabled()
     blacklist_reasons = []
     has_auto_blockify_blacklist_op = metadata.get("has_auto_blockify_blacklist_op")
@@ -222,7 +231,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             metadata["set_workspace_multibuffer"] = 0
             metadata["enable_mixed_cv"] = True
             metadata["disable_auto_inject_block_sync"] = True
-            ascend.passes.ttir.set_enable_cube_block_merge(metadata["enable_cube_block_merge"])
+            if hasattr(ascend.passes.ttir, "set_enable_cube_block_merge"):
+                ascend.passes.ttir.set_enable_cube_block_merge(metadata["enable_cube_block_merge"])
 
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
 
@@ -354,6 +364,440 @@ def _parse_ttir_metadata(ttir: str, metadata: dict):
     # Parse all tensor kinds from arguments
     metadata["tensor_kinds"] = [int(kind) for _, kind in re.findall(TENSOR_KIND_REGEX, ttir)]
     return metadata
+
+
+def _brace_delta(line: str) -> int:
+    return line.count("{") - line.count("}")
+
+
+def _is_allowed_top_level_constant(line: str) -> bool:
+    stripped = line.lstrip()
+    return stripped.startswith("%") and " = arith.constant " in stripped
+
+
+def _is_whole_body_void_simt_scope(ttir: str) -> bool:
+    """Return true when a kernel body is entirely wrapped by a void SIMT scope."""
+    in_func = False
+    depth = 0
+    scope_count = 0
+    saw_return = False
+
+    for line in ttir.splitlines():
+        stripped = line.strip()
+        if not in_func:
+            if "tt.func" in line and "{" in line:
+                in_func = True
+                depth = _brace_delta(line)
+            continue
+
+        if depth == 1:
+            if not stripped:
+                pass
+            elif stripped.startswith("}"):
+                pass
+            elif _is_allowed_top_level_constant(line):
+                pass
+            elif stripped.startswith("tt.return"):
+                saw_return = True
+            elif (
+                stripped.startswith("scope.scope")
+                and ": () -> ()" in stripped
+                and "{" in stripped
+            ):
+                scope_count += 1
+            else:
+                return False
+
+        depth += _brace_delta(line)
+        if in_func and depth <= 0:
+            return scope_count == 1 and saw_return and 'vec_mode = "simt"' in ttir
+
+    return False
+
+
+def _inline_void_simt_scopes_for_pure_simt(ttir: str) -> str:
+    """Inline void SIMT scopes before handing TTIR to the pure-SIMT compiler.
+
+    The pure-SIMT BiSheng pipeline consumes TTIR directly and does not run the
+    TritonToUnstructure pass that normally removes consumed SIMT scope markers.
+    Keep this intentionally narrow: only erase scope wrappers with no results,
+    because result-bearing scopes require SSA value remapping.
+    """
+    lines = ttir.splitlines()
+    out = []
+    i = 0
+    changed = False
+
+    while i < len(lines):
+        line = lines[i]
+        if "scope.scope" not in line or ": () -> ()" not in line or "{" not in line:
+            out.append(line)
+            i += 1
+            continue
+
+        depth = _brace_delta(line)
+        body = []
+        j = i + 1
+        close_line = None
+        while j < len(lines):
+            candidate = lines[j]
+            depth += _brace_delta(candidate)
+            if depth == 0:
+                close_line = candidate
+                break
+            body.append(candidate)
+            j += 1
+
+        if close_line is None or 'vec_mode = "simt"' not in close_line:
+            out.append(line)
+            i += 1
+            continue
+
+        for k in range(len(body) - 1, -1, -1):
+            if body[k].lstrip().startswith("scope.return"):
+                del body[k]
+                break
+        out.extend(body)
+        changed = True
+        i = j + 1
+
+    if not changed:
+        return ttir
+    return "\n".join(out) + ("\n" if ttir.endswith("\n") else "")
+
+
+def _normalize_auto_simt_scope_mode(mode: Optional[str]) -> str:
+    if mode is None:
+        return "off"
+    mode = str(mode).strip().lower()
+    if mode in ("1", "true", "on", "yes", "auto"):
+        return "auto"
+    if mode in ("report", "dry_run", "dry-run", "dump"):
+        return "report"
+    return "off"
+
+
+def _parse_float_env(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _extract_tensor_dims(text: str):
+    dims_list = []
+    for match in re.finditer(r"tensor<((?:\d+x)+)", text):
+        dims = [int(dim) for dim in match.group(1).rstrip("x").split("x") if dim]
+        if dims:
+            dims_list.append(dims)
+    return dims_list
+
+
+def _tensor_numel(dims):
+    numel = 1
+    for dim in dims:
+        numel *= dim
+    return numel
+
+
+def _count_regex(pattern: str, text: str) -> int:
+    return len(re.findall(pattern, text))
+
+
+def _analyze_auto_simt_scope_features(ttir: str) -> Dict[str, Any]:
+    lines = ttir.splitlines()
+    tensor_dims = []
+    ptr_tensor_ranks = []
+    mask_rank_sum = 0
+    mask_tensor_ops = 0
+    mask_broadcast_ops = 0
+    pointer_unstructured_dims = 0
+    lane_dependent_pointer_ops = 0
+    row_local_reduce_ops = 0
+
+    for line in lines:
+        dims_in_line = _extract_tensor_dims(line)
+        tensor_dims.extend(dims_in_line)
+
+        if "xi1" in line:
+            mask_tensor_ops += 1
+            for dims in dims_in_line:
+                mask_rank_sum += len(dims)
+            if "tt.broadcast" in line or "tt.expand_dims" in line:
+                mask_broadcast_ops += 1
+
+        if "!tt.ptr" in line and ("tt.addptr" in line or "tt.load" in line or "tt.store" in line):
+            max_ptr_rank_on_line = 0
+            for dims in dims_in_line:
+                rank = len(dims)
+                max_ptr_rank_on_line = max(max_ptr_rank_on_line, rank)
+                ptr_tensor_ranks.append(rank)
+                if rank > 1:
+                    pointer_unstructured_dims += rank
+            if max_ptr_rank_on_line > 1:
+                lane_dependent_pointer_ops += 1
+
+        if "tt.reduce" in line:
+            ranks = [len(dims) for dims in dims_in_line]
+            if ranks and max(ranks) > min(ranks):
+                row_local_reduce_ops += 1
+
+    max_tensor_rank = max((len(dims) for dims in tensor_dims), default=0)
+    max_tensor_numel = max((_tensor_numel(dims) for dims in tensor_dims), default=1)
+    load_ops = _count_regex(r"\btt\.load\b", ttir)
+    store_ops = _count_regex(r"\btt\.store\b", ttir)
+    reduce_ops = _count_regex(r"\btt\.reduce\b", ttir)
+    broadcast_ops = _count_regex(r"\btt\.broadcast\b", ttir)
+    expand_dims_ops = _count_regex(r"\btt\.expand_dims\b", ttir)
+    splat_ops = _count_regex(r"\btt\.splat\b", ttir)
+    addptr_ops = _count_regex(r"\btt\.addptr\b", ttir)
+    arith_ops = _count_regex(r"\barith\.", ttir)
+    math_ops = _count_regex(r"\bmath\.", ttir)
+    cmp_ops = _count_regex(r"\barith\.cmp[fi]\b", ttir)
+    select_ops = _count_regex(r"\barith\.select\b", ttir)
+    cast_ops = _count_regex(r"\barith\.(ext|trunc|sitofp|uitofp|fptosi|fptoui|index_cast)", ttir)
+
+    return {
+        "load_ops": load_ops,
+        "store_ops": store_ops,
+        "reduce_ops": reduce_ops,
+        "broadcast_ops": broadcast_ops,
+        "expand_dims_ops": expand_dims_ops,
+        "splat_ops": splat_ops,
+        "addptr_ops": addptr_ops,
+        "arith_ops": arith_ops,
+        "math_ops": math_ops,
+        "cmp_ops": cmp_ops,
+        "select_ops": select_ops,
+        "cast_ops": cast_ops,
+        "mask_tensor_ops": mask_tensor_ops,
+        "mask_rank_sum": mask_rank_sum,
+        "mask_broadcast_ops": mask_broadcast_ops,
+        "pointer_tensor_ops": len(ptr_tensor_ranks),
+        "pointer_unstructured_dims": pointer_unstructured_dims,
+        "lane_dependent_pointer_ops": lane_dependent_pointer_ops,
+        "row_local_reduce_ops": row_local_reduce_ops,
+        "max_tensor_rank": max_tensor_rank,
+        "max_tensor_numel": max_tensor_numel,
+        "has_dot": "tt.dot" in ttir,
+        "has_atomic": "tt.atomic_" in ttir or "tt.atomic" in ttir,
+        "has_explicit_scope": "scope.scope" in ttir,
+        "has_control_flow": "scf." in ttir or "cf." in ttir,
+    }
+
+
+def _estimate_auto_simt_scope_decision(features: Dict[str, Any], margin_ratio: float = 0.10) -> Dict[str, Any]:
+    memory_ops = features["load_ops"] + features["store_ops"]
+    scalar_ops = (
+        features["arith_ops"]
+        + features["math_ops"]
+        + features["cmp_ops"]
+        + features["select_ops"]
+        + features["cast_ops"]
+    )
+    shape_ops = features["broadcast_ops"] + features["expand_dims_ops"] + features["splat_ops"]
+    max_rank = features["max_tensor_rank"]
+    max_numel = features["max_tensor_numel"]
+
+    address_complexity = (
+        features["pointer_unstructured_dims"] * 24
+        + features["lane_dependent_pointer_ops"] * 96
+        + max(0, max_rank - 1) * features["addptr_ops"] * 16
+    )
+    mask_complexity = (
+        features["mask_tensor_ops"] * 8
+        + features["mask_rank_sum"] * 12
+        + features["mask_broadcast_ops"] * 96
+    )
+    reduction_complexity = features["reduce_ops"] * 64 + features["row_local_reduce_ops"] * max(1, max_rank) * 128
+    scalarization_risk = (
+        features["lane_dependent_pointer_ops"] * max(0, max_rank - 1) * 96
+        + features["mask_broadcast_ops"] * max(1, max_rank) * 64
+        + features["row_local_reduce_ops"] * max(1, max_rank) * 160
+        + features["pointer_unstructured_dims"] * 48
+    )
+
+    simd_base = memory_ops * max_numel + scalar_ops * max(1, max_numel // max(1, max_rank))
+    simd_cost = simd_base + address_complexity + mask_complexity + reduction_complexity + scalarization_risk
+    simt_cost = int(
+        memory_ops * max_numel * 1.25
+        + scalar_ops * max_numel * 0.55
+        + features["reduce_ops"] * max_numel * 0.90
+        + shape_ops * 16
+        + 180
+    )
+    boundary_cost = 160
+    margin = max(64, int(simd_cost * margin_ratio))
+    speedup_score = simd_cost - simt_cost - boundary_cost
+
+    eligible = (
+        max_rank >= 2
+        and memory_ops > 0
+        and features["store_ops"] > 0
+        and not features["has_dot"]
+        and not features["has_atomic"]
+        and not features["has_explicit_scope"]
+        and (
+            features["lane_dependent_pointer_ops"] > 0
+            or features["mask_broadcast_ops"] > 0
+            or features["row_local_reduce_ops"] > 0
+        )
+    )
+    choose_simt = eligible and speedup_score > margin
+    confidence = "none"
+    if choose_simt:
+        confidence = "high" if speedup_score > margin * 3 else "medium"
+    elif eligible:
+        confidence = "low"
+
+    return {
+        "eligible": eligible,
+        "choose_simt": choose_simt,
+        "simd_cost": int(simd_cost),
+        "simt_cost": int(simt_cost),
+        "boundary_cost": boundary_cost,
+        "margin": margin,
+        "speedup_score": int(speedup_score),
+        "confidence": confidence,
+        "reason": _auto_simt_scope_reason(features, eligible, choose_simt, speedup_score, margin),
+    }
+
+
+def _auto_simt_scope_reason(features: Dict[str, Any], eligible: bool, choose_simt: bool, score: float, margin: float) -> str:
+    if features["has_explicit_scope"]:
+        return "explicit_scope_present"
+    if features["has_dot"]:
+        return "dot_not_supported_by_auto_scope"
+    if features["has_atomic"]:
+        return "atomic_not_supported_by_auto_scope"
+    if features["max_tensor_rank"] < 2:
+        return "rank1_or_scalar_kernel"
+    if features["store_ops"] == 0:
+        return "no_store_op"
+    if not eligible:
+        return "no_unstructured_pointer_mask_or_reduce_risk"
+    if choose_simt:
+        return "simt_cost_lower_than_simd_with_margin"
+    return f"score_below_margin:{int(score)}<={int(margin)}"
+
+
+def _wrap_whole_body_void_simt_scope(ttir: str) -> str:
+    if "scope.scope" in ttir:
+        return ttir
+
+    lines = ttir.splitlines()
+    out = []
+    in_func = False
+    depth = 0
+    wrapped = False
+    body = []
+    constants = []
+    return_line = None
+    func_body_indent = "  "
+
+    for line in lines:
+        if not in_func:
+            out.append(line)
+            if "tt.func" in line and "{" in line:
+                in_func = True
+                depth = _brace_delta(line)
+            continue
+
+        stripped = line.strip()
+        if depth == 1 and stripped.startswith("}"):
+            if body and return_line is not None:
+                out.extend(constants)
+                out.append(f"{func_body_indent}scope.scope : () -> () {{")
+                out.extend(body)
+                out.append(f"{func_body_indent}  scope.return")
+                out.append(f'{func_body_indent}}} {{vec_mode = "simt"}}')
+                out.append(return_line)
+                wrapped = True
+            else:
+                out.extend(constants)
+                out.extend(body)
+                if return_line is not None:
+                    out.append(return_line)
+            out.append(line)
+            in_func = False
+            depth += _brace_delta(line)
+            continue
+
+        if depth == 1:
+            if not stripped:
+                constants.append(line)
+            elif _is_allowed_top_level_constant(line):
+                constants.append(line)
+            elif stripped.startswith("tt.return"):
+                return_line = line
+            else:
+                if not body:
+                    indent_match = re.match(r"^(\s*)", line)
+                    if indent_match:
+                        func_body_indent = indent_match.group(1)
+                body.append(line)
+        else:
+            body.append(line)
+
+        depth += _brace_delta(line)
+
+    if not wrapped:
+        return ttir
+    return "\n".join(out) + ("\n" if ttir.endswith("\n") else "")
+
+
+def _dump_auto_simt_scope_report(report: Dict[str, Any], dump_path: str):
+    if not dump_path:
+        return
+    try:
+        path = Path(dump_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(report, sort_keys=True) + "\n")
+    except OSError as exc:
+        if os.environ.get("TRITON_ASCEND_AUTO_SIMT_SCOPE_VERBOSE"):
+            print(f"[auto-simt-scope] failed to dump report to {dump_path}: {exc}")
+
+
+def _maybe_apply_auto_simt_scope(ttir: str, metadata: dict, opt) -> str:
+    mode = _normalize_auto_simt_scope_mode(getattr(opt, "auto_simt_scope_mode", ""))
+    if mode == "off":
+        return ttir
+    if metadata.get("compile_mode") != "simd_simt":
+        return ttir
+
+    margin_ratio = getattr(opt, "auto_simt_scope_margin", 0.10)
+    try:
+        margin_ratio = float(margin_ratio)
+    except (TypeError, ValueError):
+        margin_ratio = 0.10
+
+    features = _analyze_auto_simt_scope_features(ttir)
+    decision = _estimate_auto_simt_scope_decision(features, margin_ratio)
+    kernel_match = re.search(r"tt\.func\spublic\s+@(\w+)", ttir)
+    report = {
+        "kernel_name": kernel_match.group(1) if kernel_match else metadata.get("kernel_name", "<unknown>"),
+        "mode": mode,
+        "features": features,
+        "decision": decision,
+    }
+    metadata["auto_simt_scope_report"] = report
+    _dump_auto_simt_scope_report(report, getattr(opt, "auto_simt_scope_dump", ""))
+
+    if mode != "auto" or not decision["choose_simt"]:
+        return ttir
+
+    scoped_ttir = _wrap_whole_body_void_simt_scope(ttir)
+    if scoped_ttir == ttir:
+        decision["choose_simt"] = False
+        decision["reason"] = "failed_to_wrap_whole_body_scope"
+        return ttir
+
+    metadata["auto_simt_scope_applied"] = True
+    return scoped_ttir
 
 
 def get_common_bishengir_compile_options(metadata):
@@ -983,7 +1427,7 @@ class NPUOptions:
     # enable_bishengir_simt_optimization is passed as
     # -enable-bishengir-simt-optimization flag to bishengir-compile.
     enable_bishengir_simt_optimization: int = 000
-    # compile_mode: "simd" (default), "unstructured_in_simt", "simt_only"
+    # compile_mode: "simd" (default), "unstructured_in_simt", "simd_simt", "simt_only"
     # When compile_mode is provided, it automatically sets other fields
     compile_mode: str = "unstructured_in_simt"
     mix_mode: str = ""
@@ -991,6 +1435,11 @@ class NPUOptions:
     # take effect on the reorder instruction pattern for SIMT. The pattern is disabled by default.
     enable_simt_reorder_instruction: bool = False
     enable_costmodel_backend: bool = False
+    # TRITON_ASCEND_AUTO_SIMT_SCOPE=off|report|auto controls the lightweight
+    # TTIR cost model that can wrap profitable whole-body kernels in SIMT scope.
+    auto_simt_scope_mode: str = ""
+    auto_simt_scope_dump: str = ""
+    auto_simt_scope_margin: float = 0.10
     # disable simt fma optimization to get high precision
     disable_fma: bool = False
 
@@ -998,12 +1447,32 @@ class NPUOptions:
     superblock_factor: int = 1
 
     def __post_init__(self):
+        auto_simt_mode = self.auto_simt_scope_mode or os.environ.get("TRITON_ASCEND_AUTO_SIMT_SCOPE", "")
+        object.__setattr__(self, "auto_simt_scope_mode", _normalize_auto_simt_scope_mode(auto_simt_mode))
+        auto_simt_dump = self.auto_simt_scope_dump or os.environ.get("TRITON_ASCEND_AUTO_SIMT_SCOPE_DUMP", "")
+        object.__setattr__(self, "auto_simt_scope_dump", auto_simt_dump)
+        auto_simt_margin = (
+            self.auto_simt_scope_margin
+            if self.auto_simt_scope_margin is not None
+            else _parse_float_env("TRITON_ASCEND_AUTO_SIMT_SCOPE_MARGIN", 0.10)
+        )
+        if os.environ.get("TRITON_ASCEND_AUTO_SIMT_SCOPE_MARGIN"):
+            auto_simt_margin = _parse_float_env("TRITON_ASCEND_AUTO_SIMT_SCOPE_MARGIN", 0.10)
+        try:
+            auto_simt_margin = float(auto_simt_margin)
+        except (TypeError, ValueError):
+            auto_simt_margin = 0.10
+        object.__setattr__(self, "auto_simt_scope_margin", auto_simt_margin)
+
         # Parse compile_mode and set related fields
         if self.compile_mode == "simd":
             object.__setattr__(self, "parallel_mode", "simd")
         elif self.compile_mode == "unstructured_in_simt":
             # For historical compatibility reasons, force_simt_template will still be used.
             object.__setattr__(self, "force_simt_template", True)
+        elif self.compile_mode == "simd_simt":
+            object.__setattr__(self, "force_simt_template", True)
+            object.__setattr__(self, "parallel_mode", "mix_simd_simt")
         elif self.compile_mode == "simt_only":
             object.__setattr__(self, "force_simt_only", True)
             object.__setattr__(self, "parallel_mode", "simt")
@@ -1032,6 +1501,11 @@ class AscendAttrsDescriptor(AttrsDescriptor):
 def ttir_to_npubin(mod, metadata, opt):
     # Get Triton-MLIR as string
     ttir_code = str(mod)
+    if opt.force_simt_only:
+        metadata["force_simt_only"] = True
+        metadata["parallel_mode"] = "simt"
+        metadata["shared_mem_dynamic_size"] = opt.shared_mem_dynamic_size
+        ttir_code = _inline_void_simt_scopes_for_pure_simt(ttir_code)
     metadata = _parse_ttir_metadata(ttir_code, metadata)
     with tempfile.TemporaryDirectory() as tmpdir:
         # prepare input
@@ -1169,17 +1643,24 @@ class AscendBackend(BaseBackend):
             stages["ttadapter"] = lambda src, metadata: ttir_to_linalg(
                 src, metadata, options, named_ops=True
             )
+            def make_scope_aware_npubin(compile_linalg):
+                def scope_aware_npubin(src, metadata):
+                    if metadata.get("scope_pure_simt_auto", False):
+                        pure_options = replace(options)
+                        object.__setattr__(pure_options, "force_simt_only", True)
+                        object.__setattr__(pure_options, "parallel_mode", "simt")
+                        object.__setattr__(pure_options, "shared_mem_dynamic_size", 122880)
+                        return ttir_to_npubin(src, metadata, pure_options)
+                    return compile_linalg(src, metadata, options)
+                return scope_aware_npubin
+
             if options.compile_on_910_95:
-                stages["npubin"] = (
-                    lambda src, metadata: linalg_to_bin_enable_npu_compile_910_95(
-                        src, metadata, options
-                    )
+                stages["npubin"] = make_scope_aware_npubin(
+                    linalg_to_bin_enable_npu_compile_910_95
                 )
             else:
-                stages["npubin"] = (
-                    lambda src, metadata: linalg_to_bin_enable_npu_compile_A2_A3(
-                        src, metadata, options
-                    )
+                stages["npubin"] = make_scope_aware_npubin(
+                    linalg_to_bin_enable_npu_compile_A2_A3
                 )
         else:
             raise NotImplementedError(

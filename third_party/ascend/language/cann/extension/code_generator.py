@@ -93,6 +93,13 @@ def _handle_core_mode_attr(builder, core_mode):
     }
 
 
+def _handle_vector_mode_attr(builder, vector_mode):
+    """Handle vector_mode attribute conversion."""
+    if vector_mode not in ("simd", "simt"):
+        raise ValueError(f'vector_mode must be "simd" or "simt", got {vector_mode!r}')
+    return {"vec_mode": builder.get_str_attr(vector_mode)}
+
+
 def _build_mlir_attrs_from_scope_attrs(builder, scope_attrs):
     """Convert Python scope attributes to MLIR attributes.
     
@@ -103,10 +110,21 @@ def _build_mlir_attrs_from_scope_attrs(builder, scope_attrs):
     Returns:
         Dict of MLIR attributes
     """
+    scope_attrs = dict(scope_attrs)
+    if "vector_mode" in scope_attrs and "vec_mode" in scope_attrs:
+        if scope_attrs["vector_mode"] != scope_attrs["vec_mode"]:
+            raise ValueError("vector_mode and vec_mode cannot specify different values")
+    if "vector_mode" in scope_attrs:
+        scope_attrs["vec_mode"] = scope_attrs.pop("vector_mode")
+    if scope_attrs.get("core_mode") == "cube" and "vec_mode" in scope_attrs:
+        raise ValueError('vector_mode cannot be set when core_mode="cube"')
+
     mlir_attrs = {"noinline": builder.get_unit_attr()}
     for k, v in scope_attrs.items():
         if k == "core_mode":
             mlir_attrs.update(_handle_core_mode_attr(builder, v))
+        elif k == "vec_mode":
+            mlir_attrs.update(_handle_vector_mode_attr(builder, v))
         elif k == "noinline":
             if not v:
                 mlir_attrs.pop("noinline")
@@ -206,4 +224,3 @@ def handle_scope_with(generator, node):
     for i, name in enumerate(names):
         generator.set_value(name, _reconstruct_value_from_ir(language, scope_op.get_result(i), ret_types[i]))
     return None
-
