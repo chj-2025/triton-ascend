@@ -349,6 +349,47 @@ def __get_metadata_attr_by_callback(lib, postfix: str, metadata, meta_key: str):
         metadata[meta_key] = callback_func()
 
 
+# Mapping from vf_mode enum value to parallel_mode string.
+# vf_mode is inferred by InferVFModePass during bishengir-compile
+#   0 = SIMD, 1 = SIMT, 2 = MIX
+_VF_MODE_TO_PARALLEL_MODE = {
+    0: "simd",
+    1: "simt",
+    2: "mix_simd_simt",
+}
+
+
+def _adjust_parallel_mode_by_vf_mode(metadata: dict):
+    """
+    Override metadata['parallel_mode'] with the value derived from vf_mode.
+
+    Background: parallel_mode is initially extracted from Linalg IR text by
+    _parse_linalg_metadata (value set by TritonToLinalgPass in the frontend);
+    vf_mode is inferred by bishengir-compile's InferVFModePass in the backend
+    based on the complete HIVM IR. The backend judgement is more precise, so
+    once vf_mode is read via callback, it is used to override parallel_mode.
+
+    - No 'vf_mode' key in metadata: keep original parallel_mode unchanged
+    - vf_mode value is None: keep original parallel_mode unchanged
+    - vf_mode value out of {0, 1, 2}: keep original parallel_mode and warn
+    - vf_mode value is valid: override parallel_mode with the mapped value
+    """
+    vf_mode = metadata.get("vf_mode", None)
+    if vf_mode is None:
+        return
+
+    new_parallel_mode = _VF_MODE_TO_PARALLEL_MODE.get(vf_mode)
+    if new_parallel_mode is None:
+        print(f"[WARN] Unexpected vf_mode={vf_mode}, keep parallel_mode="
+              f"{metadata.get('parallel_mode', 'simd')!r}")
+        return
+
+    old_parallel_mode = metadata.get("parallel_mode", None)
+    print(f"[DEBUG] vf_mode={vf_mode}, parallel_mode: {old_parallel_mode!r} -> "
+          f"{new_parallel_mode!r}")
+    metadata["parallel_mode"] = new_parallel_mode
+
+
 def _parse_linalg_metadata(linalg: str, metadata: dict):
     """
     Parse Linalg IR to extract metadata required for NPU compilation.
@@ -737,6 +778,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             __get_metadata_attr_by_callback(lib, "_infer_workspace_shape_function", metadata, "workspace_size")
             __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata, "lock_num")
             __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_init_function", metadata, "lock_init_val")
+            __get_metadata_attr_by_callback(lib, "_infer_vf_mode_function", metadata, "vf_mode")
+            _adjust_parallel_mode_by_vf_mode(metadata)
 
         return Path(bin_path).read_bytes()
 
