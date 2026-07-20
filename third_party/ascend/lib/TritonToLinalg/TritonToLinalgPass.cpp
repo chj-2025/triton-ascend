@@ -850,9 +850,10 @@ static bool isSIMTOp(Operation *op) {
   }
 
   return isa<triton::ascend::IndexPutOp, triton::ascend::GatherOutToUbOp,
-             triton::ascend::ScatterUbToOutOp, triton::ascend::IndirectLoadOp,
-             triton::ascend::StrideLoadOp, triton::ascend::StrideStoreOp,
-             triton::ascend::IndirectStoreOp>(op);
+             triton::ascend::ScatterUbToOutOp,
+             triton::ascend::UnstructuredLoadOp,
+             triton::ascend::UnstructuredStoreOp,
+             triton::ascend::StrideLoadOp, triton::ascend::StrideStoreOp>(op);
 }
 
 TritonTypeConverter::TritonTypeConverter() {
@@ -1601,10 +1602,12 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::IntToPtrConverter>(typeConverter,
                                                   patterns.getContext());
 
-  patterns.add<TTOpConverters::IndirectLoadConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::UnstructuredLoadConverter>(
+      patterns.getContext());
+  patterns.add<TTOpConverters::UnstructuredStoreConverter>(
+      patterns.getContext());
   patterns.add<TTOpConverters::StrideLoadConverter>(patterns.getContext());
   patterns.add<TTOpConverters::StrideStoreConverter>(patterns.getContext());
-  patterns.add<TTOpConverters::IndirectStoreConverter>(patterns.getContext());
   patterns.add<TTOpConverters::GatherOutToUbConverter>(patterns.getContext());
   patterns.add<TTOpConverters::ScatterUbToOutConverter>(patterns.getContext());
   patterns.add<TTOpConverters::IndexSelectSimdConverter>(patterns.getContext());
@@ -1745,7 +1748,7 @@ LogicalResult TritonToLinalgPass::processStridedLoadStoreRewriteOperations(
   // The strided-axis rewrites below only apply in 950 SIMT mode. On other
   // targets we leave strided loads to the legacy strided DMA lowering.
   if (!(compileOn91095Flag &&
-        triton::ascend::isSimtTemplateMode(compileModeFlag))) {
+        compileModeFlag == triton::ascend::CompileMode::SimdSimtTemplate)) {
     return success();
   }
 
@@ -1857,9 +1860,10 @@ void TritonToLinalgPass::runOnOperation() {
 
   // NOTE: existSIMTOp is intentionally computed AFTER
   // processStridedLoadStoreRewriteOperations below, because that step
-  // materializes triton::ascend::IndirectLoadOp/IndirectStoreOp (which
-  // isSIMTOp() counts). Walking here (before the rewrite) would miss them and
-  // mislabel the kernel parallel_mode as "simd" instead of "mix_simd_simt";
+  // materializes triton::ascend::UnstructuredLoadOp/UnstructuredStoreOp
+  // (which isSIMTOp() counts). Walking here (before the rewrite) would miss
+  // them and mislabel the kernel parallel_mode as "simd" instead of
+  // "mix_simd_simt";
   // then enable_simt would be false and the launch would not reserve
   // localMemorySize for the SIMT templates -> VEC UB out-of-bounds (error 341)
   // at runtime on mix-CV kernels.
@@ -1877,19 +1881,20 @@ void TritonToLinalgPass::runOnOperation() {
     signalPassFailure();
   }
 
-  // SIMT IndirectLoad fast-path rewrite (runs after ImplicitPermute so the
+  // SIMT strided-access fast-path rewrite (runs after ImplicitPermute so the
   // permuted access patterns have already been absorbed; this step only
-  // catches non-permuted last-axis stride > 1 loads).
+  // catches non-permuted last-axis stride > 1 accesses).
   if (failed(processStridedLoadStoreRewriteOperations(moduleOp))) {
     LLVM_DEBUG({
-      llvm::dbgs() << "Failed to process indirect-load rewrite operations\n";
+      llvm::dbgs() << "Failed to process strided-access rewrite operations\n";
     });
     signalPassFailure();
   }
 
-  // Detect SIMT ops AFTER the indirect-load rewrite so the freshly materialized
-  // IndirectLoadOp/IndirectStoreOp are counted (drives parallel_mode ->
-  // "mix_simd_simt" -> enable_simt -> launch reserves localMemorySize).
+  // Detect SIMT ops AFTER the strided-access rewrite so the freshly
+  // materialized UnstructuredLoadOp/UnstructuredStoreOp are counted (drives
+  // parallel_mode -> "mix_simd_simt" -> enable_simt -> launch reserves
+  // localMemorySize).
   moduleOp.walk([&](Operation *op) {
     if (isSIMTOp(op)) {
       existSIMTOp = true;

@@ -558,8 +558,8 @@ static WritePointerInfo getKnownWritePointer(Operation *op) {
       .Case<triton::AtomicCASOp>([](auto atomicOp) {
         return WritePointerInfo{true, getRootPointer(atomicOp.getPtr())};
       })
-      .Case<triton::ascend::IndirectStoreOp>([](auto storeOp) {
-        return WritePointerInfo{true, getRootPointer(storeOp.getSrc())};
+      .Case<triton::ascend::UnstructuredStoreOp>([](auto storeOp) {
+        return WritePointerInfo{true, getRootPointer(storeOp.getBase())};
       })
       .Default([](Operation *) { return WritePointerInfo{}; });
 }

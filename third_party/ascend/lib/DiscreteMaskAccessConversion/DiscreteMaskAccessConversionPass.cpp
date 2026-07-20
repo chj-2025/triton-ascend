@@ -486,7 +486,16 @@ struct DiscreteMaskStoreConversion : OpRewritePattern<triton::StoreOp> {
     bool rankWithinIndirectFastPathLimit =
         ptrType && ptrType.getShape().size() <= 5;
     if (compileOn91095Flag &&
-        triton::ascend::isSimtTemplateMode(compileModeFlag) &&
+        compileModeFlag == triton::ascend::CompileMode::SimdSimt) {
+      rewriter.modifyOpInPlace(op, [&]() {
+        op->setAttr(ConverterUtils::mixCompileDiscreteMaskAttrName,
+                    rewriter.getUnitAttr());
+      });
+      return success();
+    }
+
+    if (compileOn91095Flag &&
+        compileModeFlag == triton::ascend::CompileMode::SimdSimtTemplate &&
         rankWithinIndirectFastPathLimit) {
       op->setAttr(ConverterUtils::mixCompileDiscreteMaskAttrName,
                   rewriter.getUnitAttr());
@@ -573,7 +582,16 @@ struct DiscreteMaskLoadConversion : OpRewritePattern<triton::LoadOp> {
     bool rankWithinIndirectFastPathLimit =
         ptrType && ptrType.getShape().size() <= 5;
     if (compileOn91095Flag &&
-        triton::ascend::isSimtTemplateMode(compileModeFlag) &&
+        compileModeFlag == triton::ascend::CompileMode::SimdSimt) {
+      rewriter.modifyOpInPlace(op, [&]() {
+        op->setAttr(ConverterUtils::mixCompileDiscreteMaskAttrName,
+                    rewriter.getUnitAttr());
+      });
+      return success();
+    }
+
+    if (compileOn91095Flag &&
+        compileModeFlag == triton::ascend::CompileMode::SimdSimtTemplate &&
         rankWithinIndirectFastPathLimit) {
       op->setAttr(ConverterUtils::mixCompileDiscreteMaskAttrName,
                   rewriter.getUnitAttr());
