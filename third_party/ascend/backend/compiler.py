@@ -353,8 +353,14 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         # Select analysis is a fixed lowering policy, not a user compile option.
         enable_select_analysis = True
         compile_on_910_95 = metadata["compile_on_910_95"]
-        compile_mode = opt.compile_mode
-        metadata["compile_mode"] = compile_mode
+        force_simt_template = metadata["force_simt_template"]
+        compile_mode = _validate_compile_mode(metadata.get("compile_mode", "simd"))
+        if force_simt_template:
+            compile_mode = "simd_simt_template"
+        enable_sync_block_lock = metadata["enable_sync_block_lock"]
+        enable_mask_fallback_conversion = metadata["enable_mask_fallback_conversion"]
+        optimize_dynamic_offset = metadata["optimize_dynamic_offset"]
+        auto_blockify_size = metadata["auto_blockify_size"]
         enable_mixed_cv = metadata.get("enable_mixed_cv")
         disable_auto_inject_block_sync = metadata.get("disable_auto_inject_block_sync")
         set_workspace_multibuffer = metadata.get("set_workspace_multibuffer")
@@ -908,6 +914,15 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
+        compile_mode = _validate_compile_mode(metadata.get("compile_mode", "simd"))
+        if compile_mode == "simd_simt":
+            _compile_option_list += ["--enable-simd-simt-mix-compile"]
+            num_warps = metadata.get("num_warps", opt.num_warps)
+            _compile_option_list += [f"--num-warps={num_warps}"]
+            warp_size = metadata.get("warp_size", opt.warp_size)
+            _compile_option_list += [f"--threads-per-warp={warp_size}"]
+
+        cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
         vf_merge_level = metadata["vf_merge_level"]
         if vf_merge_level is not None:
             _compile_option_list += [f"--enable-vf-merge-level={vf_merge_level}"]
@@ -1180,42 +1195,21 @@ def get_libdevice():
     return os.path.join(current, "lib/libdevice.10.bc")
 
 
-def _is_a5_target_arch(arch: str) -> bool:
-    return isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950"))
+VALID_COMPILE_MODES = (
+    "simd",
+    "simd_simt",
+    "simd_simt_template",
+    "simt_template",
+    "unstructured_in_simt",
+    "simt_only",
+)
 
 
-def _get_libdevice_compile_state(arch: str) -> tuple[bool, bool]:
-    return (
-        bool(os.getenv("TRITON_ENABLE_LIBDEVICE", False)),
-        bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and _is_a5_target_arch(arch),
-    )
-
-
-_CANONICAL_COMPILE_MODES = ("simd", "simd_simt_template", "simt_only")
-_COMPILE_MODE_ALIASES = {
-    "unstructured_in_simt": "simd_simt_template",
-}
-
-
-def _normalize_compile_mode(compile_mode, arch: str) -> str:
-    """Validate and canonicalize the public compile-mode contract.
-
-    ``simd_simt_template`` is the portable default: it retains the ordinary
-    SIMD pipeline on A2/A3 and enables the existing template-SIMT subpaths on
-    Ascend 950.  ``unstructured_in_simt`` is an equivalent spelling of that mode.
-    Pure-SIMT remains an Ascend 950-only explicit compile mode.
-    """
-    if not isinstance(compile_mode, str):
-        raise ValueError("compile_mode must be a string; expected one of: " + ", ".join(_CANONICAL_COMPILE_MODES))
-
-    canonical_mode = _COMPILE_MODE_ALIASES.get(compile_mode, compile_mode)
-    if canonical_mode not in _CANONICAL_COMPILE_MODES:
-        raise ValueError(f"invalid compile_mode={compile_mode!r}; expected one of: " +
-                         ", ".join(_CANONICAL_COMPILE_MODES))
-
-    if canonical_mode == "simt_only" and not _is_a5_target_arch(arch):
-        raise ValueError('compile_mode="simt_only" is supported only on Ascend 950 targets.')
-    return canonical_mode
+def _validate_compile_mode(compile_mode):
+    if compile_mode not in VALID_COMPILE_MODES:
+        valid_modes = ", ".join(VALID_COMPILE_MODES)
+        raise ValueError(f"Invalid compile_mode={compile_mode!r}. Expected one of: {valid_modes}.")
+    return compile_mode
 
 
 @dataclass(frozen=True)
@@ -1414,8 +1408,6 @@ class NPUOptions:
         if self.is_pure_simt:
             if self.shared_mem_dynamic_size is None:
                 object.__setattr__(self, "shared_mem_dynamic_size", 122880)
-        else:
-            object.__setattr__(self, "shared_mem_dynamic_size", 221184)
 
     def hash(self):
         key = "_".join([f"{name}-{val}" for name, val in self.__dict__.items()])

@@ -1,9 +1,12 @@
 // RUN: triton-opt --discrete-mask-access-conversion --split-input-file %s | FileCheck %s
+// RUN: triton-opt '--discrete-mask-access-conversion=compile-on-910-95=true compile-mode=simd_simt' '--triton-to-unstructure=compile-on-910-95=true compile-mode=simd_simt' --split-input-file %s | FileCheck %s --check-prefix=MIX
 
 // CHECK-LABEL: tt.func @discrete_load
 // CHECK: %[[loaded_value:.*]] = tt.load %[[load_ptr:.*]]
 // CHECK: %[[value:.*]] = arith.select %[[mask:.*]], %[[loaded_value]], %[[other:.*]]
 // CHECK: tt.store %[[store_ptr:.*]], %[[value]]
+// MIX-LABEL: tt.func @discrete_load
+// MIX: ascend.unstructured_load{{.*}}unstructured_dims = []
 tt.func @discrete_load(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>) {
   %cst = arith.constant dense<0> : tensor<1024xi32>
   %cst_0 = arith.constant dense<200> : tensor<1024xi32>
@@ -48,6 +51,8 @@ tt.func @discrete_load_without_other(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>) {
 // CHECK: %[[origin_value:.*]] = tt.load %[[store_ptr:.*]] : tensor<1024x!tt.ptr<i32>>
 // CHECK: %[[store_value:.*]] = arith.select %[[mask:.*]], %[[loaded_value]], %[[origin_value]]
 // CHECK: tt.store %[[store_ptr]], %[[store_value]]
+// MIX-LABEL: tt.func @discrete_store
+// MIX: ascend.unstructured_store{{.*}}unstructured_dims = []
 tt.func @discrete_store(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>) {
   %cst = arith.constant dense<0> : tensor<1024xi32>
   %cst_0 = arith.constant dense<200> : tensor<1024xi32>

@@ -24,6 +24,9 @@ __all__ = ["scope"]
 
 from triton.language.core import _unwrap_if_constexpr
 
+_VALID_CORE_MODES = ("cube", "vector")
+_VALID_VEC_MODES = ("simd", "simt")
+
 
 class scope:
     """
@@ -35,21 +38,29 @@ class scope:
         ``"vector"``.
     """
 
-    def __init__(self, core_mode: str, _builder=None, _semantic=None, **kwargs):
+    def __init__(self, core_mode: str = None, _builder=None, _semantic=None, vec_mode: str = None, **kwargs):
         """
-        :param core_mode: Either "cube" or "vector" to specify the core type
+        :param core_mode: Either "cube" or "vector" to specify the core type (optional)
+        :param vec_mode: Either "simd" or "simt" to select the vector path (optional)
         :param _builder: Internal builder object (set by code_generator)
         :param _semantic: Internal semantic object (set by code_generator)
         :param kwargs: Additional internal parameters
         """
         # Convert constexpr to value if not being called from code generator
         self.core_mode = _unwrap_if_constexpr(core_mode) if _builder is None else core_mode
+        self.vec_mode = _unwrap_if_constexpr(vec_mode) if _builder is None else vec_mode
         self._builder = _builder
         self._semantic = _semantic
 
         # Validate core_mode
-        if self.core_mode not in ("cube", "vector"):
-            raise ValueError(f'core_mode must be "cube" or "vector", got {self.core_mode}')
+        if self.core_mode is not None and self.core_mode not in _VALID_CORE_MODES:
+            raise ValueError(f'core_mode must be one of {_VALID_CORE_MODES}, got {self.core_mode!r}')
+        if self.vec_mode is not None and self.vec_mode not in _VALID_VEC_MODES:
+            raise ValueError(f'vec_mode must be one of {_VALID_VEC_MODES}, got {self.vec_mode!r}')
+        if self.core_mode == "cube" and self.vec_mode is not None:
+            raise ValueError('vec_mode cannot be set when core_mode="cube"')
+        if self.core_mode is None and self.vec_mode is None and not kwargs:
+            raise ValueError("scope requires at least one annotation")
 
     def __enter__(self):
         if self._builder is None:

@@ -111,22 +111,26 @@ namespace ascend {
 // unknown string into SIMD.
 enum class CompileMode {
   Simd,
-  SimtTemplate,
+  SimdSimt,
+  SimdSimtTemplate,
   SimtOnly,
 };
 
 inline std::optional<CompileMode> parseCompileMode(llvm::StringRef mode) {
   if (mode == "simd")
     return CompileMode::Simd;
-  if (mode == "simd_simt_template" || mode == "unstructured_in_simt")
-    return CompileMode::SimtTemplate;
+  if (mode == "simd_simt")
+    return CompileMode::SimdSimt;
+  if (mode == "simd_simt_template" || mode == "simt_template" ||
+      mode == "unstructured_in_simt")
+    return CompileMode::SimdSimtTemplate;
   if (mode == "simt_only")
     return CompileMode::SimtOnly;
   return std::nullopt;
 }
 
 inline bool isSimtTemplateMode(CompileMode mode) {
-  return mode == CompileMode::SimtTemplate;
+  return mode == CompileMode::SimdSimtTemplate;
 }
 
 inline bool isPureSimtMode(CompileMode mode) {

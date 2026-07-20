@@ -18,20 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 #
-# Tests for SIMT IndirectLoad fast-path (TritonToLinalg / StridedLoadStoreRewrite).
+# Tests for the SIMT unstructured-access fast path
+# (TritonToLinalg / StridedLoadStoreRewrite).
 #
 # What each parameter row exercises against the V1 trigger condition
 # (compileOn91095 + forceSimtTemplate, last-axis stride statically > 1,
 #  non-permuted layout, rank <= 5, not stride==2-even-size):
 #
-#   * STRIDE > 2 / odd       -> V1 should rewrite tt.load -> tt.indirect_load
+#   * STRIDE > 2 / odd       -> V1 should rewrite to ascend.unstructured_load
 #   * STRIDE == 2, even size -> DeinterleaveStatusOptimization handles (V1 yields)
 #   * STRIDE == 2, odd size  -> V1 should rewrite (deinterleave precondition fails)
 #   * Permuted layout        -> ImplicitPermute handles (V1 must not touch)
 #   * Last-axis stride == 1  -> No rewrite (normal strided memref.copy)
 #
 # Verifies correctness only -- to confirm which path actually fired, dump IR
-# with MLIR_ENABLE_DUMP=1 and grep for tt.indirect_load / tt.trans.
+# with MLIR_ENABLE_DUMP=1 and grep for ascend.unstructured_load / tt.trans.
 
 import triton
 import triton.language as tl
@@ -241,7 +242,7 @@ def test_multi_d_gather(dtype, blocks, strides):
 # make_block_ptr (tt.make_tensor_ptr) strided load:
 #   Build a tl.make_block_ptr with non-default strides such that the low-dim
 #   stride is `stride_n`.  When stride_n > 1 V1 should rewrite the load to
-#   tt.indirect_load; when stride_n == 1 V1 should bail.
+#   ascend.unstructured_load; when stride_n == 1 V1 should bail.
 #
 # Sanity: this test verifies value correctness only.  For "did V1 actually
 # trigger?" see the FileCheck test under
@@ -330,7 +331,7 @@ def test_block_ptr_strided(dtype, block_m, block_n, stride_m, stride_n):
 
 
 # ---------------------------------------------------------------------------
-# V2: tt.store -> tt.indirect_store fast-path. Mirror of the load tests
+# V2: tt.store -> ascend.unstructured_store fast path. Mirror of the load tests
 # above, but the strided side is the OUTPUT (scatter) instead of the input.
 #
 #   out[i*stride] = in[i]   (1D AddPtr)
