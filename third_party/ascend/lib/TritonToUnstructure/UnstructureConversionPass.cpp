@@ -24,6 +24,7 @@
 #include "TritonToUnstructure/IndirectAtomicUtils.h"
 #include "TritonToStructured/CannonicalizerConverter.h"
 #include "TritonToLinalg/MaskAnalysis.h"
+#include "AscendModel/RouteModel/SimtSelection.h"
 #include "Utils/Utils.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -56,68 +57,6 @@ constexpr int64_t kBitsPerByte = 8;
 
 static constexpr const char *kRouteDiscreteMaskToSimtAttrName =
     "route_discrete_mask_to_simt";
-
-static bool hasScopeVectorMode(Operation *op, llvm::StringRef mode)
-{
-  for (Operation *parent = op->getParentOp(); parent;
-       parent = parent->getParentOp()) {
-    if (auto vecModeAttr = parent->getAttrOfType<StringAttr>("vec_mode")) {
-      return vecModeAttr.getValue() == mode;
-    }
-  }
-  return false;
-}
-
-static void stripConsumedSimtScopeAttrs(Operation *root)
-{
-  root->walk([](Operation *op) {
-    auto vecModeAttr = op->getAttrOfType<StringAttr>("vec_mode");
-    if (vecModeAttr && vecModeAttr.getValue() == "simt") {
-      op->removeAttr("vec_mode");
-    }
-  });
-}
-
-static void inlineConsumedSimtScopes(Operation *root)
-{
-  SmallVector<Operation *> scopeOps;
-  root->walk([&](Operation *op) {
-    if (op->getName().getStringRef() != "scope.scope") {
-      return;
-    }
-    auto vecModeAttr = op->getAttrOfType<StringAttr>("vec_mode");
-    if (vecModeAttr && vecModeAttr.getValue() == "simt") {
-      scopeOps.push_back(op);
-    }
-  });
-
-  IRRewriter rewriter(root->getContext());
-  for (Operation *scopeOp : llvm::reverse(scopeOps)) {
-    if (scopeOp->getNumRegions() != 1 ||
-        !llvm::hasSingleElement(scopeOp->getRegion(0))) {
-      scopeOp->removeAttr("vec_mode");
-      continue;
-    }
-
-    Block &body = scopeOp->getRegion(0).front();
-    Operation *terminator = body.getTerminator();
-    if (!terminator || terminator->getName().getStringRef() != "scope.return" ||
-        terminator->getNumOperands() != scopeOp->getNumResults()) {
-      scopeOp->removeAttr("vec_mode");
-      continue;
-    }
-
-    for (auto [result, operand] :
-         llvm::zip_equal(scopeOp->getResults(), terminator->getOperands())) {
-      result.replaceAllUsesWith(operand);
-    }
-
-    rewriter.setInsertionPoint(scopeOp);
-    rewriter.eraseOp(terminator);
-    rewriter.inlineBlockBefore(&body, scopeOp);
-    rewriter.eraseOp(scopeOp);
-  }
-}
 
 static RankedTensorType resolvePtrTensorType(Value ptr)
 {
@@ -181,7 +120,9 @@ void normalizeDiscreteMaskAccessForFallback(MemAccOpTy &op,
 // ======================== 950 SIMT Indirect Fast-Path Lowering ========================
 // 1. SIMT Fast-Path Gate
 //    The SIMT indirect lowering path is enabled only when:
-//      - compileOn91095Flag && forceSimtTemplateFlag
+//      - compileOn91095Flag
+//      - and either legacy forceSimtTemplateFlag is active, or the C++ cost
+//        model selected this operation through a local SIMT scope
 //      - and the access is either:
 //          * unstructured, or has tag with 'route_discrete_mask_to_simt'
 //
@@ -497,8 +438,12 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
   auto ptr = op.getPtr();
   auto ptrType = resolvePtrTensorType(ptr);
   auto routeDiscreteMaskToSimt = op->hasAttr(kRouteDiscreteMaskToSimtAttrName);
-  bool scopeForcesSimt = hasScopeVectorMode(op, "simt");
-  bool scopeForcesSimd = hasScopeVectorMode(op, "simd");
+  bool scopeForcesSimt =
+      mlir::ascend::simt_selection::hasEnclosingVectorMode(op, "simt");
+  bool scopeForcesSimd =
+      mlir::ascend::simt_selection::hasEnclosingVectorMode(op, "simd");
+  bool modelControlled =
+      mlir::ascend::simt_selection::isModelControlled(op);
 
   if (!ptrType || op->hasAttr(ConverterUtils::discreteAttrName))
     return failure();
@@ -571,13 +516,15 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
     os << "ptrOffsetInfo.isStructured: " << ptrOffsetInfo.isStructured() << "\n";
     os << "compileOn91095Flag: " << compileOn91095Flag << "\n";
     os << "forceSimtTemplateFlag: " << forceSimtTemplateFlag << "\n";
+    os << "modelControlled: " << modelControlled << "\n";
     os << "scopeForcesSimt: " << scopeForcesSimt << "\n";
     os << "scopeForcesSimd: " << scopeForcesSimd << "\n";
   });
 
   // SIMT Indirect Fast-Path Lowering in 950 seiries
   bool simtFastPathRequested =
-      (forceSimtTemplateFlag || scopeForcesSimt) && !scopeForcesSimd;
+      mlir::ascend::simt_selection::shouldUseSimtTemplate(
+          op, forceSimtTemplateFlag);
   bool indirectFastPathEnabled =
       compileOn91095Flag && simtFastPathRequested &&
       ((!ptrOffsetInfo.isStructured() && sizeInByte < 64) ||
@@ -940,8 +887,10 @@ void TritonToUnstructurePass::runOnOperation() {
     signalPassFailure();
   }
 
-  inlineConsumedSimtScopes(moduleOp);
-  stripConsumedSimtScopeAttrs(moduleOp);
+  // Keep the local SIMT scope alive.  This pass is only the first consumer;
+  // Reduce/Scan and other route-sensitive conversions run later in
+  // TritonToLinalg, and scope.scope is also the native region contract carried
+  // into the external BiShengIR lowering.
 
   PassManager pm(&getContext(), moduleOp.getOperationName());
   pm.addPass(createCSEPass());
