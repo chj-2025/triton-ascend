@@ -38,16 +38,16 @@ tt.func public @triton_indirect_store_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr
 }
 
 // CHECK-LABEL:     tt.func public @triton_indirect_store_kernel(
-// CHECK:           ascend.indirect_store {{.*}} : <f32>, {{.*}} : tensor<8x32xi64>, {{.*}} : tensor<8x32xf32>
+// CHECK:           ascend.unstructured_store {{.*}} : <f32>, {{.*}} : tensor<8x32xi64>, {{.*}} : tensor<8x32xf32>
 // CHECK:           tt.return
 // CHECK:         }
 
-// tt.int_to_ptr + tt.store -> ascend.indirect_store with the original pointer.
+// tt.int_to_ptr + tt.store -> ascend.unstructured_store with the original pointer.
 // TritonToLinalg materializes the pointer at the indirect-store consumer.
 // CHECK-LABEL:     tt.func public @triton_indirect_store_int_to_ptr_kernel(
 // CHECK:           %[[BASE:.*]] = tt.int_to_ptr {{.*}} : i64 -> !tt.ptr<f32>
 // CHECK-NOT:       tt.addptr %[[BASE]]
-// CHECK:           ascend.indirect_store %[[BASE]] : <f32>, {{.*}} : tensor<8xi64>, {{.*}} : tensor<8xf32>
+// CHECK:           ascend.unstructured_store %[[BASE]] : <f32>, {{.*}} : tensor<8xi64>, {{.*}} : tensor<8xf32>
 // CHECK:           tt.return
 // CHECK:         }
 

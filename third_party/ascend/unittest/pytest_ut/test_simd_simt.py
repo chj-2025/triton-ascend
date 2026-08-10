@@ -2,9 +2,9 @@ import torch
 import pytest
 import triton
 import triton.language as tl
-from triton.tools.get_ascend_devices import is_compile_on_910_95
+from triton.backends.ascend.utils import is_compile_on_910_95
 
-simd_simt_910_95_only = pytest.mark.xfail(not is_compile_on_910_95,
+simd_simt_910_95_only = pytest.mark.xfail(not is_compile_on_910_95(),
                                           reason="simd_simt compile mode only supports 910_95", run=False)
 
 

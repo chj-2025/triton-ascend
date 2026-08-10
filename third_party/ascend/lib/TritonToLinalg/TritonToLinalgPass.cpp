@@ -852,8 +852,8 @@ static bool isSIMTOp(Operation *op) {
   return isa<triton::ascend::IndexPutOp, triton::ascend::GatherOutToUbOp,
              triton::ascend::ScatterUbToOutOp,
              triton::ascend::UnstructuredLoadOp,
-             triton::ascend::UnstructuredStoreOp,
-             triton::ascend::StrideLoadOp, triton::ascend::StrideStoreOp>(op);
+             triton::ascend::UnstructuredStoreOp, triton::ascend::StrideLoadOp,
+             triton::ascend::StrideStoreOp>(op);
 }
 
 TritonTypeConverter::TritonTypeConverter() {
@@ -1855,6 +1855,13 @@ void TritonToLinalgPass::runOnOperation() {
       return WalkResult::interrupt();
     }
     return WalkResult::advance();
+  });
+  // dot decomposes into a cube linalg.matmul, so a kernel containing it is
+  // a cube (mix) kernel, not a pure-AIV one. Without this the func gets tagged
+  // mix_mode="aiv" and the cube tile-and-slice fails (cbuf overflow).
+  moduleOp.walk([&](triton::ascend::DotOp dotOp) {
+    existDot = true;
+    return WalkResult::interrupt();
   });
   existDotFlag = existDot;
 

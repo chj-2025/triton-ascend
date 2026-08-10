@@ -288,6 +288,18 @@ FailureOr<TypedAttr> specializeTypelessValueToAttr(TypelessValue, Type,
 FailureOr<Value> specializeTypelessValueToConstant(TypelessValue, Type,
                                                    Location, OpBuilder &);
 
+std::optional<int64_t> getIntAttr(const OpFoldResult ofr);
+
+Value materializeValue(OpBuilder &builder, Location loc, OpFoldResult ofr);
+
+bool isZero(const OpFoldResult ofr);
+
+bool isOne(const OpFoldResult ofr);
+
+RankedTensorType getExtractSlicedType(ArrayRef<OpFoldResult> shape,
+                                      const llvm::SmallBitVector &droppedDims,
+                                      Type elemType);
+
 bool checkStructureAnnotated(Operation *op, RewriterBase &rewriter);
 
 bool isDistributedTypeCustomOp(Operation *op);

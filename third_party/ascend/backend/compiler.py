@@ -380,6 +380,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         pm.enable_debug()
         if distributed is not None:
             distributed.ascend_passes.ttgpuir.add_convert_triton_distributed_to_hivm(pm)
+        # ascend.passes.ttir.add_auto_blockify(pm, auto_blockify_size)
 
         ascend.passes.ttir.add_triton_control_flow_opt(pm)
         ascend.passes.ttir.add_triton_to_structure(pm, False, False)
@@ -779,6 +780,12 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 f"--enable-preload={enable_preload}",
             ]
 
+        enable_preload = metadata["enable_preload"]
+        if enable_preload is not None:
+            _compile_option_list += [
+                f"--enable-preload={enable_preload}",
+            ]
+
         disable_tightly_coupled_buffer_reuse = metadata["disable_tightly_coupled_buffer_reuse"]
         if disable_tightly_coupled_buffer_reuse:
             _compile_option_list += ["--disable-tightly-coupled-buffer-reuse"]
@@ -786,6 +793,14 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         _compile_option_list += [
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
+        npu_utils = NPUUtils()
+        if npu_utils.has_device_limit():
+            _compile_option_list += [
+                f"--custom-aic-number={npu_utils.get_aicore_num()}",
+            ]
+            _compile_option_list += [
+                f"--custom-aiv-number={npu_utils.get_aivector_core_num()}",
+            ]
 
         _compile_option_list += [f"--enable-optimized-metaop={is_cann_version_at_least(9, 2, 0)}"]
 
@@ -932,6 +947,10 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += [
                 f"--hfusion-enable-multiple-consumer-fusion={hfusion_enable_multiple_consumer_fusion}"
             ]
+
+        enable_cross_if_fusion = metadata["enable_cross_if_fusion"]
+        if enable_cross_if_fusion:
+            cmd_list += [f"--hfusion-enable-cross-if-fusion={enable_cross_if_fusion}"]
 
         plan_memory_strategy = metadata["plan_memory_strategy"]
         if plan_memory_strategy is not None:
@@ -1555,6 +1574,59 @@ class AscendBackend(BaseBackend):
             self.binary_ext = "npubin"
             # Include all binary file extensions (mlirbc is always emitted for normal kernels).
             self.binary_extensions = {"npubin", "mlirbc"}
+
+    def compile_mode_setup(self, options: NPUOptions) -> Any:
+        # Backward compatibility: legacy force options override compile_mode.
+        if options.force_simt_template:
+            warnings.warn(
+                "force_simt_template is deprecated, use compile_mode='simd_simt_template' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            object.__setattr__(options, "compile_mode", "simd_simt_template")
+
+        if options.force_simt_only:
+            warnings.warn(
+                "force_simt_only is deprecated, use compile_mode='simt_only' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            object.__setattr__(options, "compile_mode", "simt_only")
+
+        _validate_compile_mode(options.compile_mode)
+
+        # Parse compile_mode and set related fields
+        if options.compile_mode == "simd":
+            object.__setattr__(options, "parallel_mode", "simd")
+            if options.shared_mem_dynamic_size is None:
+                object.__setattr__(options, "shared_mem_dynamic_size", 221184)
+        elif options.compile_mode == "simd_simt":
+            if not options.compile_on_910_95:
+                raise ValueError(f"compile_mode='{options.compile_mode}' is only supported on 910_95. "
+                                 "A2/A3 targets do not support SIMT mix compile.")
+            object.__setattr__(options, "parallel_mode", "mix_simd_simt")
+            if options.shared_mem_dynamic_size is None:
+                object.__setattr__(options, "shared_mem_dynamic_size", 221184)
+        elif options.compile_mode in ("simd_simt_template", "simt_template", "unstructured_in_simt"):
+            if options.compile_mode != "simd_simt_template":
+                legacy_mode = options.compile_mode
+                warnings.warn(
+                    f"compile_mode='{legacy_mode}' is deprecated, "
+                    "use compile_mode='simd_simt_template' instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                object.__setattr__(options, "compile_mode", "simd_simt_template")
+            if not options.compile_on_910_95:
+                raise ValueError(f"compile_mode='{options.compile_mode}' is only supported on 910_95. "
+                                 "A2/A3 targets do not support SIMT mix compile.")
+            if options.shared_mem_dynamic_size is None:
+                object.__setattr__(options, "shared_mem_dynamic_size", 221184)
+        elif options.compile_mode == "simt_only":
+            object.__setattr__(options, "force_simt_only", True)
+            object.__setattr__(options, "parallel_mode", "simt")
+            if options.shared_mem_dynamic_size is None:
+                object.__setattr__(options, "shared_mem_dynamic_size", 122880)
 
     def parse_options(self, opts) -> Any:
         # TODO: get available targets when building options?
