@@ -22,6 +22,7 @@ Test that ttir_to_linalg prints the triton-opt command line when opt.debug=True.
 Does not require NPU hardware.
 """
 
+import os
 from unittest.mock import patch, MagicMock
 import pytest
 
@@ -57,8 +58,14 @@ def _run_ttir_to_linalg(debug, capsys):
     """
     Patch all MLIR machinery so ttir_to_linalg can run without hardware,
     then return the captured stdout.
+
+    The dump manager is mocked as a test double that mirrors the real
+    ``FileCacheManager(dump=True)``: its ``cache_dir`` and ``_make_path``
+    are anchored at ``$TRITON_DUMP_DIR`` (or the default ``~/.triton/dump``
+    when the env var is unset) joined with the base32-encoded hash.
     """
     from triton.backends.ascend.compiler import ttir_to_linalg
+    from triton.runtime.cache import _base32
 
     pm_mock = MagicMock()
     pm_mock.get_pipeline_str.return_value = FAKE_PIPELINE
@@ -66,7 +73,17 @@ def _run_ttir_to_linalg(debug, capsys):
     ir_mock = MagicMock()
     ir_mock.pass_manager.return_value = pm_mock
 
+    # Mirror get_dump_manager(hash_key) -> FileCacheManager(_base32(key), dump=True):
+    #   cache_dir = knobs.cache.dump_dir / _base32(key)
+    # where knobs.cache.dump_dir is $TRITON_DUMP_DIR or ~/.triton/dump.
+    dump_dir_root = os.environ.get("TRITON_DUMP_DIR") \
+        or os.path.join(os.path.expanduser("~"), ".triton", "dump")
+    expected_cache_dir = os.path.join(dump_dir_root, _base32("deadbeef"))
+
     dump_manager_mock = MagicMock()
+    dump_manager_mock.cache_dir = expected_cache_dir
+    dump_manager_mock._make_path.side_effect = \
+        lambda filename: os.path.join(expected_cache_dir, filename)
 
     with patch(f"{MOD}._get_triton_opt_path", return_value=FAKE_TOOL), \
          patch(f"{MOD}._get_triton_adapter_opt_path", return_value="/fake/triton-adapter-opt"), \
@@ -111,34 +128,69 @@ def test_no_debug_print_when_debug_is_false(capsys):
 
 
 def test_invalid_compile_mode_raises():
-    from triton.backends.ascend.compiler import NPUOptions
+    from triton.backends.ascend.compiler import NPUOptions, AscendBackend
+    from triton.backends.compiler import GPUTarget
+    # Create backend instance
+    target = GPUTarget("npu", "910_95", 0)
+    backend = AscendBackend(target)
 
+    # Create options with invalid compile_mode
+    options = NPUOptions(compile_mode="invalid")
+
+    # Validation now happens in compile_mode_setup
     with pytest.raises(ValueError, match="Invalid compile_mode='invalid'"):
-        NPUOptions(compile_mode="invalid")
+        backend.compile_mode_setup(options)
 
 
 def test_simd_simt_compile_mode_sets_mixed_parallel_mode():
-    from triton.backends.ascend.compiler import NPUOptions
+    from triton.backends.ascend.compiler import NPUOptions, AscendBackend
+    from triton.backends.compiler import GPUTarget
 
+    # Create backend instance
+    target = GPUTarget("npu", "910_95", 0)
+    backend = AscendBackend(target)
+
+    # Create options with compile_on_910_95=True to pass validation
     options = NPUOptions(compile_mode="simd_simt", compile_on_910_95=True)
+
+    # Call compile_mode_setup to apply compile_mode logic
+    backend.compile_mode_setup(options)
 
     assert options.parallel_mode == "mix_simd_simt"
     assert options.shared_mem_dynamic_size == 221184
 
 
 def test_simd_simt_template_compile_mode_is_accepted():
-    from triton.backends.ascend.compiler import NPUOptions
+    from triton.backends.ascend.compiler import NPUOptions, AscendBackend
+    from triton.backends.compiler import GPUTarget
 
+    # Create backend instance
+    target = GPUTarget("npu", "910_95", 0)
+    backend = AscendBackend(target)
+
+    # Create options with compile_on_910_95=True to pass validation
     options = NPUOptions(compile_mode="simd_simt_template", compile_on_910_95=True)
+
+    # Call compile_mode_setup to apply compile_mode logic
+    backend.compile_mode_setup(options)
 
     assert options.compile_mode == "simd_simt_template"
 
 
 def test_simt_template_compile_mode_is_a_deprecated_alias():
-    from triton.backends.ascend.compiler import NPUOptions
+    from triton.backends.ascend.compiler import NPUOptions, AscendBackend
+    from triton.backends.compiler import GPUTarget
 
+    # Create backend instance
+    target = GPUTarget("npu", "910_95", 0)
+    backend = AscendBackend(target)
+
+    # Create options with deprecated compile_mode
+    options = NPUOptions(compile_mode="simt_template", compile_on_910_95=True)
+
+    # Deprecation warning is now raised in compile_mode_setup
     with pytest.warns(DeprecationWarning, match="simd_simt_template"):
-        options = NPUOptions(compile_mode="simt_template", compile_on_910_95=True)
+        backend.compile_mode_setup(options)
 
     assert options.compile_mode == "simd_simt_template"
 
@@ -158,12 +210,15 @@ def test_debug_print_uses_dump_dir_when_set(capsys, monkeypatch):
     assert "kernel.ttir.mlir" in out
 
 
-def test_debug_print_uses_tmp_when_no_dump_dir(capsys, monkeypatch):
-    """When TRITON_DUMP_DIR is not set, debug output should show /tmp paths."""
+def test_debug_print_uses_default_dump_dir_when_unset(capsys, monkeypatch):
+    """When TRITON_DUMP_DIR is not set, debug output should show the default
+    dump dir (~/.triton/dump), not /tmp."""
     monkeypatch.delenv("TRITON_DUMP_DIR", raising=False)
     out = _run_ttir_to_linalg(debug=True, capsys=capsys)
-    # Should contain /tmp since no dump dir is set
-    assert "/tmp" in out
+    default_dump_dir = os.path.join(os.path.expanduser("~"), ".triton", "dump")
+    # Should contain the default dump dir, not /tmp
+    assert default_dump_dir in out
+    assert "/tmp" not in out
 
 
 if __name__ == "__main__":

@@ -183,8 +183,8 @@ static bool isSIMTOp(Operation *op) {
   return isa<triton::ascend::IndexPutOp, triton::ascend::GatherOutToUbOp,
              triton::ascend::ScatterUbToOutOp,
              triton::ascend::UnstructuredLoadOp,
-             triton::ascend::UnstructuredStoreOp,
-             triton::ascend::StrideLoadOp, triton::ascend::StrideStoreOp>(op);
+             triton::ascend::UnstructuredStoreOp, triton::ascend::StrideLoadOp,
+             triton::ascend::StrideStoreOp>(op);
 }
 
 TritonTypeConverter::TritonTypeConverter() {
@@ -693,6 +693,8 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::ArgMaxConverter>(patterns.getContext());
   patterns.add<TTOpConverters::ReduceConverter>(patterns.getContext());
   patterns.add<TTOpConverters::ScanConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::MapElementwiseDecomposeConverter>(
+      patterns.getContext());
   patterns.add<TTOpConverters::ReshapeConverter>(patterns.getContext());
   patterns.add<TTOpConverters::ExpandDimsConverter>(patterns.getContext());
   patterns.add<TTOpConverters::BroadcastConverter>(patterns.getContext());
@@ -719,6 +721,7 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::DeviceAssertConverter>(patterns.getContext());
   patterns.add<TTOpConverters::DevicePrintConverter>(patterns.getContext());
   patterns.add<TTOpConverters::MatmulConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::DotConverter>(patterns.getContext());
   patterns.add<TTOpConverters::DotScaledConverter>(patterns.getContext());
   patterns.add<TTOpConverters::PtrToIntConverter>(patterns.getContext());
 
@@ -945,6 +948,13 @@ void TritonToLinalgPass::runOnOperation() {
     existDot = true;
     return WalkResult::interrupt();
   });
+  // dot decomposes into a cube linalg.matmul, so a kernel containing it is
+  // a cube (mix) kernel, not a pure-AIV one. Without this the func gets tagged
+  // mix_mode="aiv" and the cube tile-and-slice fails (cbuf overflow).
+  moduleOp.walk([&](triton::ascend::DotOp dotOp) {
+    existDot = true;
+    return WalkResult::interrupt();
+  });
   existDotFlag = existDot;
 
   // NOTE: existSIMTOp is intentionally computed AFTER
@@ -1054,6 +1064,7 @@ void TritonToLinalgPass::runOnOperation() {
   };
 
   target.addIllegalOp<triton::ScanOp>();
+  target.addIllegalOp<triton::MapElementwiseOp>();
   target.addDynamicallyLegalOp<scf::ForOp>(loopOpLegalFn);
   target.addDynamicallyLegalOp<scf::WhileOp>(loopOpLegalFn);
 

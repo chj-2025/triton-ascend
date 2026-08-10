@@ -68,11 +68,11 @@ tt.func public @fully_unstructured_atomic_add_2d(%arg0: !tt.ptr<i64> {tt.divisib
 
 // -----
 
+// sizeInByte >= 64, falls back to scf.for loop unrolling + DiscreteMemAccess
 // CHECK-LABEL: tt.func public @partial_structured_atomic_add_2d
-// CHECK: %[[MASK_TRUE:.*]] = arith.constant dense<1> : tensor<32xi8>
-// CHECK: %[[OFFSET_FLAT:.*]] = tt.reshape {{.*}} : tensor<2x16xi64> -> tensor<32xi64>
-// CHECK: %[[VALUE_FLAT:.*]] = tt.reshape {{.*}} : tensor<2x16xi32> -> tensor<32xi32>
-// CHECK: hivm.hir.custom {extra_attr = "operate=add"{{.*}}} "__builtin_indirect_atomic" ins(%arg1, %[[OFFSET_FLAT]], %[[VALUE_FLAT]], %[[MASK_TRUE]]
+// CHECK: scf.for
+// CHECK: tt.atomic_rmw add, acq_rel, gpu, {{.*}} {DiscreteMemAccess}
+// CHECK: {ExtractedLoadOrStore}
 tt.func public @partial_structured_atomic_add_2d(%arg0: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<i32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
 	%cst = arith.constant dense<true> : tensor<2x16xi1>
 	%cst_0 = arith.constant dense<16> : tensor<2x1xi32>
@@ -134,8 +134,11 @@ tt.func public @fully_unstructured_atomic_and_2d(%arg0: !tt.ptr<i64>, %arg1: !tt
 
 // -----
 
+// sizeInByte >= 64, falls back to scf.for loop unrolling + DiscreteMemAccess
 // CHECK-LABEL: tt.func public @partial_structured_atomic_and_2d
-// CHECK: hivm.hir.custom {extra_attr = "operate=and"
+// CHECK: scf.for
+// CHECK: tt.atomic_rmw and, acq_rel, gpu, {{.*}} {DiscreteMemAccess}
+// CHECK: {ExtractedLoadOrStore}
 tt.func public @partial_structured_atomic_and_2d(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>, %arg2: !tt.ptr<i32>) {
 	%cst = arith.constant dense<true> : tensor<2x16xi1>
 	%cst_0 = arith.constant dense<16> : tensor<2x1xi32>
@@ -197,8 +200,10 @@ tt.func public @fully_unstructured_atomic_or_2d(%arg0: !tt.ptr<i64>, %arg1: !tt.
 
 // -----
 
+// sizeInByte >= 64, falls back to scf.for loop unrolling + DiscreteMemAccess
 // CHECK-LABEL: tt.func public @partial_structured_atomic_or_2d
-// CHECK: hivm.hir.custom {extra_attr = "operate=or"
+// CHECK: scf.for
+// CHECK: tt.atomic_rmw or, acq_rel, gpu, {{.*}} {DiscreteMemAccess}
 tt.func public @partial_structured_atomic_or_2d(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>, %arg2: !tt.ptr<i32>) {
 	%cst = arith.constant dense<true> : tensor<2x16xi1>
 	%cst_0 = arith.constant dense<16> : tensor<2x1xi32>
@@ -260,8 +265,10 @@ tt.func public @fully_unstructured_atomic_xor_2d(%arg0: !tt.ptr<i64>, %arg1: !tt
 
 // -----
 
+// sizeInByte >= 64, falls back to scf.for loop unrolling + DiscreteMemAccess
 // CHECK-LABEL: tt.func public @partial_structured_atomic_xor_2d
-// CHECK: hivm.hir.custom {extra_attr = "operate=xor"
+// CHECK: scf.for
+// CHECK: tt.atomic_rmw xor, acq_rel, gpu, {{.*}} {DiscreteMemAccess}
 tt.func public @partial_structured_atomic_xor_2d(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>, %arg2: !tt.ptr<i32>) {
 	%cst = arith.constant dense<true> : tensor<2x16xi1>
 	%cst_0 = arith.constant dense<16> : tensor<2x1xi32>
@@ -323,8 +330,10 @@ tt.func public @fully_unstructured_atomic_xchg_2d(%arg0: !tt.ptr<i64>, %arg1: !t
 
 // -----
 
+// sizeInByte >= 64, falls back to scf.for loop unrolling + DiscreteMemAccess
 // CHECK-LABEL: tt.func public @partial_structured_atomic_xchg_2d
-// CHECK: hivm.hir.custom {extra_attr = "operate=xchg"
+// CHECK: scf.for
+// CHECK: tt.atomic_rmw exch, acq_rel, gpu, {{.*}} {DiscreteMemAccess}
 tt.func public @partial_structured_atomic_xchg_2d(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>, %arg2: !tt.ptr<i32>) {
 	%cst = arith.constant dense<true> : tensor<2x16xi1>
 	%cst_0 = arith.constant dense<16> : tensor<2x1xi32>
@@ -386,8 +395,10 @@ tt.func public @fully_unstructured_atomic_max_2d(%arg0: !tt.ptr<i64>, %arg1: !tt
 
 // -----
 
+// sizeInByte >= 64, falls back to scf.for loop unrolling + DiscreteMemAccess
 // CHECK-LABEL: tt.func public @partial_structured_atomic_max_2d
-// CHECK: hivm.hir.custom {extra_attr = "operate=max"
+// CHECK: scf.for
+// CHECK: tt.atomic_rmw max, acq_rel, gpu, {{.*}} {DiscreteMemAccess}
 tt.func public @partial_structured_atomic_max_2d(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>, %arg2: !tt.ptr<i32>) {
 	%cst = arith.constant dense<true> : tensor<2x16xi1>
 	%cst_0 = arith.constant dense<16> : tensor<2x1xi32>
@@ -449,8 +460,10 @@ tt.func public @fully_unstructured_atomic_min_2d(%arg0: !tt.ptr<i64>, %arg1: !tt
 
 // -----
 
+// sizeInByte >= 64, falls back to scf.for loop unrolling + DiscreteMemAccess
 // CHECK-LABEL: tt.func public @partial_structured_atomic_min_2d
-// CHECK: hivm.hir.custom {extra_attr = "operate=min"
+// CHECK: scf.for
+// CHECK: tt.atomic_rmw min, acq_rel, gpu, {{.*}} {DiscreteMemAccess}
 tt.func public @partial_structured_atomic_min_2d(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>, %arg2: !tt.ptr<i32>) {
 	%cst = arith.constant dense<true> : tensor<2x16xi1>
 	%cst_0 = arith.constant dense<16> : tensor<2x1xi32>
@@ -517,11 +530,11 @@ tt.func public @fully_unstructured_atomic_cas_2d(%arg0: !tt.ptr<i64>, %arg1: !tt
 
 // -----
 
+// sizeInByte >= 64, falls back to scf.for loop unrolling + DiscreteMemAccess
 // CHECK-LABEL: tt.func public @partial_structured_atomic_cas_2d
-// CHECK: %[[OFFSET_FLAT:.*]] = tt.reshape {{.*}} : tensor<2x16xi64> -> tensor<32xi64>
-// CHECK: %[[CMP_FLAT:.*]] = tt.reshape {{.*}} : tensor<2x16xi32> -> tensor<32xi32>
-// CHECK: %[[VAL_FLAT:.*]] = tt.reshape {{.*}} : tensor<2x16xi32> -> tensor<32xi32>
-// CHECK: hivm.hir.custom {extra_attr = "operate=cas"
+// CHECK: scf.for
+// CHECK: tt.atomic_cas acq_rel, gpu, {{.*}} {DiscreteMemAccess}
+// CHECK: {ExtractedLoadOrStore}
 tt.func public @partial_structured_atomic_cas_2d(%arg0: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg3: !tt.ptr<i32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
 	%cst = arith.constant dense<16> : tensor<2x1xi32>
 	%cst_0 = arith.constant dense<2> : tensor<2x1xi32>

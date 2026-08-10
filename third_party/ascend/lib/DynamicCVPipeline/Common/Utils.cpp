@@ -3,13 +3,18 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/LogicalResult.h"
 
+#include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Operation.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
@@ -128,6 +133,192 @@ bool isOnlyDirectlyUse(Operation *preOp, Operation *nextOp,
     return false;
   }
   return (*allusers.begin()) == nextOp;
+}
+
+/** Determines if a value is "scalar-like" based on the following criteria:
+ 1. True scalar types (integer, index, or float)
+ 2. Tensor types with empty shape (e.g., tensor<f32>)
+ 3. Constant tensors where all elements have the same value (splat constants)
+ 4. Tensors with shape where all dimensions equal 1 (single-element tensors)
+ */
+bool isScalarLike(Value value) {
+  Type type = value.getType();
+  auto shapedType = dyn_cast<ShapedType>(type);
+
+  // 1. true scalar (int / index / float)
+  if (!shapedType) {
+    return type.isIntOrIndexOrFloat();
+  }
+
+  // 2. tensor with empty shape (e.g. tensor<f32>)
+  ArrayRef<int64_t> shape = shapedType.getShape();
+  if (shape.empty()) {
+    return true;
+  }
+
+  // 3. splat constant tensor (all elements identical)
+  Attribute attr;
+  if (matchPattern(value, m_Constant(&attr))) {
+    auto denseAttr = dyn_cast<DenseIntOrFPElementsAttr>(attr);
+    return denseAttr && denseAttr.isSplat() &&
+           denseAttr.getElementType().isIntOrIndexOrFloat();
+  }
+
+  // 4. single-element tensor (all dims == 1)
+  return llvm::all_of(shape, [](int64_t dim) { return dim == 1; });
+}
+
+bool isStoreLike(mlir::Operation *op) {
+  if (isa<bufferization::MaterializeInDestinationOp, hivm::StoreOp>(op)) {
+    return true;
+  }
+  return false;
+}
+
+bool isViewLike(mlir::Operation *op) {
+  if (isa<tensor::ExtractSliceOp, ViewLikeOpInterface>(op)) {
+    return true;
+  }
+  return false;
+}
+
+bool isZeroFillValue(mlir::Value v) {
+  auto fill = v.getDefiningOp<linalg::FillOp>();
+  if (!fill) {
+    return false;
+  }
+  if (fill.getInputs().empty()) {
+    return false;
+  }
+  Value insVal = fill.getInputs()[0];
+  auto constOp = insVal.getDefiningOp<arith::ConstantOp>();
+  if (!constOp) {
+    return false;
+  }
+  Attribute value = constOp.getValue();
+  if (auto intAttr = dyn_cast<IntegerAttr>(value)) {
+    return intAttr.getValue().isZero();
+  }
+  if (auto fpAttr = dyn_cast<FloatAttr>(value)) {
+    return fpAttr.getValue().isZero();
+  }
+  return false;
+}
+
+// Read the `hivm.tightly_coupled_buffer<N>` id attached to a `memref.alloc`
+// via its `annotation.mark` user. Returns nullopt when no annotation with
+// a concrete id is present, or when `allocVal` is null.
+std::optional<int> getTightlyCoupledBufferId(Value allocVal) {
+  if (!allocVal) {
+    return std::nullopt;
+  }
+  for (Operation *user : allocVal.getUsers()) {
+    if (auto tcbAttr = user->getAttrOfType<hivm::HIVMTightlyCoupledBufferAttr>(
+            CVPipeline::kTightlyCoupledBufferAttr)) {
+      auto id = tcbAttr.getId();
+      if (id.has_value()) {
+        return id;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// Walk back through opaque memref casts to recover the underlying
+// `memref.alloc` that backs a `bufferization.to_tensor`'s source.
+Value traceBackToMemrefAlloc(Value v) {
+  while (true) {
+    if (auto cast = v.getDefiningOp<memref::MemorySpaceCastOp>()) {
+      v = cast.getSource();
+      continue;
+    }
+    if (auto cast = v.getDefiningOp<memref::CastOp>()) {
+      v = cast.getSource();
+      continue;
+    }
+    break;
+  }
+  return v;
+}
+
+Block *MainLoop::getBody() const { return body; }
+
+Operation *MainLoop::getOperation() const { return op; }
+
+MLIRContext *MainLoop::getContext() const { return op->getContext(); }
+
+Location MainLoop::getLoc() const { return op->getLoc(); }
+
+Block *MainLoop::getBlock() const { return op->getBlock(); }
+
+Block::iterator MainLoop::getIterator() const { return op->getIterator(); }
+
+Operation *MainLoop::operator->() const { return op; }
+
+bool MainLoop::isWhile() const { return isa<scf::WhileOp>(op); }
+
+SmallVector<Value> MainLoop::getIterArgs() const {
+  SmallVector<Value> result;
+  if (auto f = dyn_cast<scf::ForOp>(op)) {
+    result.append(f.getRegionIterArgs().begin(), f.getRegionIterArgs().end());
+  } else if (auto w = dyn_cast<scf::WhileOp>(op)) {
+    Block::BlockArgListType args = w.getAfterBody()->getArguments();
+    result.append(args.begin(), args.end());
+  }
+  return result;
+}
+
+SmallVector<Value> MainLoop::getBeforeIterArgs() const {
+  SmallVector<Value> result;
+  if (auto w = dyn_cast<scf::WhileOp>(op)) {
+    Block::BlockArgListType args = w.getBeforeBody()->getArguments();
+    result.append(args.begin(), args.end());
+  }
+  return result;
+}
+
+MainLoop::MainLoop(Operation *loopOp) {
+  op = loopOp;
+  if (auto f = dyn_cast<scf::ForOp>(loopOp))
+    body = f.getBody();
+  else if (auto w = dyn_cast<scf::WhileOp>(loopOp))
+    body = w.getAfterBody();
+}
+
+scf::YieldOp MainLoop::getLoopYieldOp(Operation *loopOp) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loopOp))
+    return dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loopOp))
+    return dyn_cast<scf::YieldOp>(whileOp.getAfter().front().getTerminator());
+  return {};
+}
+
+int getLoopCarriedArgIndex(Value operand, Block *block) {
+  auto barg = dyn_cast<BlockArgument>(operand);
+  if (!barg || barg.getOwner() != block) {
+    return -1;
+  }
+
+  auto parentOp = block->getParentOp();
+  if (!isa<scf::ForOp, scf::WhileOp>(parentOp)) {
+    return -1;
+  }
+
+  auto *terminator = block->getTerminator();
+  if (!terminator || !isa<scf::YieldOp>(terminator)) {
+    return -1;
+  }
+
+  int numArgs = block->getNumArguments();
+  int numYieldOperands = terminator->getNumOperands();
+  int offset = numArgs - numYieldOperands;
+  int argIdx = barg.getArgNumber() - offset;
+
+  if (argIdx < 0 || argIdx >= numYieldOperands) {
+    return -1;
+  }
+
+  return argIdx;
 }
 
 } // namespace CVPipeline

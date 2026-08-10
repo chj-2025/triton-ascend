@@ -74,25 +74,94 @@ class NPUUtils(object):
     def load_binary(self, name, kernel, shared, device, mix_mode):
         return self.npu_utils_mod.load_kernel_binary(name, kernel, shared, device, mix_mode)
 
+    def _get_npu_device_limit_form_env(self) -> tuple[int, int]:
+        """Read and validate the NPU_DEVICE_LIMIT env var, return the capped AICore and AIVector counts.
+
+        The env var format is ``cube_core_num,vector_core_num`` (e.g. ``"14,28"``),
+        used to reduce the core count visible to Triton in multi-tenant sharding,
+        performance tuning, and resource isolation scenarios.
+        When unset, the hardware actual values are returned (AIVector = AICore x 2).
+
+        Validation rules (any failure raises ValueError):
+        1. Format must match ``^\\d+(,\\d+)$``; leading/trailing whitespace allowed,
+           but no space after the comma;
+        2. Both values must be positive;
+        3. Neither value may exceed the hardware limit (AICore cap = device actual,
+           AIVector cap = AICore x 2).
+
+        Returns:
+            tuple[int, int]: (num_aic, num_aiv) the capped AICore and AIVector counts.
+
+        Raises:
+            ValueError: when the env var is malformed, contains non-positive values,
+                or exceeds the hardware limit; the error message includes the raw
+                input and the hardware actual caps.
+        """
+        npu_device_limit_str = os.getenv("NPU_DEVICE_LIMIT")
+        num_aic, num_aiv = self.get_device_core()
+        if npu_device_limit_str is None:
+            return num_aic, num_aiv
+
+        is_valid = re.match(r'^\d+ *, *\d+$', npu_device_limit_str.strip())
+        if is_valid:
+            parts = [part.strip() for part in npu_device_limit_str.split(",")]
+            num_aic_env = int(parts[0])
+            num_aiv_env = int(parts[1])
+
+            if num_aic_env <= 0 or num_aiv_env <= 0:
+                raise ValueError(f"[ERROR]NPU_DEVICE_LIMIT={npu_device_limit_str}, which has non-positive value,"
+                                 f"both cube_core_num and vector_core_num must be positive.")
+            elif num_aic_env > num_aic or num_aiv_env > num_aiv:
+                raise ValueError(
+                    f"[ERROR]NPU_DEVICE_LIMIT={npu_device_limit_str}, both cube_core_num and vector_core_num "
+                    f"must be less than or equal to device properties ({num_aic},{num_aiv}).")
+            elif num_aic_env * (num_aiv / num_aic) != num_aiv_env:
+                env_quotient = num_aiv_env / num_aic_env
+                env_quotient_decimal = round(env_quotient, 1)
+                quotient = num_aiv / num_aic
+                quotient_decimal = round(quotient, 1)
+                raise ValueError(
+                    f"[ERROR]NPU_DEVICE_LIMIT={npu_device_limit_str}; expected ratio is consistent, actual, "
+                    f"the ratio of vector_core_num/cube_core_num({num_aiv_env}/{num_aic_env}={env_quotient_decimal}) does "
+                    f"not equal device properties vector_core_num/cube_core_num({num_aiv}/{num_aic}={quotient_decimal}) ratio."
+                )
+            else:
+                print(f"[INFO]NPU_DEVICE_LIMIT from env: cube_core_num={num_aic_env},vector_core_num={num_aiv_env}).")
+                return num_aic_env, num_aiv_env
+        else:
+            raise ValueError(f"[ERROR]NPU_DEVICE_LIMIT={npu_device_limit_str}, which has invalid format: "
+                             f"It should be like '14,28' (cube_core_num,vector_core_num) "
+                             f"and it must be a positive number.")
+
     @functools.lru_cache()
+    def get_device_core(self):
+        import torch
+        device = torch.npu.current_device()
+        prop = torch.npu.get_device_properties(device)
+        cube_core_num, vector_core_num = prop.cube_core_num, prop.vector_core_num
+        return cube_core_num, vector_core_num
+
+    def has_device_limit(self):
+        num_aic, num_aiv = self.get_device_core()
+        try:
+            return num_aic != self.get_aicore_num() or num_aiv != self.get_aivector_core_num()
+        except ValueError:
+            return False
+
     def get_device_properties(self, device):
         # temperoarily added "max_shared_mem" properties to avoid triton-compiler complain
         # fetch available memory at runtime
-        num_aic = self.get_aicore_num()
-        num_aiv = num_aic * 2
+        num_aic, num_aiv = self._get_npu_device_limit_form_env()
         return {"max_shared_mem": 1, "num_aicore": num_aic, "num_vectorcore": num_aiv}
 
-    @functools.lru_cache()
     def get_arch(self):
         # temporarily return empty arch descriptor
         return self.npu_utils_mod.get_arch()
 
-    @functools.lru_cache()
     def get_aicore_num(self):
         # temporarily return empty arch descriptor
-        return self.npu_utils_mod.get_aicore_num()
+        return self.get_device_properties("npu")["num_aicore"]
 
-    @functools.lru_cache()
     def get_aivector_core_num(self):
         return self.get_device_properties("npu")["num_vectorcore"]
 
@@ -451,7 +520,8 @@ def make_launcher(constants, signature, metadata):
         int gridX, gridY, gridZ;
         rtStream_t stream;
         const void *functon;
-        PyObject* packed_metadata,
+        PyObject* packed_metadata, *launch_metadata;
+        PyObject* launch_enter_hook, *launch_exit_hook;
         *args_expand
     """
 
@@ -602,27 +672,6 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
     ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(ret));
     if(!ptr_info.dev_ptr)
       return ptr_info;
-        aclrtPtrAttributes attributes;
-        aclError status = aclrtPointerGetAttributes(ptr_info.dev_ptr, &attributes);
-
-        if (status == ACL_SUCCESS) {
-          if (attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE && attributes.location.type != 4) {
-            Py_DECREF(ret);
-            PyErr_Format(PyExc_ValueError,
-                         "Pointer argument (at %d) cannot be accessed from Triton (cpu tensor?)", idx);
-            ptr_info.valid = false;
-            return ptr_info;
-          }
-        } else {
-          Py_DECREF(ret);
-          PyErr_Format(PyExc_RuntimeError,
-                       "Failed to query pointer attributes at argument %d. "
-                       "Error code: %d. This may indicate invalid memory address "
-                       "or NPU device error.",
-                       idx, status);
-          ptr_info.valid = false;
-          return ptr_info;
-        }
     Py_DECREF(ret);
     return ptr_info;
   }
@@ -830,6 +879,10 @@ void triton_launch_kernel(
     const int64_t* shapes_data, const int* shape_dims, int num_tensors,
     const int* tensor_kinds,
     const void* const* kernel_args, const size_t* arg_sizes, int num_args) {{
+  if (gridX <=0 || gridY <=0 || gridZ <=0) {{
+    printf("WARNING: Skipping launch for kernel '%s' due to empty grid (gridX=%d, gridY=%d, gridZ=%d).\\n", kernelName, gridX, gridY, gridZ);
+    return;
+  }}
   std::vector<std::vector<int64_t>> tensorShapes;
   if (shapes_data != nullptr && shape_dims != nullptr) {{
     int shapes_idx = 0;
@@ -967,8 +1020,12 @@ void triton_launch_kernel(
 }}
 }} // extern "C"
 
-static void _launch(const char* kernelName, const void* func, rtStream_t stream, int gridX, int gridY, int gridZ, std::vector<std::vector<int64_t>> &tensorShapes, std::vector<int> &tensorKinds{', ' + arg_decls if len(signature) > 0 else ''}) {{
+static void _launch(const char* kernelName, const void* func, rtStream_t stream, int gridX, int gridY, int gridZ, std::vector<std::vector<int64_t>> &tensorShapes, std::vector<int> &tensorKinds{(', ' + arg_decls) if len(arg_decls) > 0 else ''}) {{
   // Keep Python launcher on the stable local packing path.
+  if (gridX <=0 || gridY <=0 || gridZ <=0) {{
+    printf("WARNING: Skipping launch for kernel '%s' due to empty grid (gridX=%d, gridY=%d, gridZ=%d).\\n", kernelName, gridX, gridY, gridZ);
+    return;
+  }}
   std::string name = "";
   name.append(kernelName);
   void *workspace_addr_ptr = NULL;
