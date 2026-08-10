@@ -1140,13 +1140,7 @@ bool isDisqualifyingLoaderOp(Operation *op) {
 } // namespace
 
 bool OpClassifierPass::isCubeLoaderForOp(scf::ForOp forOp) {
-  if (forOp->hasAttr(hivm::ExtractLoadStoreAttr))
-    return false;
-
   // Every result must be live and used only by CUBE consumers
-  if (forOp.getNumResults() == 0) {
-    return false;
-  }
   for (Value result : forOp.getResults()) {
     for (Operation *user : result.getUsers()) {
       if (isa<linalg::MatmulOp>(user) || getCoreType(user) == OP_CUBE_ONLY)

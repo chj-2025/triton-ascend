@@ -684,6 +684,28 @@ void DataDependencyAnalysisPass::processIterArgDependencies() {
                                           cubeUsers, info);
             }
           }
+          if (isControlFlowOp(user)) {
+            LOG_DEBUG("cannot process nested iterarg!");
+            continue;
+          }
+          auto userCoreType = getCoreTypeWithIndex(user, 0);
+          if (userCoreType == initCoreType) {
+            initCoreTypeUsers.push_back(user);
+          } else if (userCoreType == yieldCoreType) {
+            yieldCoreTypeUsers.push_back(user);
+          }
+        }
+        if (!initCoreTypeUsers.empty() && !yieldCoreTypeUsers.empty()) {
+          recordInitValueDeps(loopOp, initValue, yieldCoreType, info);
+          insertProducerAndRecordDeps(loopOp, iterArg, yieldCoreType,
+                                      yieldCoreTypeUsers, info);
+        } else if (!initCoreTypeUsers.empty() && yieldCoreTypeUsers.empty()) {
+          insertConsumerAndRecordDeps(loopOp, yieldedValue, iterArgIndex,
+                                      initCoreType, info);
+        } else if (initCoreTypeUsers.empty() && !yieldCoreTypeUsers.empty()) {
+          recordInitValueDeps(loopOp, initValue, yieldCoreType, info);
+        } else {
+          LOG_DEBUG("no dependencies with: " << iterArg << "\n");
         }
       } else if (initCoreType == yieldCoreType) {
         auto diffUsers = collectDiffCoreTypeUsers(iterArg, yieldCoreType);

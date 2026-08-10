@@ -29,7 +29,7 @@
 // covered at the Graph compatibility boundary.
 // SLS-INSPECT: IR Dump After {{.*}}LayoutMemoryCompatibilityPass{{.*}}
 // SLS-INSPECT: tt.func public @addptr_stride4_masked_single_tile
-// SLS-INSPECT: ascend.indirect_load {{.*}} {RewrittenByStridedLoadStoreRewrite, isVolatile = false}
+// SLS-INSPECT: ascend.unstructured_load {{.*}} {RewrittenByStridedLoadStoreRewrite, isVolatile = false}
 // SLS-INSPECT: IR Dump After TritonToLinalg
 // SLS-INSPECT: func.func @addptr_stride4_masked_single_tile
 // SLS-INSPECT: call @triton_indirect_load

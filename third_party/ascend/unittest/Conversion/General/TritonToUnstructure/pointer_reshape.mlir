@@ -16,7 +16,7 @@ tt.func @masked_pointer_reshape(%base: !tt.ptr<f32>, %offsets: tensor<2x2x4xi64>
 // CHECK-SAME:  %[[BASE:.*]]: !tt.ptr<f32>, %[[OFFSETS:.*]]: tensor<2x2x4xi64>, %[[MASK:.*]]: tensor<4x4xi1>
 // CHECK-DAG:   %[[OTHER:.*]] = arith.constant dense<-7.000000e+00> : tensor<4x4xf32>
 // CHECK-DAG:   %[[FLAT:.*]] = tt.reshape %[[OFFSETS]] : tensor<2x2x4xi64> -> tensor<4x4xi64>
-// INDIRECT:    ascend.indirect_load %[[BASE]] : <f32>, %[[FLAT]] : tensor<4x4xi64>, %[[MASK]] : tensor<4x4xi1>, %[[OTHER]] : tensor<4x4xf32>
+// INDIRECT:    ascend.unstructured_load %[[BASE]] : <f32>, %[[FLAT]] : tensor<4x4xi64>, %[[MASK]] : tensor<4x4xi1>, %[[OTHER]] : tensor<4x4xf32>
 // SCALAR:      %[[LOADED:.*]] = scf.for
 // SCALAR:      tensor.extract %[[FLAT]]
 // SCALAR:      tt.load
@@ -37,7 +37,7 @@ tt.func @store_pointer_reshape(%base: !tt.ptr<i32>, %offsets: tensor<2x4xi32>, %
 // CHECK-SAME:  %[[BASE:.*]]: !tt.ptr<i32>, %[[OFFSETS:.*]]: tensor<2x4xi32>, %[[VALUES:.*]]: tensor<8xi32>, %[[MASK:.*]]: tensor<8xi1>
 // CHECK:       %[[WIDE:.*]] = arith.extsi %[[OFFSETS]] : tensor<2x4xi32> to tensor<2x4xi64>
 // CHECK:       %[[FLAT:.*]] = tt.reshape %[[WIDE]] : tensor<2x4xi64> -> tensor<8xi64>
-// INDIRECT:    ascend.indirect_store %[[BASE]] : <i32>, %[[FLAT]] : tensor<8xi64>, %[[VALUES]] : tensor<8xi32>, %[[MASK]] : tensor<8xi1>
+// INDIRECT:    ascend.unstructured_store %[[BASE]] : <i32>, %[[FLAT]] : tensor<8xi64>, %[[VALUES]] : tensor<8xi32>, %[[MASK]] : tensor<8xi1>
 // SCALAR:      scf.for
 // SCALAR:      tensor.extract %[[FLAT]]
 // SCALAR:      tt.store
@@ -59,7 +59,7 @@ tt.func @reshape_attributes_and_other_use(%base: !tt.ptr<f32>, %offsets: tensor<
 // CHECK:       %[[ORIGINAL:.*]] = tt.addptr {{.*}} : tensor<8x!tt.ptr<f32>>, tensor<8xi32>
 // CHECK:       %[[OFFSET:.*]] = tt.reshape %[[WIDE]] efficient_layout : tensor<8xi64> -> tensor<2x4xi64>
 // CHECK:       %[[PTRS:.*]] = tt.reshape %[[ORIGINAL]] efficient_layout : tensor<8x!tt.ptr<f32>> -> tensor<2x4x!tt.ptr<f32>>
-// INDIRECT:    ascend.indirect_load %[[BASE]] : <f32>, %[[OFFSET]] : tensor<2x4xi64>
+// INDIRECT:    ascend.unstructured_load %[[BASE]] : <f32>, %[[OFFSET]] : tensor<2x4xi64>
 // SCALAR:      scf.for
 // CHECK:       tt.return {{.*}}, %[[PTRS]], %[[ORIGINAL]]
 
@@ -80,7 +80,7 @@ tt.func @nested_addptr_and_reshape(%base: !tt.ptr<f32>, %first: tensor<2x4xi32>,
 // CHECK:       %[[WIDE:.*]] = arith.extsi %[[FIRST]] : tensor<2x4xi32> to tensor<2x4xi64>
 // CHECK:       %[[SUM:.*]] = arith.addi %[[WIDE]], %[[SECOND]] : tensor<2x4xi64>
 // CHECK:       %[[FLAT:.*]] = tt.reshape %[[SUM]] : tensor<2x4xi64> -> tensor<8xi64>
-// INDIRECT:    ascend.indirect_load %[[BASE]] : <f32>, %[[FLAT]] : tensor<8xi64>
+// INDIRECT:    ascend.unstructured_load %[[BASE]] : <f32>, %[[FLAT]] : tensor<8xi64>
 // SCALAR:      scf.for
 // SCALAR:      tensor.extract %[[FLAT]]
 // CHECK:       tt.return
@@ -100,7 +100,7 @@ tt.func @broadcast_pointer_reshape(%base: !tt.ptr<f32>, %offsets: tensor<2x1xi64
 // CHECK-SAME:  %[[BASE:.*]]: !tt.ptr<f32>, %[[OFFSETS:.*]]: tensor<2x1xi64>
 // CHECK:       %[[BROADCAST:.*]] = tt.broadcast %[[OFFSETS]] : tensor<2x1xi64> -> tensor<2x4xi64>
 // CHECK:       %[[FLAT:.*]] = tt.reshape %[[BROADCAST]] : tensor<2x4xi64> -> tensor<8xi64>
-// INDIRECT:    ascend.indirect_load %[[BASE]] : <f32>, %[[FLAT]] : tensor<8xi64>
+// INDIRECT:    ascend.unstructured_load %[[BASE]] : <f32>, %[[FLAT]] : tensor<8xi64>
 // SCALAR:      scf.for
 // CHECK:       tt.return
 
@@ -114,7 +114,7 @@ tt.func @uniform_pointer_reshape(%base: !tt.ptr<f32>) -> tensor<8xf32> {
 }
 
 // CHECK-LABEL: tt.func @uniform_pointer_reshape
-// INDIRECT:    ascend.indirect_load
+// INDIRECT:    ascend.unstructured_load
 // SCALAR:      scf.for
 // CHECK:       tt.return
 
@@ -133,5 +133,5 @@ tt.func @keep_lane_wise_base(%bases: tensor<2x4x!tt.ptr<f32>>, %offsets: tensor<
 // CHECK:       scf.for
 // CHECK:       tensor.extract %[[FLAT]]
 // CHECK:       tt.load
-// CHECK-NOT:   ascend.indirect_load
+// CHECK-NOT:   ascend.unstructured_load
 // CHECK:       tt.return

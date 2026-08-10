@@ -925,13 +925,13 @@ index 52192cf3e..241ba3378 100644
 +            load_handle = self.builder.create_masked_load(ptr.handle, mask.handle, other.handle if other else None,
 +                                                          cache, eviction, is_volatile)
 +
-+        if is_bool:
+         if is_bool:
+-            ret = self.cast(ret, tl.int1)
 +            load_handle.set_attr("was_bool_to_int8", self.builder.get_bool_attr(True))
 +
 +        ret = self.tensor(load_handle, dst_ty)
 +        # Do not cast back to int1 when is_bool=true. We directly use the int8 tensor given by tl.load
-         if is_bool:
--            ret = self.cast(ret, tl.int1)
++        if is_bool:
 +            ret.was_bool_to_int8 = True
 +
          return ret

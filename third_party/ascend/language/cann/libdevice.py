@@ -443,6 +443,7 @@ def isfinited(arg0):
 
 
 @core.extern
+@math._add_math_1arg_docstr("finitef")
 def finitef(arg0, _semantic=None):
     """
     Determines whether the input is a finite floating-point number.
