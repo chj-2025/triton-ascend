@@ -13,7 +13,7 @@
 // UNSTRUCTURE: tt.int_to_ptr
 // UNSTRUCTURE-NOT: tt.bitcast
 // SIMT-LABEL: tt.func public @widen_tensor_offset
-// SIMT: ascend.indirect_load
+// SIMT: ascend.unstructured_load
 // SIMT-NOT: tt.bitcast
 module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
   tt.func public @widen_tensor_offset(
