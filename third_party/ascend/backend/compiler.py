@@ -317,15 +317,15 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
 
         _intra_val = metadata.get("intra_cache_num")
         if _intra_val is not None:
-            ascend.passes.ttir.set_buffer_count("INTRA", _intra_val)
+            ascend.passes.ttir.set_buffer_count(mod, "INTRA", _intra_val)
 
         _inter_val = metadata.get("inter_cache_num")
         if _inter_val is not None:
-            ascend.passes.ttir.set_buffer_count("INTER", _inter_val)
+            ascend.passes.ttir.set_buffer_count(mod, "INTER", _inter_val)
 
         _load_val = metadata.get("load_cache_num")
         if _load_val is not None:
-            ascend.passes.ttir.set_buffer_count("LOAD", _load_val)
+            ascend.passes.ttir.set_buffer_count(mod, "LOAD", _load_val)
 
         pm.run(mod)
         _adjust_metadata_by_module_result(mod, metadata, opt,
@@ -753,7 +753,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += [
                 "--enable-hfusion-compile=true",
                 # CANN 9.1's hivmc-a5 cannot translate hacc.noinline yet.
-                "--enable-lib-call-no-inline=false",
+                # "--enable-lib-call-no-inline=false",
                 "--enable-triton-kernel-compile=true",
             ]
             if metadata.get("auto_simt_requested_kind") == "mixed_simd_simt":
@@ -1002,7 +1002,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
                 "--enable-hfusion-compile=true",
                 bishengir_hivm_opt,
                 # CANN 9.1's hivmc-a5 cannot translate hacc.noinline yet.
-                "--enable-lib-call-no-inline=false",
+                # "--enable-lib-call-no-inline=false",
                 "--enable-triton-kernel-compile=true",
             ]
 
@@ -1153,7 +1153,7 @@ class NPUOptions:
     enable_bishengir_simt_optimization: int = 000
     # compile_mode: "simd" (default), "unstructured_in_simt", "simd_simt", "simt_only"
     # When compile_mode is provided, it automatically sets other fields
-    compile_mode: str = "unstructured_in_simt"
+    compile_mode: str = "simd_simt"
     mix_mode: str = ""
     simt_stack_limit: int = None
     # take effect on the reorder instruction pattern for SIMT. The pattern is disabled by default.

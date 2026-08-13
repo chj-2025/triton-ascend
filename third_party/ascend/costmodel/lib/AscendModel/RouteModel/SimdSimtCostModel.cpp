@@ -1120,49 +1120,246 @@ rankingCalibrationCoverage(const SimdSimtFeatureSummary &features,
                            int64_t weightedReductions, int64_t dotFlops,
                            const CandidateProfile &profile,
                            double irregularDensity) {
-  if (features.hasDynamicShape)
-    return {false, "dynamic_shape"};
   const CoverageProfile &coverage = profile.coverage;
   const int64_t maxNumel = features.maxTensorNumel;
   const int64_t staticLoopTrips = features.staticLoopTripCountSum;
   const int64_t maskRankSum = features.maskRankSum;
   const bool hasTriangularSolve = llvm::is_contained(
       features.simtAnchors.mechanismKinds, "triangular_solve_loop");
-  // The triangular solve has intentionally dynamic loop bounds (min(T, 16),
-  // min(T, 32), ...), so the generic unknown-trip-count rejection is too
-  // coarse.  Admit only the bounded shape for which the manual scope and TTIR
-  // evidence are available; this is a route-specific calibration domain, not
-  // a general exemption for unknown loops.
-  if (hasTriangularSolve && !features.hasUnknownTripCount &&
-      maxNumel <= coverage.tinyDotMaxTensorNumel &&
-      features.simtAnchors.count >= 1 && features.simtAnchors.count <= 4)
+
+  // ---- 条件 1 -------------------------------------------------
+  llvm::errs() << "=== Condition 1 ===\n";
+  llvm::errs() << "  features.hasDynamicShape = "
+               << features.hasDynamicShape << "\n";
+
+  // 场景1：动态形状
+  // 当模型有动态形状时，直接返回"dynamic_shape"
+  if (features.hasDynamicShape) {
+    llvm::errs() << "  => true, return \"dynamic_shape\"\n";
+    return {false, "dynamic_shape"};
+  }
+
+  // ---- 条件 2 -------------------------------------------------
+  llvm::errs() << "=== Condition 2 ===\n";
+  llvm::errs() << "  hasTriangularSolve = " << hasTriangularSolve << "\n";
+  llvm::errs() << "  features.hasUnknownTripCount = "
+               << features.hasUnknownTripCount << "\n";
+  llvm::errs() << "  !features.hasUnknownTripCount = "
+               << !features.hasUnknownTripCount << "\n";
+  llvm::errs() << "  maxNumel = " << maxNumel << "\n";
+  llvm::errs() << "  coverage.tinyDotMaxTensorNumel = "
+               << coverage.tinyDotMaxTensorNumel << "\n";
+  llvm::errs() << "  features.simtAnchors.count = "
+               << features.simtAnchors.count << "\n";
+
+  // 场景2：三角求解循环（
+  // 条件：1）包含三角求解操作
+  //       2）循环次数已知（编译期可确定）
+  //       3）张量足够小，确保张量元素数量小于等于16
+  //       4）锚点数量在1到4之间（包含1和4个锚点）
+  // 当模型有三角求解循环时，返回"triangular_solve_loop"
+  bool cond2 = (hasTriangularSolve && !features.hasUnknownTripCount &&
+                maxNumel <= coverage.tinyDotMaxTensorNumel &&
+                features.simtAnchors.count >= 1 &&
+                features.simtAnchors.count <= 4);
+  llvm::errs() << "  overall cond2 = " << cond2 << "\n";
+  if (cond2) {
+    llvm::errs() << "  => return \"triangular_solve_loop\"\n";
     return {true, "triangular_solve_loop"};
-  if (hasTriangularSolve && maxNumel <= coverage.tinyDotMaxTensorNumel &&
-      features.simtAnchors.count >= 1 && features.simtAnchors.count <= 4 &&
-      maskRankSum <= coverage.rowwiseMaskRankSumMax + 16 &&
-      weightedReductions <= coverage.rowwiseWeightedReductionsMax)
+  }
+
+  // ---- 条件 3 -------------------------------------------------
+  llvm::errs() << "=== Condition 3 ===\n";
+  llvm::errs() << "  hasTriangularSolve = " << hasTriangularSolve << "\n";
+  llvm::errs() << "  maxNumel = " << maxNumel << "\n";
+  llvm::errs() << "  coverage.tinyDotMaxTensorNumel = "
+               << coverage.tinyDotMaxTensorNumel << "\n";
+  llvm::errs() << "  features.simtAnchors.count = "
+               << features.simtAnchors.count << "\n";
+  llvm::errs() << "  maskRankSum = " << maskRankSum << "\n";
+  int64_t rowMaskSumPlus16 = coverage.rowwiseMaskRankSumMax + 16;
+  llvm::errs() << "  coverage.rowwiseMaskRankSumMax + 16 = "
+               << rowMaskSumPlus16 << "\n";
+  llvm::errs() << "  weightedReductions = " << weightedReductions << "\n";
+  llvm::errs() << "  coverage.rowwiseWeightedReductionsMax = "
+               << coverage.rowwiseWeightedReductionsMax << "\n";
+  // 场景3：三角求解循环（
+  // 条件： 1）包含三角求解操作
+  //       2）张量足够小，确保张量元素数量小于等于16
+  //       3）锚点数量在1到4之间（包含1和4个锚点）
+  //       4）mask秩和 数量小于等于16
+  //       5）加权归约数小于等于16
+  // 当模型有三角求解循环时，返回"triangular_solve_loop"
+  bool cond3 = (hasTriangularSolve &&
+                maxNumel <= coverage.tinyDotMaxTensorNumel &&
+                features.simtAnchors.count >= 1 &&
+                features.simtAnchors.count <= 4 &&
+                maskRankSum <= rowMaskSumPlus16 &&
+                weightedReductions <= coverage.rowwiseWeightedReductionsMax);
+  llvm::errs() << "  overall cond3 = " << cond3 << "\n";
+  if (cond3) {
+    llvm::errs() << "  => return \"triangular_solve_loop\"\n";
     return {true, "triangular_solve_loop"};
-  if (features.hasUnknownTripCount)
+  }
+
+  // ---- 条件 4 -------------------------------------------------
+  llvm::errs() << "=== Condition 4 ===\n";
+  llvm::errs() << "  features.hasUnknownTripCount = "
+               << features.hasUnknownTripCount << "\n";
+  // 场景4：未知循环次数
+  // 当模型有未知循环次数为0时，返回"unknown_loop_trip_count"
+  if (features.hasUnknownTripCount) {
+    llvm::errs() << "  => true, return \"unknown_loop_trip_count\"\n";
     return {false, "unknown_loop_trip_count"};
-  if (dotFlops > 0 && dotFlops <= coverage.tinyDotFlopsMax &&
-      staticLoopTrips == 0 &&
-      maxNumel <= coverage.tinyDotMaxTensorNumel &&
-      irregularDensity >= coverage.minimumIrregularDensity)
+  }
+
+  // ---- 条件 5 -------------------------------------------------
+  llvm::errs() << "=== Condition 5 ===\n";
+  llvm::errs() << "  dotFlops = " << dotFlops << "\n";
+  llvm::errs() << "  coverage.tinyDotFlopsMax = "
+               << coverage.tinyDotFlopsMax << "\n";
+  llvm::errs() << "  staticLoopTrips = " << staticLoopTrips << "\n";
+  llvm::errs() << "  maxNumel = " << maxNumel << "\n";
+  llvm::errs() << "  coverage.tinyDotMaxTensorNumel = "
+               << coverage.tinyDotMaxTensorNumel << "\n";
+  llvm::errs() << "  irregularDensity = " << irregularDensity << "\n";
+  llvm::errs() << "  coverage.minimumIrregularDensity = "
+               << coverage.minimumIrregularDensity << "\n";
+  // 场景5：小型不规则点积（矩阵乘）（
+  // 条件： 1）有点积（矩阵乘）操作
+  //       2）点积规模很小
+  //       3）无循环（单次执行）
+  //       4）张量足够小，确保张量元素数量小于等于16
+  //       5）点积密度大于等于最小密度
+  // 适用场景 ：小型矩阵乘 + 不规则内存访问（如 gather 后做小 matmul）。SIMT 在这种场景下因为不规则访问而优于 SIMD
+  // 当模型有小不规则循环时，返回"tiny_irregular_dot"
+  bool cond5 = (dotFlops > 0 && dotFlops <= coverage.tinyDotFlopsMax &&
+                staticLoopTrips == 0 &&
+                maxNumel <= coverage.tinyDotMaxTensorNumel &&
+                irregularDensity >= coverage.minimumIrregularDensity);
+  llvm::errs() << "  overall cond5 = " << cond5 << "\n";
+  if (cond5) {
+    llvm::errs() << "  => return \"tiny_irregular_dot\"\n";
     return {true, "tiny_irregular_dot"};
-  if (dotFlops == 0 && features.rank1IndirectVectorReduce &&
-      weightedReductions > 0 &&
-      weightedReductions <= coverage.rank1WeightedReductionsMax &&
-      maxNumel <= coverage.rank1MaxTensorNumel &&
-      staticLoopTrips <= coverage.rowwiseLoopTripSumMax)
+  }
+
+  // ---- 条件 6 -------------------------------------------------
+  llvm::errs() << "=== Condition 6 ===\n";
+  llvm::errs() << "  dotFlops = " << dotFlops << "\n";
+  llvm::errs() << "  features.rank1IndirectVectorReduce = "
+               << features.rank1IndirectVectorReduce << "\n";
+  llvm::errs() << "  weightedReductions = " << weightedReductions << "\n";
+  llvm::errs() << "  coverage.rank1WeightedReductionsMax = "
+               << coverage.rank1WeightedReductionsMax << "\n";
+  llvm::errs() << "  maxNumel = " << maxNumel << "\n";
+  llvm::errs() << "  coverage.rank1MaxTensorNumel = "
+               << coverage.rank1MaxTensorNumel << "\n";
+  llvm::errs() << "  staticLoopTrips = " << staticLoopTrips << "\n";
+  llvm::errs() << "  coverage.rowwiseLoopTripSumMax = "
+               << coverage.rowwiseLoopTripSumMax << "\n";
+  // 场景6：Rank-1间接向量归约（
+  // 条件： 1）无矩阵乘
+  //       2）有 rank-1 间接索引归约（gather + reduce）
+  //       3）有加权归约
+  //       4）归约数受限
+  //       5）张量受限
+  //       6）静态循环受限
+  // 适用场景 ：Rank-1 间接索引归约（gather + reduce）在SIMT中是高效的，因为它可以并行处理多个索引。
+  // 当模型有Rank-1间接向量归约时，返回"rank1_indirect_vector_reduction"
+  bool cond6 = (dotFlops == 0 && features.rank1IndirectVectorReduce &&
+                weightedReductions > 0 &&
+                weightedReductions <= coverage.rank1WeightedReductionsMax &&
+                maxNumel <= coverage.rank1MaxTensorNumel &&
+                staticLoopTrips <= coverage.rowwiseLoopTripSumMax);
+  llvm::errs() << "  overall cond6 = " << cond6 << "\n";
+  if (cond6) {
+    llvm::errs() << "  => return \"rank1_indirect_vector_reduction\"\n";
     return {true, "rank1_indirect_vector_reduction"};
-  if (dotFlops == 0 && staticLoopTrips > 0 &&
-      staticLoopTrips <= coverage.rowwiseLoopTripSumMax && maskRankSum > 0 &&
-      maskRankSum <= coverage.rowwiseMaskRankSumMax &&
-      weightedReductions > 0 &&
-      weightedReductions <= coverage.rowwiseWeightedReductionsMax &&
-      maxNumel <= coverage.rowwiseMaxTensorNumel &&
-      irregularDensity >= coverage.minimumIrregularDensity)
+  }
+
+  // ---- 条件 7 (新增) ：masked_indirect_scatter -----------------
+  llvm::errs() << "=== Condition 7 (masked_indirect_scatter) ===\n";
+  llvm::errs() << "  dotFlops = " << dotFlops << "\n";
+  llvm::errs() << "  features.loadedIndexDependentMemoryOps = "
+               << features.loadedIndexDependentMemoryOps << "\n";
+  llvm::errs() << "  maxNumel = " << maxNumel << "\n";
+  llvm::errs() << "  coverage.rowwiseMaxTensorNumel = "
+               << coverage.rowwiseMaxTensorNumel << "\n";
+  llvm::errs() << "  maskRankSum = " << maskRankSum << "\n";
+  llvm::errs() << "  irregularDensity = " << irregularDensity << "\n";
+  // Masked indirect scatter/gather: address depends on a loaded index
+  // (loadedIndexDependentMemoryOps > 0) but there is no dot, no reduction,
+  // and no static loop.  Rank-1 indirect addressing naturally yields a low
+  // irregularDensity, so the generic minimumIrregularDensity gate (tuned for
+  // rowwise reductions) is not applied here.  SIMT advantage: per-lane
+  // independent address computation and mask predication.
+  // 场景7：Masked indirect scatter/gather（
+  // 条件： 1）无矩阵乘
+  //       2）必须有基于加载索引的内存操作（真实间接寻址）
+  //       3）张量足够小
+  //       4）必须有 mask
+  //       5）只要求有非零不规则密度（修正后约 0.125），不要求 >= 0.25 ，因为 rank-1 间接寻址的密度天然较低
+  // 适用场景 ：基于加载索引的 masked scatter/gather，无点积无归约无循环。SIMT 优势：每线程独立计算地址 + 独立 mask 判断
+  // 当模型有Masked indirect scatter/gather时，返回"masked_indirect_scatter"
+  bool cond7 = (dotFlops == 0 &&
+                features.loadedIndexDependentMemoryOps > 0 &&
+                maxNumel <= coverage.rowwiseMaxTensorNumel &&
+                maskRankSum > 0 &&
+                irregularDensity > 0.0);
+  llvm::errs() << "  overall cond7 = " << cond7 << "\n";
+  if (cond7) {
+    llvm::errs() << "  => return \"masked_indirect_scatter\"\n";
+    return {true, "masked_indirect_scatter"};
+  }
+
+  // ---- 条件 8 (原条件 7) ：masked_rowwise_reduction -------------
+  llvm::errs() << "=== Condition 8 (masked_rowwise_reduction) ===\n";
+  llvm::errs() << "  dotFlops = " << dotFlops << "\n";
+  llvm::errs() << "  staticLoopTrips = " << staticLoopTrips << "\n";
+  llvm::errs() << "  coverage.rowwiseLoopTripSumMax = "
+               << coverage.rowwiseLoopTripSumMax << "\n";
+  llvm::errs() << "  maskRankSum = " << maskRankSum << "\n";
+  llvm::errs() << "  coverage.rowwiseMaskRankSumMax = "
+               << coverage.rowwiseMaskRankSumMax << "\n";
+  llvm::errs() << "  weightedReductions = " << weightedReductions << "\n";
+  llvm::errs() << "  coverage.rowwiseWeightedReductionsMax = "
+               << coverage.rowwiseWeightedReductionsMax << "\n";
+  llvm::errs() << "  maxNumel = " << maxNumel << "\n";
+  llvm::errs() << "  coverage.rowwiseMaxTensorNumel = "
+               << coverage.rowwiseMaxTensorNumel << "\n";
+  llvm::errs() << "  irregularDensity = " << irregularDensity << "\n";
+  llvm::errs() << "  coverage.minimumIrregularDensity = "
+               << coverage.minimumIrregularDensity << "\n";
+  // 场景8：Masked rowwise reduction（
+  // 条件： 1）无矩阵乘
+  //       2）有循环（大于0）
+  //       3）循环次数受限
+  //       4）有 mask 操作
+  //       5）mask 秩和受限
+  //       6）有加权归约
+  //       7）归约数受限
+  //       8）张量受限
+  //       9）点积密度大于等于最小点积密度
+  // 适用场景 ：循环 + mask + 归约三者同时存在，SIMD 向量化的优势被 mask 打断，SIMT 更灵活
+  // 当模型有Masked rowwise reduction时，返回"masked_rowwise_reduction"
+  bool cond8 = (dotFlops == 0 &&
+                staticLoopTrips > 0 &&
+                staticLoopTrips <= coverage.rowwiseLoopTripSumMax &&
+                maskRankSum > 0 &&
+                maskRankSum <= coverage.rowwiseMaskRankSumMax &&
+                weightedReductions > 0 &&
+                weightedReductions <= coverage.rowwiseWeightedReductionsMax &&
+                maxNumel <= coverage.rowwiseMaxTensorNumel &&
+                irregularDensity >= coverage.minimumIrregularDensity);
+  llvm::errs() << "  overall cond8 = " << cond8 << "\n";
+  if (cond8) {
+    llvm::errs() << "  => return \"masked_rowwise_reduction\"\n";
     return {true, "masked_rowwise_reduction"};
+  }
+
+  // ---- fallback -------------------------------------------------
+  llvm::errs() << "=== fallback ===\n";
+  llvm::errs() << "  returning \"out_of_calibration_domain\"\n";
   return {false, "out_of_calibration_domain"};
 }
 
@@ -2262,8 +2459,15 @@ mlir::ascend::estimateSimdSimtCandidates(
   const int64_t dotFlops = features.dotFlops;
   const int64_t pointerOps =
       std::max<int64_t>(1, features.pointerTensorOps);
+  // Prefer the real SSA-back-slice signal (loadedIndexDependentMemoryOps) over
+  // the legacy rank-based proxy (laneDependentPointerOps).  The legacy proxy
+  // only fires when maxPointerRank > 1, so rank-1 indirect scatter/gather
+  // kernels (e.g. masked_select) incorrectly reported irregularDensity == 0.
+  const int64_t irregularPointerOps =
+      std::max<int64_t>(features.loadedIndexDependentMemoryOps,
+                        features.laneDependentPointerOps);
   report.breakdown.irregularDensity =
-      std::min(1.0, static_cast<double>(features.laneDependentPointerOps) /
+      std::min(1.0, static_cast<double>(irregularPointerOps) /
                         pointerOps);
   auto [covered, domain] = rankingCalibrationCoverage(
       features, weightedReductions, dotFlops, profile,
@@ -2636,10 +2840,18 @@ mlir::ascend::estimateSimdSimtCandidates(
   const int64_t remainingLaneDependentPointerOps =
       std::max<int64_t>(0, features.laneDependentPointerOps -
                                features.simtAnchors.laneDependentPointerOps);
+  const int64_t remainingLoadedIndexDependentMemoryOps = std::max<int64_t>(
+      0, features.loadedIndexDependentMemoryOps -
+             features.simtAnchors.loadedIndexDependentMemoryOps);
+  // Mirror the irregularDensity fix: prefer the real SSA-back-slice signal
+  // over the legacy rank-based proxy so rank-1 indirect ops are accounted.
+  const int64_t remainingIrregularPointerOps =
+      std::max(remainingLoadedIndexDependentMemoryOps,
+               remainingLaneDependentPointerOps);
   const double remainingIrregularDensity =
       remainingPointerOps > 0
           ? std::min(1.0,
-                     static_cast<double>(remainingLaneDependentPointerOps) /
+                     static_cast<double>(remainingIrregularPointerOps) /
                          remainingPointerOps)
           : 0.0;
   const int64_t remainingMaskRank =
@@ -2834,6 +3046,7 @@ llvm::Expected<SimdSimtCostReport>
 mlir::ascend::analyzeSimdSimtCandidates(
     ModuleOp module, const SimtAnchorPlan &anchorPlan,
     const SimdSimtCostModelOptions &options) {
+  llvm::errs() << "\n>>> analyzeSimdSimtCandidates. ModuleOp:\n" << module << "\n";
   auto features = analyzeSimdSimtFeatures(module, anchorPlan);
   if (!features)
     return features.takeError();

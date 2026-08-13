@@ -80,6 +80,15 @@
           "mixed_simd_simt_validated": true,
           "source": "A5 card 0, solve-tril BT16/num_warps4, one process with routes interleaved after 50 warmup, 200 NPU Event samples each: median all-SIMD 22.1160 us, all-SIMT 21.9315 us, C++-materialized mixed 22.3130 us; all routes correctness PASS. The all-SIMT advantage is below the 10% production switch margin, so Post Check keeps the all-SIMD baseline.",
           "confidence": "low"
+        },
+        "masked_indirect_scatter": {
+          "all_simd": 1.15,
+          "all_simt_only": 0.85,
+          "mixed_simd_simt": 0.90,
+          "all_simt_only_validated": false,
+          "mixed_simd_simt_validated": true,
+          "source": "Analytical seed for rank-1 masked indirect scatter/gather kernels (e.g. masked_select). SIMD requires gather/scatter emulation with per-element mask materialization; SIMT performs per-lane independent address computation and predicated store. Multipliers are conservative initial estimates pending dedicated NPU Event calibration on A5.",
+          "confidence": "low"
         }
       }
     }
