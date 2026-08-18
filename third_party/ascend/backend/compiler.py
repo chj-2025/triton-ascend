@@ -32,8 +32,7 @@ import warnings
 from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, Optional, Tuple, Union
-from .debug_line_rewriter import rewrite_debug_line
+from typing import Any, Dict, Optional, Tuple
 
 from triton._C.libtriton import ir, passes, ascend, buffer_ir
 from triton._C.libtriton.ascend import ir as ascend_ir
@@ -44,7 +43,6 @@ except ImportError:
 from triton.backends.ascend.utils import (
     _multibuffer_mode_to_tuple,
     _check_bishengir_api_change,
-    _check_bishengir_able_save_ir,
     _check_bishengir_is_regbased,
     _enable_print_ub_bits,
     _enable_dump_memory_info,
@@ -329,10 +327,76 @@ def make_ttir(mod, metadata, opt):
     return mod
 
 
-def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
+def _costmodel_profiles_dir() -> Path:
+    """Locate runtime assets without requiring backend-specific setup.py code."""
+    compiler = Path(__file__)
+
+    # Ascend CMake copies canonical profiles beside the native extension.
+    native_packaged = (compiler.resolve().parents[2] / "_C" / "ascend" / "costmodel_profiles")
+    if native_packaged.is_dir():
+        return native_packaged
+
+    # Compatibility with packages produced before the Cost Model ownership
+    # cleanup.  Check this only after the canonical native package location so
+    # incremental build directories cannot shadow freshly packaged profiles.
+    legacy_packaged = compiler.with_name("costmodel_profiles")
+    if legacy_packaged.is_dir():
+        return legacy_packaged
+
+    # Editable/source-tree builds resolve compiler.py back into
+    # third_party/ascend/backend.
+    source = Path(__file__).resolve().parent.parent / "costmodel" / "profiles"
+    return source if source.is_dir() else native_packaged
+
+
+def _run_cpp_simd_simt_costmodel(mod, metadata, opt) -> str:
+    """Run native selection/materialization; Python only schedules the passes."""
+    mode = opt.auto_simt_scope_mode
+    if mode == "off" or metadata.get("compile_mode") != "simd_simt":
+        return "backend_default"
+
+    profile = opt.auto_simt_model_profile or str(
+        _costmodel_profiles_dir() / "simd_simt" / "david_v100_simd_simt_v1.json")
+    pm = ir.pass_manager(mod.context)
+    pm.enable_debug()
+    ascend.passes.ttir.add_select_simd_simt_costmodel(
+        pm,
+        mode,
+        profile,
+        str(opt.arch),
+        int(opt.num_warps),
+        float(opt.auto_simt_scope_margin),
+        bool(opt.compile_on_910_95),
+        str(opt.auto_simt_scope_dump),
+    )
+    ascend.passes.ttir.add_materialize_simt_scopes(pm)
+    pm.run(mod, "select_simd_simt_costmodel")
+
+    report = ascend.ir.get_string_attr(mod, "ascend.simt_costmodel.report_json")
+    effective = ascend.ir.get_string_attr(mod, "ascend.simt_costmodel.effective")
+    if not report or effective not in {"all_simd", "all_simt_only", "mixed_simd_simt", "backend_default"}:
+        raise RuntimeError("invalid native SIMD/SIMT costmodel result")
+    metadata["auto_simt_scope_report"] = report
+    if effective == "mixed_simd_simt":
+        metadata["auto_simt_requested_kind"] = effective
+    return effective
+
+
+def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
     # use triton_adapter to lower Triton-MLIR to linalg
-    # Get Triton-MLIR as string
-    ttir_code = _serialize_module(mod, opt)
+    cpp_decision = _run_cpp_simd_simt_costmodel(mod, metadata, opt)
+    cpp_all_simt = cpp_decision == "all_simt_only"
+    if metadata.get("compile_mode") == "simd_simt" and (cpp_all_simt or ascend.ir.is_whole_body_void_simt_scope(mod)):
+        metadata["scope_pure_simt_auto"] = True
+        metadata["force_simt_only"] = True
+        metadata["parallel_mode"] = "simt"
+        metadata["shared_mem_dynamic_size"] = 122880
+        ascend.ir.inline_void_simt_scopes_for_pure_simt(mod)
+        ascend.ir.clear_simd_simt_costmodel_attrs(mod)
+        return str(mod)
+
+    # Get TTIR after C++ has materialized any selected mixed-mode scopes.
+    ttir_code = str(mod)
     auto_map_parallel_blocks_enabled = _is_auto_map_parallel_blocks_enabled()
     # This is compiler-derived safety metadata, never a user compile option.
     # Derive it even when the feature is currently disabled so a later runtime
@@ -353,8 +417,19 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         # Select analysis is a fixed lowering policy, not a user compile option.
         enable_select_analysis = True
         compile_on_910_95 = metadata["compile_on_910_95"]
-        force_simt_template = metadata["force_simt_template"]
+        requested_force_simt_template = metadata["force_simt_template"]
         compile_mode = _validate_compile_mode(metadata.get("compile_mode", "simd"))
+        # Once the C++ Route Model has made an explicit decision, lowering
+        # must implement that decision rather than also applying the legacy
+        # global SIMT-template switch. A mixed decision is represented solely
+        # by the materialized scope.scope<vector_mode=simt>; an all-SIMD
+        # decision contains no such scope.  Keep the old global behavior only
+        # for backend_default/report/off compatibility paths.
+        model_owns_local_routing = cpp_decision in {
+            "all_simd",
+            "mixed_simd_simt",
+        }
+        force_simt_template = (requested_force_simt_template and not model_owns_local_routing)
         if force_simt_template:
             compile_mode = "simd_simt_template"
         enable_sync_block_lock = metadata["enable_sync_block_lock"]
@@ -418,15 +493,15 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
 
         _intra_val = metadata.get("buf_slot_num_of_veccore")
         if _intra_val is not None:
-            ascend.passes.ttir.set_buffer_count(mod, "INTRA", _intra_val)
+            ascend.passes.ttir.set_buffer_count("INTRA", _intra_val)
 
         _inter_val = metadata.get("buf_slot_num_of_crosscore")
         if _inter_val is not None:
-            ascend.passes.ttir.set_buffer_count(mod, "INTER", _inter_val)
+            ascend.passes.ttir.set_buffer_count("INTER", _inter_val)
 
         _load_val = metadata.get("buf_slot_num_of_gm")
         if _load_val is not None:
-            ascend.passes.ttir.set_buffer_count(mod, "LOAD", _load_val)
+            ascend.passes.ttir.set_buffer_count("LOAD", _load_val)
 
         if opt.debug:
             # Print the equivalent triton-opt command line so the pass
@@ -604,6 +679,13 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     # the mix mode is also encoded into metadata['name'] for runtime to distinguish
     metadata["mix_mode"] = re.search(MIX_MODE_REGEX, linalg).group(1)
     metadata["parallel_mode"] = re.search(PARALLEL_MODE_REGEX, linalg).group(1)
+    if metadata.get("auto_simt_requested_kind") == "mixed_simd_simt":
+        applied = metadata["parallel_mode"] == "mix_simd_simt"
+        metadata["auto_simt_scope_applied"] = applied
+        if not applied and os.environ.get("TRITON_ASCEND_AUTO_SIMT_STRICT_VERIFY",
+                                          "").strip().lower() in {"1", "true", "yes", "on"}:
+            raise RuntimeError("C++ costmodel selected mixed SIMD/SIMT, but lowering "
+                               f"reported {metadata['parallel_mode']!r}")
     metadata["kernel_name"] = re.search(KERNEL_NAME_REGEX, linalg).group(1)
     # Check the function load_binary in npu_driver.py.
     metadata["name"] = metadata["kernel_name"]
@@ -645,6 +727,73 @@ def _parse_ttir_metadata(ttir: str, metadata: dict):
     # Parse all tensor kinds from arguments
     metadata["tensor_kinds"] = [int(kind) for _, kind in re.findall(TENSOR_KIND_REGEX, ttir)]
     return metadata
+
+
+def _normalize_auto_simt_scope_mode(mode: Optional[str]) -> str:
+    if mode is None:
+        return "off"
+    mode = str(mode).strip().lower()
+    if mode in ("1", "true", "on", "yes", "auto"):
+        return "auto"
+    if mode in ("report", "dry_run", "dry-run", "dump"):
+        return "report"
+    return "off"
+
+
+VALID_PARTITION_AND_BIND_SUB_BLOCK = (
+    "off",
+    "default-pin",
+    "load-balanced",
+)
+
+
+def _validate_partition_and_bind_sub_block(partition_mode: str) -> str:
+    if partition_mode not in VALID_PARTITION_AND_BIND_SUB_BLOCK:
+        valid_values = ", ".join(VALID_PARTITION_AND_BIND_SUB_BLOCK)
+        raise ValueError("Invalid enable_partition_and_bind_sub_block="
+                         f"{partition_mode!r}. Expected one of: {valid_values}.")
+    return partition_mode
+
+
+def _parse_float_env(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _auto_simt_asset_hash(path: str, default_name: str) -> str:
+    asset = Path(path) if path else _costmodel_profiles_dir() / default_name
+    try:
+        selection_bytes = asset.read_bytes()
+    except OSError:
+        return f"missing:{asset}"
+
+    digest = hashlib.sha256()
+    digest.update(b"selection-profile\0")
+    digest.update(selection_bytes)
+    try:
+        profile = json.loads(selection_bytes)
+        shared_ref = (profile.get("microbenchmark_profile") if isinstance(profile, dict) else None)
+    except (TypeError, ValueError, UnicodeError):
+        shared_ref = None
+    if shared_ref is not None and not isinstance(shared_ref, str):
+        digest.update(b"\0invalid-shared-microbenchmark-reference\0")
+        digest.update(repr(shared_ref).encode())
+        return digest.hexdigest()
+    if shared_ref:
+        shared_asset = Path(shared_ref)
+        if not shared_asset.is_absolute():
+            shared_asset = asset.parent / shared_asset
+        digest.update(b"\0shared-microbenchmark\0")
+        try:
+            digest.update(shared_asset.read_bytes())
+        except OSError:
+            digest.update(f"missing:{shared_asset}".encode())
+    return digest.hexdigest()
 
 
 def get_common_bishengir_compile_options(metadata):
@@ -1161,7 +1310,11 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
                 bishengir_hivm_opt,
                 "--enable-triton-kernel-compile=true",
             ]
-
+            if (_needs_lib_call_no_inline(metadata)
+                    and _npu_compiler_supports_option(npu_compiler_path, "--enable-lib-call-no-inline")):
+                _compile_option_list += ["--enable-lib-call-no-inline=false"]
+        _compile_option_list += ["--mlir-print-ir-after-failure"]
+        _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
         if opt.debug:
             _compile_option_list += ["--mlir-print-ir-after-failure"]
             _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
@@ -1281,6 +1434,9 @@ class NPUOptions:
     disable_size_align_for_cast: bool = None
     enable_preload: bool = None
     enable_auto_bind_sub_block: bool = None
+    # Experimental BiShengIR policy for assigning work to the two AIV
+    # sub-blocks. Off preserves the existing backend behavior.
+    enable_partition_and_bind_sub_block: str = "off"
     disable_tightly_coupled_buffer_reuse: bool = False
     enable_hivm_auto_cv_balance: bool = None
     # Temporary 910_95 switch; the NPU compiler plans to make this default in Q4.
@@ -1386,6 +1542,42 @@ class NPUOptions:
     def __post_init__(self, arch, rule_mask):
         from triton.backends.ascend import _apply_ascend_patch
 
+        mode = self.auto_simt_scope_mode or os.environ.get("TRITON_ASCEND_AUTO_SIMT_SCOPE", "")
+        object.__setattr__(self, "auto_simt_scope_mode", _normalize_auto_simt_scope_mode(mode))
+        dump = self.auto_simt_scope_dump or os.environ.get("TRITON_ASCEND_AUTO_SIMT_SCOPE_DUMP", "")
+        margin = self.auto_simt_scope_margin
+        if margin is None:
+            margin = _parse_float_env("TRITON_ASCEND_AUTO_SIMT_SCOPE_MARGIN", 0.10)
+        try:
+            margin = float(margin)
+            margin = (min(1.0, max(0.0, margin)) if float("-inf") < margin < float("inf") else 0.10)
+        except (TypeError, ValueError):
+            margin = 0.10
+        profile = self.auto_simt_model_profile or os.environ.get("TRITON_ASCEND_AUTO_SIMT_PROFILE", "")
+        if self.auto_simt_scope_mode == "off":
+            dump, margin, profile, asset_hash = "", 0.10, "", "disabled"
+        else:
+            asset_hash = _auto_simt_asset_hash(profile, "simd_simt/david_v100_simd_simt_v1.json")
+        object.__setattr__(self, "auto_simt_scope_dump", dump)
+        object.__setattr__(self, "auto_simt_scope_margin", margin)
+        object.__setattr__(self, "auto_simt_model_profile", profile)
+        object.__setattr__(self, "auto_simt_model_assets_hash", asset_hash)
+
+        forced_compile_mode = os.environ.get("TRITON_ASCEND_COMPILE_MODE")
+        if forced_compile_mode:
+            object.__setattr__(self, "compile_mode", forced_compile_mode)
+
+        _validate_partition_and_bind_sub_block(self.enable_partition_and_bind_sub_block)
+
+        # Backward compatibility: legacy force options override compile_mode.
+        if self.force_simt_template:
+            warnings.warn(
+                "force_simt_template is deprecated, use compile_mode='simd_simt_template' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            object.__setattr__(self, "compile_mode", "simd_simt_template")
+
         _apply_ascend_patch()
         object.__setattr__(self, "target_arch", arch)
         # Plain init=False defaults live on the class. Materialize them in
@@ -1481,8 +1673,13 @@ def _normalize_bishengir_simt_optimization_for_context(options: NPUOptions, raw_
 
 
 def ttir_to_npubin(mod, metadata, opt):
-    _export_program_grid_metadata(mod, metadata, require_row_contract=True)
-    ttir_code = _serialize_module(mod, opt)
+    if opt.force_simt_only:
+        metadata["force_simt_only"] = True
+        metadata["parallel_mode"] = "simt"
+        metadata["shared_mem_dynamic_size"] = opt.shared_mem_dynamic_size
+        if not isinstance(mod, str):
+            ascend.ir.inline_void_simt_scopes_for_pure_simt(mod)
+    ttir_code = mod if isinstance(mod, str) else str(mod)
     metadata = _parse_ttir_metadata(ttir_code, metadata)
     _finalize_program_launch_policy(metadata, opt)
 
@@ -1520,7 +1717,10 @@ def ttir_to_npubin(mod, metadata, opt):
             if bisheng_options is not None:
                 _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
 
-            if _is_auto_map_parallel_blocks_enabled() and not metadata.get("row_coalescing_applied", False):
+            # Enable SIMT auto-blockify when TRITON_ALL_BLOCKS_PARALLEL is set,
+            # mirroring the SIMD compile paths. driver.py's runtime block-count
+            # cap keys off the same env switch, so the two stay in sync.
+            if (_is_auto_map_parallel_blocks_enabled() and not metadata.get("has_auto_blockify_blacklist_op", False)):
                 _compile_option_list += ["--enable-auto-blockify-loop"]
                 if opt.superblock_factor > 1:
                     _compile_option_list += [f"--super-block-factor={opt.superblock_factor}"]
