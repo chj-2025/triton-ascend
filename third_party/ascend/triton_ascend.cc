@@ -10,6 +10,7 @@
 #include "mlir/Transforms/Passes.h" // createInlinerPass
 
 #include "ascend/include/AutoBlockify/Passes.h"
+#include "ascend/include/AutoBlockifyV1/Passes.h"
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
 #include "ascend/include/TritonControlFlowOpt/Passes.h"
@@ -64,27 +65,60 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     opts.autoBlockifySize = autoBlockifySize;
     pm.addPass(mlir::triton::createAutoBlockifyPass(opts));
   });
+  m.def("add_ttir_layout_merge", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createTTIRLayoutMergePass());
+  });
+  m.def("add_simt_auto_blockify_v1", [](mlir::PassManager &pm,
+                                        int physicalVectorCoreCount,
+                                        int superBlockFactor) {
+    if (physicalVectorCoreCount <= 0)
+      throw py::value_error(
+          "physical_vector_core_count must be greater than zero");
+    if (superBlockFactor <= 0)
+      throw py::value_error("super_block_factor must be greater than zero");
+    TASIMTAutoBlockifyV1Options opts;
+    opts.physicalVectorCoreCount = physicalVectorCoreCount;
+    opts.superBlockFactor = superBlockFactor;
+    pm.addNestedPass<mlir::triton::FuncOp>(
+        mlir::triton::createTASIMTAutoBlockifyV1Pass(opts));
+  });
+  m.def(
+      "add_refine_simt_auto_blockify_v1_superblock",
+      [](mlir::PassManager &pm, int superBlockFactor) {
+        if (superBlockFactor <= 0)
+          throw py::value_error("super_block_factor must be greater than zero");
+        TARefineSIMTAutoBlockifyV1SuperBlockOptions opts;
+        opts.superBlockFactor = superBlockFactor;
+        pm.addNestedPass<mlir::triton::FuncOp>(
+            mlir::triton::createTARefineSIMTAutoBlockifyV1SuperBlockPass(opts));
+      });
 
 #if TRITON_ASCEND_HAS_INPROC_COSTMODEL
   m.def(
       "add_select_simd_simt_costmodel",
       [](mlir::PassManager &pm, const std::string &mode,
          const std::string &profilePath, const std::string &actualTarget,
-         int64_t numWarps, double marginRatio, bool compileOn91095,
-         const std::string &reportFile) {
+         int64_t numWarps, bool compileOn91095,
+         bool wholeKernelSuperblockMaterializable,
+         bool scopeSuperblockMaterializable, const std::string &reportFile) {
         mlir::ascend::SelectSimdSimtCostModelPassOptions opts;
         opts.mode = mode;
         opts.profilePath = profilePath;
         opts.actualTarget = actualTarget;
         opts.numWarps = numWarps;
-        opts.marginRatio = marginRatio;
         opts.compileOn91095 = compileOn91095;
+        opts.wholeKernelSuperblockMaterializable =
+            wholeKernelSuperblockMaterializable;
+        opts.scopeSuperblockMaterializable = scopeSuperblockMaterializable;
         opts.reportFile = reportFile;
         pm.addPass(mlir::ascend::createSelectSimdSimtCostModelPass(opts));
       },
       py::arg("pm"), py::arg("mode"), py::arg("profile_path"),
-      py::arg("actual_target"), py::arg("num_warps"), py::arg("margin_ratio"),
-      py::arg("compile_on_910_95"), py::arg("report_file") = "");
+      py::arg("actual_target"), py::arg("num_warps"),
+      py::arg("compile_on_910_95"),
+      py::arg("whole_kernel_superblock_materializable") = false,
+      py::arg("scope_superblock_materializable") = false,
+      py::arg("report_file") = "");
 
   m.def("add_materialize_simt_scopes", [](mlir::PassManager &pm) {
     pm.addPass(mlir::ascend::createMaterializeSimtScopesPass());

@@ -301,6 +301,60 @@ static bool isTriangularSolveLoop(Operation *op) {
   return hasTriangularState || siblingMatches >= 1;
 }
 
+static TriangularSolveFacts analyzeTriangularSolveFacts(Operation *anchor) {
+  TriangularSolveFacts facts;
+  if (!anchor || !anchor->getBlock())
+    return facts;
+
+  auto recordStateType = [&](Type type) {
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    if (!tensor || !tensor.hasStaticShape() || tensor.getRank() != 2)
+      return;
+    if (facts.blockRows == 0 && facts.blockColumns == 0) {
+      facts.blockRows = tensor.getShape()[0];
+      facts.blockColumns = tensor.getShape()[1];
+      facts.accumulatorType = getScalarTypeName(tensor.getElementType());
+    }
+  };
+  if (anchor->getNumRegions() == 1 && !anchor->getRegion(0).empty())
+    for (BlockArgument argument : anchor->getRegion(0).front().getArguments())
+      recordStateType(argument.getType());
+  for (Type type : anchor->getResultTypes())
+    recordStateType(type);
+
+  Operation *lastRecurrence = nullptr;
+  int64_t recurrenceLoopOps = 0;
+  for (Operation &candidate : *anchor->getBlock()) {
+    if (!isTriangularSolveLoop(&candidate))
+      continue;
+    ++recurrenceLoopOps;
+    lastRecurrence = &candidate;
+  }
+
+  // The recognized 16x16 recurrence updates rows [2, 16), hence 14 modeled
+  // trips per full block.  Keep the start row explicit so structural matching
+  // and reports do not hide that structural assumption in a magic trip count.
+  facts.recurrenceStartRow = 2;
+  // recurrenceLoopCount is consumed by StageCostModel as N_iter.  It must be
+  // the dynamic body execution count, not the number of sibling scf.for ops.
+  // A full 16x16 block updates rows [2, 16), hence 14 iterations.
+  facts.recurrenceLoopCount =
+      facts.blockRows > facts.recurrenceStartRow
+          ? recurrenceLoopOps * (facts.blockRows - facts.recurrenceStartRow)
+          : recurrenceLoopOps;
+
+  for (Operation *candidate = lastRecurrence ? lastRecurrence->getNextNode()
+                                             : nullptr;
+       candidate; candidate = candidate->getNextNode()) {
+    candidate->walk([&](Operation *nested) {
+      facts.denseDotTailOps +=
+          nested->getName().getStringRef() == "tt.dot" ? 1 : 0;
+    });
+  }
+  facts.requiresCubeTailPartition = facts.denseDotTailOps > 0;
+  return facts;
+}
+
 static bool isMovableTriangularTensorSetup(Operation *op) {
   if (!op || op->getNumResults() == 0 || op->getNumRegions() != 0)
     return false;
@@ -559,6 +613,7 @@ static std::optional<SimtAnchorDescriptor> analyzeAnchor(Operation *op,
     }
   } else if (isTriangularSolveLoop(op)) {
     descriptor.kind = SimtAnchorKind::TriangularSolveLoop;
+    descriptor.facts = analyzeTriangularSolveFacts(op);
     descriptor.lowerability = simpleMixedLowerability(
         "pure_simt_triangular_solve_requires_cube_tail_partition");
     descriptor.lowerability.mixedReasons.push_back(

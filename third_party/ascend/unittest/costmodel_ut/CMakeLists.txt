@@ -42,4 +42,8 @@ add_triton_ut(
     TRITON_ASCEND_SIMD_SIMT_TEST_PROFILE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../costmodel/profiles/simd_simt/david_v100_simd_simt_v1.json"
   LIBS
     AscendModelRouteModel
+    MLIRArithDialect
+    MLIRFuncDialect
+    MLIRParser
+    MLIRSCFDialect
 )

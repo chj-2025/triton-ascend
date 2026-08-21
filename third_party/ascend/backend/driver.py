@@ -561,7 +561,16 @@ def make_launcher(constants, signature, metadata):
         "has_auto_blockify_blacklist_op",
         False,
     )
-    enable_auto_map_parallel_blocks = (_is_auto_map_parallel_blocks_enabled() and not has_auto_blockify_blacklist_op)
+    auto_blockify_v1_runtime_cap = getattr(
+        metadata,
+        "auto_blockify_v1_runtime_cap",
+        None,
+    )
+    if auto_blockify_v1_runtime_cap is None:
+        # Compatibility for cached metadata produced before the shared V1
+        # policy was exported by compiler.py.
+        auto_blockify_v1_runtime_cap = _is_auto_map_parallel_blocks_enabled()
+    enable_auto_map_parallel_blocks = (auto_blockify_v1_runtime_cap and not has_auto_blockify_blacklist_op)
     npu_utils = NPUUtils()
     num_physical_blocks = npu_utils.get_aivector_core_num() if mix_mode == "aiv" else npu_utils.get_aicore_num()
     task_type, mix_block_dim_ratio = _format_of_msprof_task_type_ratio(bs_task_type, mix_mode)
@@ -624,15 +633,19 @@ static void release_npu_tensor_handle(void* handle) {{
     # and the program-id/grid axis it applies to. Each program now covers H tiles
     # along that axis, so the host shrinks the matching grid dim by H here (the
     # equivalent of what bishengir AutoBlockify used to do via hacc.coalesce_factor;
-    # bishengir no longer touches it). The division is unconditional and mirrors the
-    # old integer division -- the kernel rewrite assumes grid[axis] % H == 0.
+    # bishengir no longer touches it). Tile/strided merges require exact
+    # divisibility; independent-row coalescing carries a runtime tail predicate
+    # and therefore explicitly requests ceil-div.
     coalesce_factor = int(getattr(metadata, "coalesce_factor", 1) or 1)
     coalesce_axis = int(getattr(metadata, "coalesce_axis", -1))
+    coalesce_grid_ceil_div = bool(getattr(metadata, "coalesce_grid_ceil_div", False))
     if coalesce_factor > 1 and coalesce_axis in (0, 1, 2):
         _coalesce_grid_var = {0: "gridX", 1: "gridY", 2: "gridZ"}[coalesce_axis]
+        _coalesce_grid_expr = (f"({_coalesce_grid_var} + {coalesce_factor} - 1) / {coalesce_factor}"
+                               if coalesce_grid_ceil_div else f"{_coalesce_grid_var} / {coalesce_factor}")
         coalesce_grid_div = (f"// coalescing: each program covers {coalesce_factor} tiles along "
                              f"axis {coalesce_axis}; shrink that grid dim.\n"
-                             f"  {_coalesce_grid_var} = {_coalesce_grid_var} / {coalesce_factor};")
+                             f"  {_coalesce_grid_var} = {_coalesce_grid_expr};")
     else:
         coalesce_grid_div = ""
 

@@ -238,6 +238,45 @@ module {
 }
 
 TEST(CostModelPassesTest,
+     LoopDependencyAnalysisSeparatesDataStateFromPointerInduction) {
+  mlir::MLIRContext context;
+  context.allowUnregisteredDialects();
+  auto module = parseModule(context, R"mlir(
+module {
+  func.func @main(%base: tensor<4xi64>, %initial: i32) -> i32 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %one = arith.constant 1 : i32
+    %step = arith.constant dense<1> : tensor<4xi64>
+    %ptr_result = scf.for %i = %c0 to %c4 step %c1
+        iter_args(%ptr = %base) -> tensor<4xi64> {
+      %loaded = "tt.load"(%ptr) : (tensor<4xi64>) -> tensor<4xf32>
+      %next = "tt.addptr"(%ptr, %step)
+        : (tensor<4xi64>, tensor<4xi64>) -> tensor<4xi64>
+      scf.yield %next : tensor<4xi64>
+    }
+    %sum = scf.for %i = %c0 to %c4 step %c1
+        iter_args(%acc = %initial) -> i32 {
+      %next = arith.addi %acc, %one : i32
+      scf.yield %next : i32
+    }
+    return %sum : i32
+  }
+}
+)mlir");
+  ASSERT_TRUE(module);
+
+  auto plan = buildMixedSimtAnchorPlan(*module, /*compileOn91095=*/true);
+  auto features = analyzeSimdSimtFeatures(*module, plan);
+  if (!features)
+    FAIL() << llvm::toString(features.takeError());
+
+  EXPECT_EQ(features->pointerInductionDependencyCount, 1);
+  EXPECT_EQ(features->loopCarriedDataDependencyCount, 1);
+}
+
+TEST(CostModelPassesTest,
      SimtAnchorAnalysisExtractsHistogramFactsAndLowerability) {
   mlir::MLIRContext context;
   context.allowUnregisteredDialects();
@@ -451,6 +490,16 @@ module {
     EXPECT_EQ(anchor.scopeInsertionPoint, anchor.operation);
     EXPECT_EQ(anchor.scopeOperations.front()->getName().getStringRef(),
               "tt.make_range");
+    const auto *facts =
+        std::get_if<mlir::ascend::TriangularSolveFacts>(&anchor.facts);
+    ASSERT_NE(facts, nullptr);
+    EXPECT_EQ(facts->blockRows, 16);
+    EXPECT_EQ(facts->blockColumns, 16);
+    EXPECT_EQ(facts->accumulatorType, "f32");
+    EXPECT_EQ(facts->recurrenceStartRow, 2);
+    EXPECT_EQ(facts->recurrenceLoopCount, 2);
+    EXPECT_EQ(facts->denseDotTailOps, 0);
+    EXPECT_FALSE(facts->requiresCubeTailPartition);
   }
   EXPECT_EQ(plan.kernelLowerability.mixed,
             mlir::ascend::CandidateLoweringStatus::Native);
@@ -470,6 +519,8 @@ module {
   // that is moved into the same scope.
   EXPECT_EQ(features->simtAnchors.predicateLaneEvaluations, 7424);
   EXPECT_TRUE(features->hasUnknownTripCount);
+  EXPECT_EQ(features->loopCarriedDataDependencyCount, 2);
+  EXPECT_EQ(features->pointerInductionDependencyCount, 0);
 
   ASSERT_TRUE(mlir::succeeded(materializeSimtAnchorPlan(*module, plan)));
   Operation *scope = findFirstOp(*module, "scope.scope");
@@ -548,14 +599,13 @@ TEST(CostModelPassesTest, PerfReportPassAcceptsEstimatedPipeline) {
                         createPipelineAnalysisPass(), createPerfReportPass()));
 }
 
-TEST(CostModelPassesTest, SimdSimtCoverageShortCircuitIsAutoOnly) {
+TEST(CostModelPassesTest, SimdSimtAutoAlwaysScoresLegalCandidates) {
   auto configureOptions = [](SelectSimdSimtCostModelPassOptions &options,
                              llvm::StringRef mode) {
     options.mode = mode.str();
     options.profilePath = TRITON_ASCEND_SIMD_SIMT_TEST_PROFILE_PATH;
     options.actualTarget = "Ascend950PR_9579";
     options.numWarps = 4;
-    options.marginRatio = 0.10;
     options.compileOn91095 = true;
   };
 
@@ -579,25 +629,23 @@ TEST(CostModelPassesTest, SimdSimtCoverageShortCircuitIsAutoOnly) {
   ASSERT_TRUE(autoEffective);
   ASSERT_TRUE(autoRecommended);
   ASSERT_TRUE(autoReport);
-  EXPECT_EQ(autoEffective.getValue(), "backend_default");
-  EXPECT_EQ(autoRecommended.getValue(), "backend_default");
-  EXPECT_FALSE((*autoModule)->hasAttr("ascend.simt_costmodel.all_simd_score"));
+  EXPECT_EQ(autoEffective.getValue(), "all_simd");
+  EXPECT_EQ(autoRecommended.getValue(), "all_simd");
+  EXPECT_TRUE((*autoModule)->hasAttr("ascend.simt_costmodel.all_simd_score"));
   auto autoJSON = llvm::json::parse(autoReport.getValue());
   ASSERT_TRUE(static_cast<bool>(autoJSON));
   auto *autoObject = autoJSON->getAsObject();
   ASSERT_NE(autoObject, nullptr);
-  auto autoEvaluated = autoObject->getBoolean("candidate_costs_evaluated");
-  ASSERT_TRUE(autoEvaluated);
-  EXPECT_FALSE(*autoEvaluated);
   auto *autoCandidateCosts = autoObject->get("candidate_costs");
   auto *autoDecision = autoObject->get("decision_kind");
   ASSERT_NE(autoCandidateCosts, nullptr);
   ASSERT_NE(autoDecision, nullptr);
-  EXPECT_TRUE(autoCandidateCosts->getAsNull().has_value());
-  EXPECT_TRUE(autoDecision->getAsNull().has_value());
+  EXPECT_NE(autoCandidateCosts->getAsObject(), nullptr);
+  ASSERT_TRUE(autoDecision->getAsString());
+  EXPECT_EQ(*autoDecision->getAsString(), "all_simd");
   auto autoReason = autoObject->getString("application_reason");
   ASSERT_TRUE(autoReason);
-  EXPECT_EQ(*autoReason, "selection_score_invalid");
+  EXPECT_EQ(*autoReason, "minimum_cost_candidate");
 
   mlir::MLIRContext reportContext;
   auto reportModule = parseModule(reportContext, kOutOfSimdSimtCoverageModule);
@@ -621,9 +669,9 @@ TEST(CostModelPassesTest, SimdSimtCoverageShortCircuitIsAutoOnly) {
   ASSERT_TRUE(static_cast<bool>(reportJSON));
   auto *reportObject = reportJSON->getAsObject();
   ASSERT_NE(reportObject, nullptr);
-  auto reportEvaluated = reportObject->getBoolean("candidate_costs_evaluated");
-  ASSERT_TRUE(reportEvaluated);
-  EXPECT_TRUE(*reportEvaluated);
+  auto reportDecision = reportObject->getString("decision_kind");
+  ASSERT_TRUE(reportDecision);
+  EXPECT_EQ(*reportDecision, "all_simd");
   auto reportReason = reportObject->getString("application_reason");
   ASSERT_TRUE(reportReason);
   EXPECT_EQ(*reportReason, "report_mode");
