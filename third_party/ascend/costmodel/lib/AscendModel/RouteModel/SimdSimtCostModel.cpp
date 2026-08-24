@@ -27,6 +27,7 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/SHA256.h"
 
 #include <algorithm>
@@ -2515,6 +2516,15 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
     report.decision = chooseBest(
         report.candidateCosts, report.allSimdCandidateLegal,
         report.allSimtOnlyCandidateLegal, report.mixedCandidateLegal);
+    // FORCE_COSTMODEL_MIXROUTE: override decision to mixed_simd_simt.
+    if (report.mixedCandidateLegal) {
+      llvm::Optional<std::string> envVal;
+      if (llvm::sys::Process::GetEnv("FORCE_COSTMODEL_MIXROUTE", envVal) &&
+          envVal.hasValue() && *envVal == "1") {
+        llvm::errs() << "[COSTMODEL]   FORCE_COSTMODEL_MIXROUTE=1: forcing decision=mixed_simd_simt\n";
+        report.decision = SimdSimtCandidateKind::MixedSIMDSIMT;
+      }
+    }
     report.bestScore = report.candidateCosts.get(report.decision);
     const double denominator = std::max(1.0e-9, report.bestScore);
     report.candidateRatiosToBest = {

@@ -4,6 +4,7 @@
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Process.h"
 
 #include <algorithm>
 #include <array>
@@ -585,13 +586,13 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
   aggregatePhases(result.mixed);
 
   llvm::errs() << "[COSTMODEL]   Route results:\n";
-  llvm::errs() << "[COSTMODEL]     AllSIMD: legal=" << result.allSimd.legal
+  llvm::errs() << "[COSTMODEL]     AllSIMD: legal=" << (result.allSimd.legal ? "true" : "false")
                << " totalCycles=" << result.allSimd.totalCycles
                << " factor=" << result.allSimd.routeSuperblockFactor << "\n";
-  llvm::errs() << "[COSTMODEL]     AllSIMT: legal=" << result.allSimt.legal
+  llvm::errs() << "[COSTMODEL]     AllSIMT: legal=" << (result.allSimt.legal ? "true" : "false")
                << " totalCycles=" << result.allSimt.totalCycles
                << " factor=" << result.allSimt.routeSuperblockFactor << "\n";
-  llvm::errs() << "[COSTMODEL]     Mixed:  legal=" << result.mixed.legal
+  llvm::errs() << "[COSTMODEL]     Mixed:  legal=" << (result.mixed.legal ? "true" : "false")
                << " totalCycles=" << result.mixed.totalCycles
                << " factor=" << result.mixed.routeSuperblockFactor << "\n";
   if (result.mixed.legal) {
@@ -600,6 +601,48 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
       llvm::errs() << " " << stringifyStageMode(impl.mode).str() << "F" << impl.superblockFactor;
     llvm::errs() << "\n";
   }
+
+  // FORCE_COSTMODEL_MIXROUTE: force Mixed route legal so downstream
+  // materialization is exercised even when DP could not construct a
+  // realizable allSimtStagesLocal Mixed route.
+  if (!result.mixed.legal) {
+    llvm::Optional<std::string> envVal;
+    if (llvm::sys::Process::GetEnv("FORCE_COSTMODEL_MIXROUTE", envVal) &&
+        envVal.hasValue() && *envVal == "1") {
+      llvm::errs() << "[COSTMODEL]   FORCE_COSTMODEL_MIXROUTE=1: forcing Mixed route legal\n";
+      result.mixed.legal = true;
+      result.mixed.candidate = StageKernelRouteKind::Mixed;
+      result.mixed.source = "force_mix_route_env";
+      if (result.mixed.totalCycles <= 0.0)
+        result.mixed.totalCycles = result.allSimd.legal ? result.allSimd.totalCycles
+                                                        : result.allSimt.legal
+                                                              ? result.allSimt.totalCycles
+                                                              : 1.0;
+      if (result.mixed.implementations.empty() && !costTable.stages.empty()) {
+        for (const LogicalStageCost &stage : costTable.stages) {
+          for (const StageImplementationCost &cost : stage.implementations) {
+            if (cost.implementation.mode == StageMode::SIMT) {
+              result.mixed.implementations.push_back(cost.implementation);
+              break;
+            }
+          }
+          if (result.mixed.implementations.size() <=
+              &stage - &costTable.stages.front())
+            result.mixed.implementations.push_back(
+                stage.implementations.front().implementation);
+        }
+      }
+      if (result.mixed.logicalStageCycles.empty())
+        for (size_t i = 0; i < result.mixed.implementations.size(); ++i)
+          result.mixed.logicalStageCycles.push_back(0.0);
+      if (result.mixed.entryTransitionCycles.empty())
+        for (size_t i = 0; i < result.mixed.implementations.size(); ++i)
+          result.mixed.entryTransitionCycles.push_back(0.0);
+      if (result.mixed.routeSuperblockFactor == 0)
+        result.mixed.routeSuperblockFactor = 1;
+    }
+  }
+
   llvm::errs() << "[COSTMODEL] --- solveStageRoutes END ---\n";
   return result;
 }
