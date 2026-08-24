@@ -1171,8 +1171,11 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
         compile_mode = _validate_compile_mode(metadata.get("compile_mode", "simd"))
-        if compile_mode == "simd_simt" and metadata.get("parallel_mode") != "mix_simd_simt":
+
+        if compile_mode == "simd_simt":
             _compile_option_list += ["--enable-simd-simt-mix-compile"]
+
+        if compile_mode == "simd_simt" and metadata.get("parallel_mode") != "mix_simd_simt":
             num_warps = metadata.get("num_warps", opt.num_warps)
             _compile_option_list += [f"--num-warps={num_warps}"]
             warp_size = metadata.get("warp_size", opt.warp_size)
