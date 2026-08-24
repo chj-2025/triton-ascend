@@ -9,6 +9,7 @@
 #define ASCENDMODEL_ROUTEMODEL_SIMDSIMTCOSTMODEL_H
 
 #include "AscendModel/RouteModel/SimtAnchorAnalysis.h"
+#include "AscendModel/RouteModel/StageRouteCostModel.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
@@ -69,6 +70,10 @@ struct SimtAnchorFeatureSummary {
   int64_t staticLoopTripCountSum = 0;
   int64_t modeledDynamicLoopCount = 0;
   int64_t modeledDynamicLoopTripCountSum = 0;
+  int64_t conditionalBranchCount = 0;
+  int64_t divergentBranchCount = 0;
+  double activeLaneRatio = 1.0;
+
   bool hasControlFlow = false;
 
   llvm::StringMap<int64_t> weightedOps;
@@ -88,6 +93,7 @@ struct SimtAnchorFeatureSummary {
   std::vector<TensorAtomicFacts> tensorAtomics;
   std::vector<HistogramFacts> histograms;
   std::vector<PlainCumsumFacts> plainCumsums;
+  std::vector<TriangularSolveFacts> triangularSolves;
   CandidateLowerability kernelLowerability;
 
   llvm::json::Object toJSON() const;
@@ -169,6 +175,26 @@ struct SimdSimtFeatureSummary {
   int64_t staticLoopTripCountMax = 1;
   int64_t modeledDynamicLoopCount = 0;
   int64_t modeledDynamicLoopTripCountSum = 0;
+  /// scf.for iter_args whose values feed data computation in a later
+  /// iteration. These dependencies serialize a Stage roofline.
+  int64_t loopCarriedDataDependencyCount = 0;
+  /// Loop-carried pointer/address induction tracked separately because
+  /// downstream address lowering can remove it.
+  int64_t pointerInductionDependencyCount = 0;
+  int64_t conditionalBranchCount = 0;
+  int64_t divergentBranchCount = 0;
+  double activeLaneRatio = 1.0;
+
+  /// Scheduling/layout facts read from the transformed TTIR consumed by this
+  /// model.  These make it explicit that layout merging and AutoBlockify V1
+  /// ran before feature extraction rather than being guessed from source TTIR.
+  bool ttirLayoutMergeApplied = false;
+  int64_t coalesceFactor = 1;
+  int64_t coalesceAxis = -1;
+  bool autoBlockifyV1Applied = false;
+  int64_t autoBlockifyV1LoopCount = 0;
+  int64_t autoBlockifyV1ScheduleOpCount = 0;
+  bool autoBlockifyV1HasDynamicTripCount = false;
 
   bool hasDot = false;
   bool hasGather = false;
@@ -189,10 +215,9 @@ struct SimdSimtFeatureSummary {
   llvm::json::Object toJSON() const;
 };
 
-/// Applicability is a hardware/lowering statement, not a calibration-domain
-/// statement.  It says whether TTIR contains a recognized SIMT mechanism and
-/// whether the current target can materialize at least one corresponding
-/// anchor.  Calibration coverage is reported separately.
+/// Applicability is strictly a hardware/lowering statement.  It says whether
+/// transformed TTIR contains a recognized SIMT mechanism and whether the
+/// current target can materialize at least one corresponding anchor.
 struct SimtApplicabilityResult {
   bool mechanismDetected = false;
   bool targetSupported = false;
@@ -253,6 +278,9 @@ struct SimdSimtCostBreakdown {
   double mixedSimtAnchorShuffleCycles = 0.0;
   double mixedSimtAnchorPredicateCycles = 0.0;
   double mixedSimtAnchorPayloadCycles = 0.0;
+  double mixedSimtAnchorCalibratedPayloadCycles = 0.0;
+  int64_t cubeTailDotOps = 0;
+  int64_t cubeTailDotFlops = 0;
   double mixedBoundaryCycles = 0.0;
   double mixedRemainingStructuralPenaltyRatio = 0.0;
 
@@ -282,23 +310,22 @@ struct SimdSimtCostModelOptions {
   std::string profilePath;
   std::string actualTarget;
   unsigned numWarps = 32;
-  /// Minimum relative advantage over the established all-SIMD baseline.
-  /// The absolute floor is fixed at 64 selection-score cycles.
-  double marginRatio = 0.10;
   bool includeFeaturesInJSON = true;
-  /// Keep scoring outside the calibrated feature domain for offline/report
-  /// diagnostics.  Production auto selection disables this so that coverage
-  /// rejection happens before candidate-cost evaluation.
-  bool scoreOutsideCalibrationCoverage = true;
   /// True only when the target backend can materialize the shared TTIR anchor
   /// plan.  Candidate costs remain reportable when false, but mixed is not
   /// eligible for selection.
   bool compileOn91095 = false;
+  /// True when backend integration can wrap a mixed local scope with the
+  /// AutoBlockify V1 logical-program schedule for F2/F4.
+  bool scopeSuperblockMaterializable = false;
+  /// True when backend integration can apply AutoBlockify V1 to a pure-SIMT
+  /// kernel.  This is deliberately independent of local-scope batching.
+  bool wholeKernelSuperblockMaterializable = false;
 };
 
 struct SimdSimtCostReport {
-  int64_t schemaVersion = 10;
-  std::string model = "ascend_candidate_cost_v2_cpp";
+  int64_t schemaVersion = 14;
+  std::string model = "ascend_stage_route_cost_v3_cpp";
   std::string profileVersion;
   std::string profileTarget;
   std::string actualTarget;
@@ -310,51 +337,21 @@ struct SimdSimtCostReport {
   std::string scoreUnit;
   std::string scoreScope = "per_program_ranking_proxy";
 
-  /// False means coverage rejected the kernel before any candidate cost was
-  /// evaluated.  In that state the numeric score members are placeholders and
-  /// are serialized as null rather than as meaningful zeros.
-  bool candidateCostsEvaluated = false;
-  /// Resource/structural scores before the bounded Event calibration for the
-  /// recognized feature domain is applied.
-  SimdSimtCandidateScores uncalibratedCandidateCosts;
   SimdSimtCandidateScores candidateCosts;
   SimdSimtCandidateScores candidateRatiosToBest;
-  SimdSimtCandidateScores eventRouteScoreMultipliers{1.0, 1.0, 1.0};
-  bool eventRouteCalibrationApplied = false;
-  bool eventAllSimtOnlyValidated = false;
-  bool eventMixedSimdSimtValidated = false;
-  std::string eventRouteCalibrationSource;
-  std::string eventRouteCalibrationConfidence = "none";
   bool allSimdCandidateLegal = true;
   bool allSimtOnlyCandidateLegal = true;
   bool mixedCandidateLegal = false;
   SimdSimtCandidateKind decision = SimdSimtCandidateKind::AllSIMD;
-  SimdSimtCandidateKind runnerUp = SimdSimtCandidateKind::AllSIMTOnly;
   double bestScore = 0.0;
-  double runnerUpScore = 0.0;
-  /// Alias of decisionAdvantage kept as the compact gate-facing gain field.
-  double gainScore = 0.0;
-  /// For non-SIMD decisions this is all_simd - best.  For an all-SIMD
-  /// decision this is runner_up - best, so the baseline can win its own gate.
-  double decisionAdvantage = 0.0;
-  double requiredGainScore = 0.0;
-  double marginRatio = 0.10;
 
   bool targetCompatible = true;
-  bool selectionScoreValid = false;
-  bool absoluteCostValid = false;
-  std::string rankingConfidence = "none";
-  std::string minimumConfidenceForDecision = "medium";
-  std::string absoluteConfidence = "none";
-  bool gatePassed = false;
-  std::vector<std::string> gateReasons;
   std::vector<std::string> unsupported;
-  bool calibrationCovered = false;
-  std::string calibrationDomain = "out_of_calibration_domain";
   SimtApplicabilityResult applicability;
 
   SimdSimtFeatureSummary features;
   SimdSimtCostBreakdown breakdown;
+  StageCostModelSummary stageModel;
   bool includeFeaturesInJSON = true;
 
   llvm::json::Object toJSON() const;
@@ -377,15 +374,14 @@ analyzeSimdSimtFeatures(mlir::ModuleOp module,
                         const SimtAnchorPlan &anchorPlan);
 
 /// Run the versioned profile formula on an already materialized feature
-/// summary.  By default this preserves full out-of-coverage scoring for
-/// offline diagnostics; production callers can disable it in the options.
-/// This overload is useful for golden feature tests and offline tools.
+/// summary.  Every structurally lowerable candidate is scored; policy-domain,
+/// confidence, Event-validation, and gain-margin admission are deliberately
+/// absent from the online model.
 llvm::Expected<SimdSimtCostReport>
 estimateSimdSimtCandidates(const SimdSimtFeatureSummary &features,
                            const SimdSimtCostModelOptions &options = {});
 
-/// Analyze a ModuleOp and, when admitted for scoring, score all three
-/// candidates in one call.
+/// Analyze a ModuleOp and score all three candidates in one call.
 llvm::Expected<SimdSimtCostReport>
 analyzeSimdSimtCandidates(mlir::ModuleOp module,
                           const SimdSimtCostModelOptions &options = {});

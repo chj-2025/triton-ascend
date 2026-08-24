@@ -1,4 +1,5 @@
 add_subdirectory(AutoBlockify)
+add_subdirectory(AutoBlockifyV1)
 add_subdirectory(Dialect)
 add_subdirectory(TritonMemoryAccess)
 add_subdirectory(Utils)
@@ -32,6 +33,7 @@ if(TRITON_ENABLE_COVERAGE_HITEST)
       TritonAscendIR               # from Dialect/TritonAscend/IR
       TritonStructuredIR           # from Dialect/TritonStructured/IR
       AutoBlockify
+      AutoBlockifyV1
   )
 
   foreach(_target ${_instrument_targets})

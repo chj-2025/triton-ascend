@@ -25,6 +25,7 @@
 
 #include "DeduplicateDebugNopsPass.h"
 #include "MarkTensorKindPass.h"
+#include "TTIRLayoutMergePass.h"
 #include "TritonToLinalgPass.h"
 
 namespace mlir::triton {

@@ -2,8 +2,8 @@
 //
 // This pass is the online owner of SIMD/SIMT candidate selection.  Python
 // only schedules the pass and reacts to its machine-readable execution intent.
-// Feature extraction, calibrated scoring, confidence/target/margin gates, and
-// mixed-operation planning stay in C++.
+// Feature extraction, stage scoring, candidate legality, and mixed-operation
+// planning stay in C++.
 //
 //===----------------------------------------------------------------------===//
 
@@ -17,6 +17,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -42,8 +43,6 @@ inline constexpr llvm::StringLiteral kRecommendedExecutionAttr =
     "ascend.simt_costmodel.recommended";
 inline constexpr llvm::StringLiteral kSelectionSourceAttr =
     "ascend.simt_costmodel.selection_source";
-inline constexpr llvm::StringLiteral kRankingConfidenceAttr =
-    "ascend.simt_costmodel.ranking_confidence";
 inline constexpr llvm::StringLiteral kAllSimdScoreAttr =
     "ascend.simt_costmodel.all_simd_score";
 inline constexpr llvm::StringLiteral kAllSimtScoreAttr =
@@ -52,6 +51,8 @@ inline constexpr llvm::StringLiteral kMixedScoreAttr =
     "ascend.simt_costmodel.mixed_score";
 inline constexpr llvm::StringLiteral kReportJSONAttr =
     "ascend.simt_costmodel.report_json";
+inline constexpr llvm::StringLiteral kSuperblockFactorAttr =
+    "ascend.simt_costmodel.superblock_factor";
 
 static bool containsExplicitVectorScope(ModuleOp module) {
   bool found = false;
@@ -69,11 +70,39 @@ static void clearPreviousSelection(ModuleOp module) {
   module->removeAttr(kEffectiveExecutionAttr);
   module->removeAttr(kRecommendedExecutionAttr);
   module->removeAttr(kSelectionSourceAttr);
-  module->removeAttr(kRankingConfidenceAttr);
   module->removeAttr(kAllSimdScoreAttr);
   module->removeAttr(kAllSimtScoreAttr);
   module->removeAttr(kMixedScoreAttr);
   module->removeAttr(kReportJSONAttr);
+  module->removeAttr(kSuperblockFactorAttr);
+}
+
+static SimtAnchorPlan
+buildSelectedMixedAnchorPlan(const StageCostModelSummary &stageModel,
+                             const SimtAnchorPlan &completePlan) {
+  SimtAnchorPlan selected;
+  selected.kernelLowerability = completePlan.kernelLowerability;
+  if (!stageModel.mixed.legal ||
+      stageModel.mixed.implementations.size() != stageModel.stages.size())
+    return selected;
+
+  llvm::DenseSet<unsigned> included;
+  for (size_t stageIndex = 0; stageIndex < stageModel.stages.size();
+       ++stageIndex) {
+    const LogicalStageCost &stage = stageModel.stages[stageIndex];
+    const StageImplementation &implementation =
+        stageModel.mixed.implementations[stageIndex];
+    if (implementation.mode != StageMode::SIMT)
+      continue;
+
+    for (unsigned index : stage.simtAnchorIndices) {
+      if (index >= completePlan.anchors.size() ||
+          !included.insert(index).second)
+        continue;
+      selected.anchors.push_back(completePlan.anchors[index]);
+    }
+  }
+  return selected;
 }
 
 static LogicalResult appendJSONLine(llvm::StringRef path,
@@ -96,17 +125,19 @@ struct SelectSimdSimtCostModelPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
     clearPreviousSelection(module);
-    bool autoMode = mode.getValue() == "auto";
+    const bool autoMode = mode.getValue() == "auto";
 
     SimdSimtCostModelOptions options;
     options.profilePath = profilePath.getValue();
     options.actualTarget = actualTarget.getValue();
     options.numWarps =
         static_cast<unsigned>(std::max<int64_t>(1, numWarps.getValue()));
-    options.marginRatio = std::max(0.0, std::min(1.0, marginRatio.getValue()));
     options.includeFeaturesInJSON = true;
-    options.scoreOutsideCalibrationCoverage = !autoMode;
     options.compileOn91095 = compileOn91095.getValue();
+    options.wholeKernelSuperblockMaterializable =
+        wholeKernelSuperblockMaterializable.getValue();
+    options.scopeSuperblockMaterializable =
+        scopeSuperblockMaterializable.getValue();
 
     SimtAnchorPlan anchorPlan =
         buildMixedSimtAnchorPlan(module, options.compileOn91095);
@@ -119,14 +150,24 @@ struct SelectSimdSimtCostModelPass
     }
     SimdSimtCostReport report = std::move(*reportOr);
 
-    std::string recommended =
-        report.candidateCostsEvaluated
-            ? stringifySimdSimtCandidate(report.decision).str()
-            : kBackendDefault.str();
+    std::string recommended = stringifySimdSimtCandidate(report.decision).str();
     std::string effective = kBackendDefault.str();
     std::string selectionSource = "backend_default";
     std::string applicationReason;
     SmallVector<Operation *> mixedAnchors;
+    SimtAnchorPlan selectedMixedAnchorPlan;
+    int64_t selectedSuperblockFactor = 1;
+    if (report.stageModel.applied) {
+      if (report.decision == SimdSimtCandidateKind::AllSIMD)
+        selectedSuperblockFactor =
+            report.stageModel.allSimd.routeSuperblockFactor;
+      else if (report.decision == SimdSimtCandidateKind::AllSIMTOnly)
+        selectedSuperblockFactor =
+            report.stageModel.allSimt.routeSuperblockFactor;
+      else
+        selectedSuperblockFactor =
+            report.stageModel.mixed.routeSuperblockFactor;
+    }
 
     bool actionSupported = true;
     bool hasExplicitScope = containsExplicitVectorScope(module);
@@ -135,11 +176,22 @@ struct SelectSimdSimtCostModelPass
         actionSupported = false;
         applicationReason = "explicit_scope_present";
       } else {
-        mixedAnchors = anchorPlan.materializableRoots();
+        selectedMixedAnchorPlan =
+            buildSelectedMixedAnchorPlan(report.stageModel, anchorPlan);
+        mixedAnchors = selectedMixedAnchorPlan.materializableRoots();
         if (mixedAnchors.empty()) {
           actionSupported = false;
           applicationReason = "no_materializable_mixed_anchor";
         }
+      }
+      // A factor>1 mixed route needs batching of the surrounding SIMD
+      // producer/consumer phases, not just a scope attribute.  Keep the
+      // recommendation visible but do not apply it until ScopeSuperBlockPass
+      // implements that exact materialization.
+      if (selectedSuperblockFactor > 1 &&
+          !options.scopeSuperblockMaterializable) {
+        actionSupported = false;
+        applicationReason = "scope_superblock_not_materializable";
       }
     } else if (recommended == kAllSimtOnly && hasExplicitScope) {
       // Preserve explicit local SIMD/SIMT/cube scope semantics instead of
@@ -147,31 +199,26 @@ struct SelectSimdSimtCostModelPass
       actionSupported = false;
       applicationReason = "explicit_scope_present";
     }
+    if (selectedSuperblockFactor > 1 &&
+        selectedSuperblockFactor * options.numWarps > 64) {
+      actionSupported = false;
+      applicationReason = "superblock_warp_limit_exceeded";
+    }
+    if (recommended == kAllSimtOnly && selectedSuperblockFactor > 1 &&
+        !report.features.autoBlockifyV1Applied &&
+        !options.wholeKernelSuperblockMaterializable) {
+      actionSupported = false;
+      applicationReason = "superblock_requires_auto_blockify_v1";
+    }
 
-    const bool onlyInsufficientGain =
-        report.gateReasons.size() == 1 &&
-        report.gateReasons.front() ==
-            "decision_advantage_not_above_required_gain";
-    if (autoMode && report.gatePassed && actionSupported) {
+    if (autoMode && actionSupported) {
       effective = recommended;
       selectionSource = "cpp_cost_model";
-      applicationReason = "cpp_cost_model_admitted";
-    } else if (autoMode && onlyInsufficientGain &&
-               report.allSimdCandidateLegal) {
-      // A failed switch-margin check means "do not leave the established
-      // baseline", not "hand control back to legacy backend heuristics".
-      // Keeping all-SIMD here avoids accidentally taking the historical
-      // compile_mode=simd_simt force path after the model rejected a marginal
-      // SIMT/mixed recommendation.
-      effective = kAllSimd.str();
-      selectionSource = "cpp_cost_model_safe_baseline";
-      applicationReason = "decision_gain_below_margin_keep_all_simd";
+      applicationReason = "minimum_cost_candidate";
     } else if (!autoMode) {
       applicationReason = "report_mode";
-    } else if (!report.gatePassed) {
-      applicationReason = report.gateReasons.empty()
-                              ? "model_gate_rejected"
-                              : report.gateReasons.front();
+    } else if (applicationReason.empty()) {
+      applicationReason = "candidate_not_materializable";
     }
 
     Builder builder(module.getContext());
@@ -180,23 +227,19 @@ struct SelectSimdSimtCostModelPass
     module->setAttr(kEffectiveExecutionAttr, builder.getStringAttr(effective));
     module->setAttr(kSelectionSourceAttr,
                     builder.getStringAttr(selectionSource));
-    module->setAttr(kRankingConfidenceAttr,
-                    builder.getStringAttr(report.rankingConfidence));
-    if (report.candidateCostsEvaluated) {
-      module->setAttr(kAllSimdScoreAttr,
-                      builder.getF64FloatAttr(report.candidateCosts.allSimd));
-      module->setAttr(
-          kAllSimtScoreAttr,
-          builder.getF64FloatAttr(report.candidateCosts.allSimtOnly));
-      module->setAttr(
-          kMixedScoreAttr,
-          builder.getF64FloatAttr(report.candidateCosts.mixedSimdSimt));
-    }
+    module->setAttr(kAllSimdScoreAttr,
+                    builder.getF64FloatAttr(report.candidateCosts.allSimd));
+    module->setAttr(kAllSimtScoreAttr,
+                    builder.getF64FloatAttr(report.candidateCosts.allSimtOnly));
+    module->setAttr(kMixedScoreAttr, builder.getF64FloatAttr(
+                                         report.candidateCosts.mixedSimdSimt));
+    module->setAttr(kSuperblockFactorAttr,
+                    builder.getI64IntegerAttr(selectedSuperblockFactor));
 
     // Selector and Materializer consume the same immutable anchor plan in one
     // pass invocation.  No per-operation marker is persisted in TTIR.
     if (effective == kMixedSimdSimt &&
-        failed(materializeSimtAnchorPlan(module, anchorPlan))) {
+        failed(materializeSimtAnchorPlan(module, selectedMixedAnchorPlan))) {
       signalPassFailure();
       return;
     }
@@ -210,6 +253,7 @@ struct SelectSimdSimtCostModelPass
     reportJSON["action_supported"] = actionSupported;
     reportJSON["materialized_simt_anchor_count"] =
         static_cast<int64_t>(mixedAnchors.size());
+    reportJSON["selected_superblock_factor"] = selectedSuperblockFactor;
     std::string json =
         llvm::formatv("{0}", llvm::json::Value(std::move(reportJSON))).str();
     module->setAttr(kReportJSONAttr, builder.getStringAttr(json));
