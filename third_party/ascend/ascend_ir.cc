@@ -630,10 +630,10 @@ void init_ascend_ir(py::module &&m) {
              "ascend.simt_costmodel.effective",
              "ascend.simt_costmodel.recommended",
              "ascend.simt_costmodel.selection_source",
-             "ascend.simt_costmodel.ranking_confidence",
              "ascend.simt_costmodel.all_simd_score",
              "ascend.simt_costmodel.all_simt_score",
              "ascend.simt_costmodel.mixed_score",
+             "ascend.simt_costmodel.superblock_factor",
              "ascend.simt_costmodel.report_json",
          }) {
       op->removeAttr(name);

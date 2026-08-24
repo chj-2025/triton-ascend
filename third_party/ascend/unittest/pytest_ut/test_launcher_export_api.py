@@ -34,6 +34,7 @@ def _make_metadata():
         debug=False,
         coalesce_factor=1,
         coalesce_axis=-1,
+        coalesce_grid_ceil_div=False,
     )
 
 
@@ -95,6 +96,36 @@ def test_make_launcher_shrinks_coalesced_grid_for_both_launch_paths(
     )
 
     assert src.count("gridY = gridY / 16;") == 2
+
+
+@patch.object(driver, "NPUUtils")
+@patch.object(driver, "_is_auto_map_parallel_blocks_enabled", return_value=False)
+@patch.object(driver, "force_disable_ffts", return_value=False)
+@patch.object(driver, "is_ffts_supported", return_value=True)
+@patch.object(driver, "get_ascend_arch_from_env", return_value="Ascend910B")
+@patch.object(driver, "get_backend_func", side_effect=_mock_backend_func)
+def test_make_launcher_ceil_divides_row_coalesced_grid(
+    _mock_backend_func_patch,
+    _mock_arch,
+    _mock_ffts,
+    _mock_disable_ffts,
+    _mock_auto_map,
+    mock_npu_utils,
+):
+    mock_npu_utils.return_value.get_aivector_core_num.return_value = 40
+    mock_npu_utils.return_value.get_aicore_num.return_value = 20
+    metadata = _make_metadata()
+    metadata.coalesce_factor = 8
+    metadata.coalesce_axis = 0
+    metadata.coalesce_grid_ceil_div = True
+
+    src = driver.make_launcher(
+        constants={},
+        signature={0: "*fp32", 1: "*fp32"},
+        metadata=metadata,
+    )
+
+    assert src.count("gridX = (gridX + 8 - 1) / 8;") == 2
 
 
 @patch("importlib.util.module_from_spec")

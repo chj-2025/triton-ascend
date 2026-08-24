@@ -929,19 +929,12 @@ LogicalResult TritonToLinalgPass::processStridedLoadStoreRewriteOperations(
     return success();
   }
 
-  // coalesce adjacent strided axes into one  so that to convert discrete memory
-  // asccess into continuous memory access .
-  StridedAxisCoalescing::rewriteStridedAxisCoalesce(moduleOp);
-
-  // TileChunkCoalescing (default-on, lower priority): when the outermost
-  // program-id axis is a pure tile index over a contiguous problem axis with a
-  // small tile T, fold H adjacent tiles into one program so the per-tile
-  // load/store become a single contiguous H*T DMA (H picked so the block is
-  // >= 512B and within UB). Emits hacc.coalesce_factor = H and
-  // hacc.coalesce_axis. Bails when the pattern / lane-safety do not hold, when
-  // the kernel reads num_programs(axis) (the launcher changes it), or when
-  // StridedAxisCoalescing above already claimed the coalesce factor.
-  TileChunkCoalescing::rewriteTileChunkCoalesce(moduleOp);
+  if (!moduleOp->hasAttr("ta.ttir_layout_merge.applied")) {
+    // Compatibility path for pipelines that do not run the standalone
+    // pre-costmodel TTIR layout pass.
+    StridedAxisCoalescing::rewriteStridedAxisCoalesce(moduleOp);
+    TileChunkCoalescing::rewriteTileChunkCoalesce(moduleOp);
+  }
 
   mlir::RewritePatternSet patterns(&getContext());
   patterns.add<StridedLoadStoreRewrite::LoadConverter,
@@ -1412,10 +1405,10 @@ void TritonToLinalgPass::runOnOperation() {
            "ascend.simt_costmodel.effective",
            "ascend.simt_costmodel.recommended",
            "ascend.simt_costmodel.selection_source",
-           "ascend.simt_costmodel.ranking_confidence",
            "ascend.simt_costmodel.all_simd_score",
            "ascend.simt_costmodel.all_simt_score",
            "ascend.simt_costmodel.mixed_score",
+           "ascend.simt_costmodel.superblock_factor",
            "ascend.simt_costmodel.report_json",
        })
     moduleOp->removeAttr(name);

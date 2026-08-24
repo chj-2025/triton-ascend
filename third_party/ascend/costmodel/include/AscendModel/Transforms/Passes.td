@@ -193,12 +193,10 @@ def SelectSimdSimtCostModelPass
   let description = [{
     This pass runs the AscendModel C++ SIMD/SIMT candidate model directly on
     Triton IR.  Report mode always records the complete three-candidate
-    diagnostic report.  Auto mode first checks calibration coverage and skips
-    candidate scoring for out-of-domain kernels; an admitted in-domain decision
-    becomes the authoritative execution intent.  A mixed decision passes the
-    same immutable anchor plan used for scoring directly to the C++
-    materializer, which creates local scope.scope regions without persisting
-    per-operation selection attributes.
+    diagnostic report.  Auto mode applies the legal candidate with the lowest
+    stage cost.  A mixed decision passes the same immutable anchor plan used
+    for scoring directly to the C++ materializer, which creates local
+    scope.scope regions without persisting per-operation selection attributes.
 
     Mandatory mixed is intentionally not part of this pass.  Singleton
     legality fast paths can be added in front of the model after the calibrated
@@ -218,12 +216,15 @@ def SelectSimdSimtCostModelPass
     Option<"numWarps", "num-warps", "int64_t",
            /*default=*/"32",
            "Number of logical warps in the candidate execution plan">,
-    Option<"marginRatio", "margin-ratio", "double",
-           /*default=*/"0.10",
-           "Minimum relative score advantage required for an online action">,
     Option<"compileOn91095", "compile-on-910-95", "bool",
            /*default=*/"false",
            "Whether the target exposes the 910/95 SIMT lowering templates">,
+    Option<"wholeKernelSuperblockMaterializable", "whole-kernel-superblock-materializable", "bool",
+           /*default=*/"false",
+           "Whether backend integration can materialize pure-SIMT F2/F4 with AutoBlockify V1">,
+    Option<"scopeSuperblockMaterializable", "scope-superblock-materializable", "bool",
+           /*default=*/"false",
+           "Whether backend integration can materialize mixed F2/F4 with AutoBlockify V1">,
     Option<"reportFile", "report-file", "std::string",
            /*default=*/"\"\"",
            "Optional JSONL path for the C++ selection report">

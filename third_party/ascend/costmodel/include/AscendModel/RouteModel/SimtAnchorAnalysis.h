@@ -84,8 +84,23 @@ struct PlainCumsumFacts {
   bool reverse = false;
 };
 
-using SimtAnchorFacts = std::variant<std::monostate, TensorAtomicFacts,
-                                     HistogramFacts, PlainCumsumFacts>;
+/// Structural facts for a blockwise triangular recurrence such as solve_tril.
+/// These are extracted from TTIR and deliberately avoid workload/function
+/// names.  The dense dot tail is outside the SIMT anchor and must remain on the
+/// SIMD/Cube side of a mixed route.
+struct TriangularSolveFacts {
+  int64_t blockRows = 0;
+  int64_t blockColumns = 0;
+  std::string accumulatorType = "unknown";
+  int64_t recurrenceStartRow = 0;
+  int64_t recurrenceLoopCount = 0;
+  int64_t denseDotTailOps = 0;
+  bool requiresCubeTailPartition = false;
+};
+
+using SimtAnchorFacts =
+    std::variant<std::monostate, TensorAtomicFacts, HistogramFacts,
+                 PlainCumsumFacts, TriangularSolveFacts>;
 
 struct SimtAnchorDescriptor {
   Operation *operation = nullptr;

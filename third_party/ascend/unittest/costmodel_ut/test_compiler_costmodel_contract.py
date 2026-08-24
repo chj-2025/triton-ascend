@@ -31,6 +31,8 @@ class CompilerCostmodelContractTest(unittest.TestCase):
         libtriton_mod.passes = Dummy()
         libtriton_mod.ascend = Dummy()
         libtriton_mod.buffer_ir = Dummy()
+        libtriton_ascend_mod = types.ModuleType("triton._C.libtriton.ascend")
+        libtriton_ascend_mod.ir = Dummy()
 
         utils_mod = types.ModuleType("triton.backends.ascend.utils")
         for name in [
@@ -107,6 +109,7 @@ class CompilerCostmodelContractTest(unittest.TestCase):
             "triton": triton_mod,
             "triton._C": triton_c_mod,
             "triton._C.libtriton": libtriton_mod,
+            "triton._C.libtriton.ascend": libtriton_ascend_mod,
             "triton.backends.ascend": ascend_backend_mod,
             "triton.backends.ascend.utils": utils_mod,
             "triton.backends.ascend.driver": driver_mod,
@@ -164,6 +167,33 @@ class CompilerCostmodelContractTest(unittest.TestCase):
 
         metadata = {"target": GPUTarget(backend="npu", arch="Ascend950PR_9579")}
         self.assertTrue(cmplr._needs_lib_call_no_inline(metadata))
+
+    def test_all_simd_decision_replaces_route_request_with_backend_mode(self):
+        cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
+        metadata = {
+            "compile_mode": "simd_simt",
+            "parallel_mode": "mix_simd_simt",
+            "auto_blockify_v1_enabled": True,
+        }
+
+        cmplr._apply_cpp_simd_simt_decision(metadata, "all_simd", 1, "{}")
+
+        self.assertEqual(metadata["compile_mode"], "simd")
+        self.assertEqual(metadata["parallel_mode"], "simd")
+        self.assertEqual(metadata["auto_simt_effective_kind"], "all_simd")
+        self.assertFalse(metadata["auto_blockify_v1_enabled"])
+        self.assertFalse(metadata["auto_blockify_v1_runtime_cap"])
+        self.assertNotIn("auto_simt_requested_kind", metadata)
+
+    def test_mixed_decision_preserves_route_request_and_factor(self):
+        cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
+        metadata = {"compile_mode": "simd_simt"}
+
+        cmplr._apply_cpp_simd_simt_decision(metadata, "mixed_simd_simt", 4, "{\"decision\":\"mixed\"}")
+
+        self.assertEqual(metadata["compile_mode"], "simd_simt")
+        self.assertEqual(metadata["auto_simt_superblock_factor"], 4)
+        self.assertEqual(metadata["auto_simt_requested_kind"], "mixed_simd_simt")
 
 
 if __name__ == "__main__":
