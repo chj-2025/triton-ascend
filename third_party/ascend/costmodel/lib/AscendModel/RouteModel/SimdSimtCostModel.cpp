@@ -1250,6 +1250,7 @@ static llvm::Expected<std::optional<StageCostModelSummary>> evaluateStageModel(
     unsigned numWarps, bool wholeKernelSuperblockMaterializable,
     bool scopeSuperblockMaterializable, ModuleOp module = nullptr,
     const SimtAnchorPlan *anchorPlan = nullptr) {
+  llvm::errs() << "[COSTMODEL] --- evaluateStageModel START ---\n";
   StagePartitionerOptions partitionerOptions;
   partitionerOptions.tinyDotFlopsMax = profile.structural.tinyDotFlopsMax;
   partitionerOptions.maximumSuperblockFactor =
@@ -1258,6 +1259,9 @@ static llvm::Expected<std::optional<StageCostModelSummary>> evaluateStageModel(
           : 1;
   partitionerOptions.scopeSuperblockMaterializable =
       scopeSuperblockMaterializable;
+  llvm::errs() << "[COSTMODEL]   tinyDotFlopsMax=" << partitionerOptions.tinyDotFlopsMax
+               << " maxSuperblockFactor=" << partitionerOptions.maximumSuperblockFactor
+               << " scopeSuperblock=" << (partitionerOptions.scopeSuperblockMaterializable ? "true" : "false") << "\n";
   StagePartitioner partitioner;
   auto partition =
       module && anchorPlan ? partitioner.partition(module, *anchorPlan,
@@ -1267,8 +1271,11 @@ static llvm::Expected<std::optional<StageCostModelSummary>> evaluateStageModel(
           : partitioner.partition(features, partitionerOptions);
   if (!partition)
     return partition.takeError();
-  if (!*partition)
+  if (!*partition) {
+    llvm::errs() << "[COSTMODEL]   No matching Phase domain → Stage Model not applied\n";
+    llvm::errs() << "[COSTMODEL] --- evaluateStageModel END (not applied) ---\n";
     return std::optional<StageCostModelSummary>{};
+  }
 
   HardwareProfile hardwareProfile =
       buildStageHardwareProfile(profile, numWarps);
@@ -1283,6 +1290,8 @@ static llvm::Expected<std::optional<StageCostModelSummary>> evaluateStageModel(
   auto routes = solveStageRoutes(*costTable, (*snapshot)->transition);
   if (!routes)
     return routes.takeError();
+  llvm::errs() << "[COSTMODEL]   Stage Model applied successfully\n";
+  llvm::errs() << "[COSTMODEL] --- evaluateStageModel END ---\n";
   return std::optional<StageCostModelSummary>{std::move(*routes)};
 }
 
@@ -1837,6 +1846,7 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
     return llvm::createStringError(std::errc::invalid_argument,
                                    "cannot analyze a null ModuleOp");
 
+  llvm::errs() << "[COSTMODEL] --- analyzeSimdSimtFeatures START ---\n";
   SimdSimtFeatureSummary features;
   initializeWorkMaps(features);
   initializeWorkMaps(features.simtAnchors);
@@ -2388,6 +2398,28 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
       features.vectorReduceToScalarOps > 0 && features.vectorPtrSplatOps > 0 &&
       features.scalarLoadOps >= 2;
 
+  llvm::errs() << "[COSTMODEL]   Features summary:\n";
+  llvm::errs() << "[COSTMODEL]     dotOps=" << features.dotOps
+               << " reduceOps=" << features.reduceOps
+               << " loadOps=" << features.loadOps
+               << " storeOps=" << features.storeOps << "\n";
+  llvm::errs() << "[COSTMODEL]     dotFlops=" << features.dotFlops
+               << " loadBytes=" << features.loadBytes
+               << " storeBytes=" << features.storeBytes << "\n";
+  llvm::errs() << "[COSTMODEL]     gatherOps=" << features.gatherOps
+               << " atomicOps=" << features.atomicOps
+               << " histogramOps=" << features.histogramOps << "\n";
+  llvm::errs() << "[COSTMODEL]     loadedIndexDependentMemoryOps=" << features.loadedIndexDependentMemoryOps
+               << " pointerTensorOps=" << features.pointerTensorOps
+               << " laneDependentPointerOps=" << features.laneDependentPointerOps << "\n";
+  llvm::errs() << "[COSTMODEL]     hasControlFlow=" << (features.hasControlFlow ? "true" : "false")
+               << " hasDot=" << (features.hasDot ? "true" : "false")
+               << " hasGather=" << (features.hasGather ? "true" : "false")
+               << " hasExplicitScope=" << (features.hasExplicitScope ? "true" : "false") << "\n";
+  llvm::errs() << "[COSTMODEL]     simtAnchors: count=" << features.simtAnchors.count
+               << " recognizedCount=" << features.simtAnchors.recognizedCount
+               << " triangularSolves=" << features.simtAnchors.triangularSolves.size() << "\n";
+  llvm::errs() << "[COSTMODEL] --- analyzeSimdSimtFeatures END ---\n";
   return features;
 }
 
@@ -2396,6 +2428,7 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
                                const SimdSimtCostModelOptions &options,
                                ModuleOp module,
                                const SimtAnchorPlan *anchorPlan) {
+  llvm::errs() << "[COSTMODEL] --- estimateSimdSimtCandidatesImpl START ---\n";
   auto profileOrError = loadCandidateProfile(options.profilePath);
   if (!profileOrError)
     return profileOrError.takeError();
@@ -2416,6 +2449,16 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
   report.features = features;
   report.applicability =
       evaluateSimtApplicability(features, options.compileOn91095);
+  llvm::errs() << "[COSTMODEL]   Applicability: materializable="
+               << (report.applicability.materializable ? "true" : "false")
+               << " mechanismDetected=" << (report.applicability.mechanismDetected ? "true" : "false")
+               << " materializableAnchorCount=" << report.applicability.materializableAnchorCount << "\n";
+  if (!report.applicability.reasons.empty()) {
+    llvm::errs() << "[COSTMODEL]   applicability.reasons:";
+    for (const std::string &r : report.applicability.reasons)
+      llvm::errs() << " " << r;
+    llvm::errs() << "\n";
+  }
   report.allSimdCandidateLegal =
       features.simtAnchors.kernelLowerability.allSimd ==
       CandidateLoweringStatus::Native;
@@ -2458,6 +2501,9 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
     report.allSimtOnlyCandidateLegal &= report.stageModel.allSimt.legal;
     report.mixedCandidateLegal &= report.stageModel.mixed.legal;
     report.breakdown.mixedCostSource = "stage_cost_evaluator_route_sum";
+    llvm::errs() << "[COSTMODEL]   Stage Model applied: allSimd=" << report.candidateCosts.allSimd
+                 << " allSimtOnly=" << report.candidateCosts.allSimtOnly
+                 << " mixed=" << report.candidateCosts.mixedSimdSimt << "\n";
     const unsigned legalCandidateCount =
         static_cast<unsigned>(report.allSimdCandidateLegal) +
         static_cast<unsigned>(report.allSimtOnlyCandidateLegal) +
@@ -2475,9 +2521,13 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
         report.candidateCosts.allSimd / denominator,
         report.candidateCosts.allSimtOnly / denominator,
         report.candidateCosts.mixedSimdSimt / denominator};
+    llvm::errs() << "[COSTMODEL]   decision=" << stringifySimdSimtCandidate(report.decision).str()
+                 << " bestScore=" << report.bestScore << "\n";
+    llvm::errs() << "[COSTMODEL] --- estimateSimdSimtCandidatesImpl END (stage model) ---\n";
     return report;
   }
 
+  llvm::errs() << "[COSTMODEL]   Stage Model NOT applied, falling back to legacy cost model\n";
   const int64_t maxNumel = std::max<int64_t>(1, features.maxTensorNumel);
   const int64_t elementBits =
       features.maxElementBits > 0
@@ -2875,6 +2925,9 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
       report.candidateCosts.allSimd / ratioDenominator,
       report.candidateCosts.allSimtOnly / ratioDenominator,
       report.candidateCosts.mixedSimdSimt / ratioDenominator};
+  llvm::errs() << "[COSTMODEL]   legacy decision=" << stringifySimdSimtCandidate(report.decision).str()
+               << " bestScore=" << report.bestScore << "\n";
+  llvm::errs() << "[COSTMODEL] --- estimateSimdSimtCandidatesImpl END (legacy) ---\n";
   return report;
 }
 

@@ -1477,11 +1477,14 @@ ProgramStructureAnalysis::analyze(ModuleOp module,
 llvm::Expected<std::optional<PhaseBoundaryPlan>>
 PhaseBoundaryAnalysis::analyze(const SimdSimtFeatureSummary &features,
                                const StagePartitionerOptions &options) const {
+  llvm::errs() << "[COSTMODEL] --- PhaseBoundaryAnalysis::analyze START ---\n";
   if (features.simtAnchors.triangularSolves.size() == 1 &&
       features.simtAnchors.count > 0) {
     PhaseBoundaryPlan plan{PhaseBoundaryDomain::TriangularRecurrence,
                            "triangular_recurrence",
                            features.simtAnchors.triangularSolves.front()};
+    llvm::errs() << "[COSTMODEL]   Domain=TriangularRecurrence (triangularSolves.size=1, anchors.count="
+                 << features.simtAnchors.count << ")\n";
     return std::optional<PhaseBoundaryPlan>{std::move(plan)};
   }
   if (features.dotOps == 0 && features.reduceOps > 0 &&
@@ -1489,6 +1492,8 @@ PhaseBoundaryAnalysis::analyze(const SimdSimtFeatureSummary &features,
       features.storeOps > 0) {
     PhaseBoundaryPlan plan{PhaseBoundaryDomain::LoadedIndexRowwiseReduction,
                            "loaded_index_rowwise_reduction", std::nullopt};
+    llvm::errs() << "[COSTMODEL]   Domain=LoadedIndexRowwiseReduction (dotOps=0, reduceOps="
+                 << features.reduceOps << ", loadedIndexDepMem=" << features.loadedIndexDependentMemoryOps << ")\n";
     return std::optional<PhaseBoundaryPlan>{std::move(plan)};
   }
   if (features.dotOps > 0 && features.reduceOps == 0 &&
@@ -1497,8 +1502,17 @@ PhaseBoundaryAnalysis::analyze(const SimdSimtFeatureSummary &features,
       features.storeOps > 0) {
     PhaseBoundaryPlan plan{PhaseBoundaryDomain::IndirectUnderfilledDot,
                            "indirect_underfilled_dot", std::nullopt};
+    llvm::errs() << "[COSTMODEL]   Domain=IndirectUnderfilledDot (dotOps=" << features.dotOps
+                 << ", dotFlops=" << features.dotFlops
+                 << " <= tinyDotFlopsMax=" << options.tinyDotFlopsMax
+                 << ", loadedIndexDepMem=" << features.loadedIndexDependentMemoryOps << ")\n";
     return std::optional<PhaseBoundaryPlan>{std::move(plan)};
   }
+  llvm::errs() << "[COSTMODEL]   No matching domain (dotOps=" << features.dotOps
+               << " reduceOps=" << features.reduceOps
+               << " loadedIndexDepMem=" << features.loadedIndexDependentMemoryOps
+               << " dotFlops=" << features.dotFlops << ")\n";
+  llvm::errs() << "[COSTMODEL] --- PhaseBoundaryAnalysis::analyze END (no match) ---\n";
   return std::optional<PhaseBoundaryPlan>{};
 }
 
@@ -2048,6 +2062,7 @@ llvm::Expected<std::optional<StagePartition>>
 StagePartitioner::partition(ModuleOp module, const SimtAnchorPlan &anchorPlan,
                             const SimdSimtFeatureSummary &features,
                             const StagePartitionerOptions &options) const {
+  llvm::errs() << "[COSTMODEL] --- StagePartitioner::partition(module) START ---\n";
   auto phasePlan =
       PhaseBoundaryAnalysis().analyze(module, anchorPlan, features, options);
   if (!phasePlan)
@@ -2058,6 +2073,29 @@ StagePartitioner::partition(ModuleOp module, const SimtAnchorPlan &anchorPlan,
       StageBoundaryAnalysis().analyze(**phasePlan, features, &anchorPlan);
   if (!result)
     return result.takeError();
+  llvm::errs() << "[COSTMODEL]   Phase→Stage partition: phases=" << result->phases.size() << "\n";
+  for (size_t pi = 0; pi < result->phases.size(); ++pi) {
+    llvm::errs() << "[COSTMODEL]     Phase[" << pi << "] id='" << result->phases[pi].id
+                 << "' stages=" << result->phases[pi].stages.size() << "\n";
+    for (size_t si = 0; si < result->phases[pi].stages.size(); ++si) {
+      const LogicalStage &s = result->phases[pi].stages[si];
+      llvm::errs() << "[COSTMODEL]       Stage[" << pi << "." << si << "] id='" << s.id
+                   << "' kind=" << stringifyStageCostModel(s.costModelKind)
+                   << " simdLegal=" << (s.simdLegal ? "true" : "false")
+                   << " simtLegal=" << (s.simtLegal ? "true" : "false")
+                   << " ops=" << s.operations.size() << "\n";
+      if (!s.operations.empty()) {
+        llvm::errs() << "[COSTMODEL]         --- IR of Stage '" << s.id << "' ---\n";
+        for (Operation *op : s.operations) {
+          if (op) {
+            llvm::errs() << "[COSTMODEL]           ";
+            op->print(llvm::errs());
+            llvm::errs() << "\n";
+          }
+        }
+      }
+    }
+  }
   StageWorkloadAnalysis workloadAnalysis;
   if (llvm::Error error = workloadAnalysis.analyze(*result))
     return std::move(error);
@@ -2075,6 +2113,8 @@ StagePartitioner::partition(ModuleOp module, const SimtAnchorPlan &anchorPlan,
   if (llvm::Error error = StagePartitionVerifier().verify(
           *result, buildKernelStageWorkload(features)))
     return std::move(error);
+  llvm::errs() << "[COSTMODEL]   Partition verification passed\n";
+  llvm::errs() << "[COSTMODEL] --- StagePartitioner::partition(module) END ---\n";
   return std::optional<StagePartition>{std::move(*result)};
 }
 
@@ -2091,6 +2131,29 @@ StagePartitioner::partition(const SimdSimtFeatureSummary &features,
       StageBoundaryAnalysis().analyze(**phasePlan, features, &anchorPlan);
   if (!result)
     return result.takeError();
+  llvm::errs() << "[COSTMODEL]   Phase→Stage partition (no-module): phases=" << result->phases.size() << "\n";
+  for (size_t pi = 0; pi < result->phases.size(); ++pi) {
+    llvm::errs() << "[COSTMODEL]     Phase[" << pi << "] id='" << result->phases[pi].id
+                 << "' stages=" << result->phases[pi].stages.size() << "\n";
+    for (size_t si = 0; si < result->phases[pi].stages.size(); ++si) {
+      const LogicalStage &s = result->phases[pi].stages[si];
+      llvm::errs() << "[COSTMODEL]       Stage[" << pi << "." << si << "] id='" << s.id
+                   << "' kind=" << stringifyStageCostModel(s.costModelKind)
+                   << " simdLegal=" << (s.simdLegal ? "true" : "false")
+                   << " simtLegal=" << (s.simtLegal ? "true" : "false")
+                   << " ops=" << s.operations.size() << "\n";
+      if (!s.operations.empty()) {
+        llvm::errs() << "[COSTMODEL]         --- IR of Stage '" << s.id << "' ---\n";
+        for (Operation *op : s.operations) {
+          if (op) {
+            llvm::errs() << "[COSTMODEL]           ";
+            op->print(llvm::errs());
+            llvm::errs() << "\n";
+          }
+        }
+      }
+    }
+  }
   StageFeatureAnalysis featureAnalysis;
   if (llvm::Error error = featureAnalysis.analyze(*result))
     return std::move(error);

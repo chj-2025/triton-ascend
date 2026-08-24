@@ -802,6 +802,7 @@ llvm::Error StageCostModelRegistry::verifyComplete() const {
 llvm::Expected<StageCostTable>
 StageCostEvaluator::evaluate(const StagePartition &partition,
                              const HardwareProfile &profile) const {
+  llvm::errs() << "[COSTMODEL] --- StageCostEvaluator::evaluate START ---\n";
   if (partition.domain.empty() || partition.phases.empty())
     return llvm::createStringError(
         std::errc::invalid_argument,
@@ -906,10 +907,22 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
         logicalCost.implementations.push_back(std::move(cost));
       }
 
+      llvm::errs() << "[COSTMODEL]   Stage '" << stage.id << "' model="
+                   << stringifyStageCostModel(stage.costModelKind).str()
+                   << " implementations=" << logicalCost.implementations.size() << "\n";
+      for (const auto &impl : logicalCost.implementations) {
+        llvm::errs() << "[COSTMODEL]     mode=" << stringifyStageMode(impl.implementation.mode).str()
+                     << " F" << impl.implementation.superblockFactor
+                     << " cycles=" << impl.totalCycles
+                     << " model=" << impl.modelName << "\n";
+      }
       phaseCost.stages.push_back(logicalCost);
       table.stages.push_back(std::move(logicalCost));
     }
     table.phases.push_back(std::move(phaseCost));
   }
+  llvm::errs() << "[COSTMODEL]   CostTable: stages=" << table.stages.size()
+               << " phases=" << table.phases.size() << "\n";
+  llvm::errs() << "[COSTMODEL] --- StageCostEvaluator::evaluate END ---\n";
   return table;
 }

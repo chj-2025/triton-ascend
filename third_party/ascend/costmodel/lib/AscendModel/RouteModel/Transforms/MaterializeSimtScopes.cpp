@@ -150,6 +150,8 @@ static LogicalResult wrapAnchorRange(ArrayRef<Operation *> ops,
 
 LogicalResult materializeSimtAnchorPlan(ModuleOp module,
                                         const SimtAnchorPlan &plan) {
+  llvm::errs() << "[COSTMODEL] --- materializeSimtAnchorPlan START ---\n";
+  llvm::errs() << "[COSTMODEL]   plan.anchors=" << plan.anchors.size() << "\n";
   struct PlannedRange {
     SmallVector<Operation *> operations;
     Operation *insertionPoint = nullptr;
@@ -166,6 +168,9 @@ LogicalResult materializeSimtAnchorPlan(ModuleOp module,
       continue;
 
     if (anchor.scopeOperations.size() > 1) {
+      llvm::errs() << "[COSTMODEL]   Range anchor: ops=" << anchor.scopeOperations.size() << " op=";
+      op->print(llvm::errs());
+      llvm::errs() << "\n";
       for (Operation *rangeOp : anchor.scopeOperations)
         coveredByRange.insert(rangeOp);
       PlannedRange range;
@@ -178,9 +183,14 @@ LogicalResult materializeSimtAnchorPlan(ModuleOp module,
     if (!isMaterializable(op))
       return op->emitError(
           "SIMT anchor is not materializable as a local scope");
+    llvm::errs() << "[COSTMODEL]   Single anchor: op=";
+    op->print(llvm::errs());
+    llvm::errs() << "\n";
     anchorOps.push_back(op);
   }
 
+  llvm::errs() << "[COSTMODEL]   anchorRanges=" << anchorRanges.size()
+               << " anchorOps=" << anchorOps.size() << "\n";
   int64_t materialized = 0;
   for (const PlannedRange &range : anchorRanges) {
     if (failed(wrapAnchorRange(range.operations, range.insertionPoint)))
@@ -196,6 +206,8 @@ LogicalResult materializeSimtAnchorPlan(ModuleOp module,
   if (materialized == 0)
     return module.emitError(
         "mixed_simd_simt has no materializable local SIMT scope");
+  llvm::errs() << "[COSTMODEL]   Materialized " << materialized << " SIMT scope(s)\n";
+  llvm::errs() << "[COSTMODEL] --- materializeSimtAnchorPlan END ---\n";
   return success();
 }
 

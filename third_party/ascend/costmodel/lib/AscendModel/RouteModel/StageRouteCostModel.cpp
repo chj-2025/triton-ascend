@@ -417,6 +417,8 @@ llvm::json::Object StageCostModelSummary::toJSON() const {
 llvm::Expected<StageCostModelSummary>
 mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
                                const StageTransitionCost &transition) {
+  llvm::errs() << "[COSTMODEL] --- solveStageRoutes START ---\n";
+  llvm::errs() << "[COSTMODEL]   costTable.stages=" << costTable.stages.size() << "\n";
   if (costTable.stages.empty())
     return llvm::createStringError(std::errc::invalid_argument,
                                    "stage route model requires at least one "
@@ -581,5 +583,23 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
   aggregatePhases(result.allSimd);
   aggregatePhases(result.allSimt);
   aggregatePhases(result.mixed);
+
+  llvm::errs() << "[COSTMODEL]   Route results:\n";
+  llvm::errs() << "[COSTMODEL]     AllSIMD: legal=" << result.allSimd.legal
+               << " totalCycles=" << result.allSimd.totalCycles
+               << " factor=" << result.allSimd.routeSuperblockFactor << "\n";
+  llvm::errs() << "[COSTMODEL]     AllSIMT: legal=" << result.allSimt.legal
+               << " totalCycles=" << result.allSimt.totalCycles
+               << " factor=" << result.allSimt.routeSuperblockFactor << "\n";
+  llvm::errs() << "[COSTMODEL]     Mixed:  legal=" << result.mixed.legal
+               << " totalCycles=" << result.mixed.totalCycles
+               << " factor=" << result.mixed.routeSuperblockFactor << "\n";
+  if (result.mixed.legal) {
+    llvm::errs() << "[COSTMODEL]     Mixed implementations:";
+    for (const auto &impl : result.mixed.implementations)
+      llvm::errs() << " " << stringifyStageMode(impl.mode).str() << "F" << impl.superblockFactor;
+    llvm::errs() << "\n";
+  }
+  llvm::errs() << "[COSTMODEL] --- solveStageRoutes END ---\n";
   return result;
 }

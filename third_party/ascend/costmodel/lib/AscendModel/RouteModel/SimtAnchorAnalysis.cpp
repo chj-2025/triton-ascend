@@ -718,6 +718,7 @@ mlir::ascend::classifyMixedSimtAnchor(Operation *op) {
 
 SimtAnchorPlan mlir::ascend::buildMixedSimtAnchorPlan(ModuleOp module,
                                                       bool compileOn91095) {
+  llvm::errs() << "[COSTMODEL] --- buildMixedSimtAnchorPlan START ---\n";
   SimtAnchorPlan plan;
   llvm::DenseSet<Operation *> operationsInPlannedScope;
   module.walk<WalkOrder::PreOrder>([&](Operation *op) {
@@ -728,6 +729,11 @@ SimtAnchorPlan mlir::ascend::buildMixedSimtAnchorPlan(ModuleOp module,
     if (!descriptor)
       return WalkResult::advance();
 
+    llvm::errs() << "[COSTMODEL]   Recognized anchor: kind="
+                 << stringifySimtAnchorKind(descriptor->kind) << " op=";
+    op->print(llvm::errs());
+    llvm::errs() << "\n";
+
     if (descriptor->kind == SimtAnchorKind::TriangularSolveLoop) {
       descriptor->scopeOperations = collectTriangularSolveScopeOperations(
           op, descriptor->scopeInsertionPoint);
@@ -736,6 +742,7 @@ SimtAnchorPlan mlir::ascend::buildMixedSimtAnchorPlan(ModuleOp module,
         descriptor->lowerability.mixed = CandidateLoweringStatus::Unsupported;
         descriptor->lowerability.mixedReasons.push_back(
             "triangular_solve_has_no_materializable_scope_operations");
+        llvm::errs() << "[COSTMODEL]     TriangularSolve: NO materializable scope ops\n";
       }
     } else {
       descriptor->scopeOperations.push_back(op);
@@ -775,6 +782,18 @@ SimtAnchorPlan mlir::ascend::buildMixedSimtAnchorPlan(ModuleOp module,
         mixedBlocked ? CandidateLoweringStatus::Unsupported
                      : CandidateLoweringStatus::BackendConditional;
   }
+  llvm::errs() << "[COSTMODEL]   Total anchors: " << plan.anchors.size() << "\n";
+  llvm::errs() << "[COSTMODEL]   kernelLowerability: allSimd="
+               << stringifyCandidateLoweringStatus(plan.kernelLowerability.allSimd)
+               << " allSimtOnly=" << stringifyCandidateLoweringStatus(plan.kernelLowerability.allSimtOnly)
+               << " mixed=" << stringifyCandidateLoweringStatus(plan.kernelLowerability.mixed) << "\n";
+  if (!plan.kernelLowerability.mixedReasons.empty()) {
+    llvm::errs() << "[COSTMODEL]   mixedReasons:";
+    for (const std::string &r : plan.kernelLowerability.mixedReasons)
+      llvm::errs() << " " << r;
+    llvm::errs() << "\n";
+  }
+  llvm::errs() << "[COSTMODEL] --- buildMixedSimtAnchorPlan END ---\n";
   return plan;
 }
 

@@ -127,6 +127,18 @@ struct SelectSimdSimtCostModelPass
     clearPreviousSelection(module);
     const bool autoMode = mode.getValue() == "auto";
 
+    llvm::errs() << "\n[COSTMODEL] ============================================================\n";
+    llvm::errs() << "[COSTMODEL] ===== SelectSimdSimtCostModelPass START =====\n";
+    llvm::errs() << "[COSTMODEL]   mode=" << mode.getValue()
+                << " autoMode=" << autoMode
+                << " compileOn91095=" << compileOn91095.getValue()
+                << " numWarps=" << numWarps.getValue() << "\n";
+    llvm::errs() << "[COSTMODEL]   wholeKernelSuperblock=" << wholeKernelSuperblockMaterializable.getValue()
+                << " scopeSuperblock=" << scopeSuperblockMaterializable.getValue() << "\n";
+    llvm::errs() << "[COSTMODEL]   ----- Input IR -----\n";
+    module->print(llvm::errs());
+    llvm::errs() << "\n[COSTMODEL]   ----- End of Input IR -----\n";
+
     SimdSimtCostModelOptions options;
     options.profilePath = profilePath.getValue();
     options.actualTarget = actualTarget.getValue();
@@ -139,16 +151,53 @@ struct SelectSimdSimtCostModelPass
     options.scopeSuperblockMaterializable =
         scopeSuperblockMaterializable.getValue();
 
+    llvm::errs() << "[COSTMODEL] ----- Step 1: Build SIMT Anchor Plan -----\n";
     SimtAnchorPlan anchorPlan =
         buildMixedSimtAnchorPlan(module, options.compileOn91095);
+    llvm::errs() << "[COSTMODEL]   anchorPlan: anchors=" << anchorPlan.anchors.size()
+                << " kernelLowerability.allSimd=" << stringifyCandidateLoweringStatus(anchorPlan.kernelLowerability.allSimd)
+                << " allSimtOnly=" << stringifyCandidateLoweringStatus(anchorPlan.kernelLowerability.allSimtOnly)
+                << " mixed=" << stringifyCandidateLoweringStatus(anchorPlan.kernelLowerability.mixed) << "\n";
+    for (size_t i = 0; i < anchorPlan.anchors.size(); ++i) {
+      const SimtAnchorDescriptor &a = anchorPlan.anchors[i];
+      llvm::errs() << "[COSTMODEL]   anchor[" << i << "]: op=";
+      if (a.operation)
+        a.operation->print(llvm::errs());
+      else
+        llvm::errs() << "<null>";
+      llvm::errs() << " materializable=" << (a.materializable ? "true" : "false")
+                   << " scopeOps=" << a.scopeOperations.size() << "\n";
+    }
+
+    llvm::errs() << "[COSTMODEL] ----- Step 2: Analyze SIMD/SIMT Candidates -----\n";
     auto reportOr = analyzeSimdSimtCandidates(module, anchorPlan, options);
     if (!reportOr) {
+      llvm::errs() << "[COSTMODEL]   FAILED: " << llvm::toString(reportOr.takeError()) << "\n";
       module.emitError("C++ SIMD/SIMT cost model failed: ")
           << llvm::toString(reportOr.takeError());
       signalPassFailure();
       return;
     }
     SimdSimtCostReport report = std::move(*reportOr);
+
+    llvm::errs() << "[COSTMODEL] ----- Step 3: Decision Summary -----\n";
+    llvm::errs() << "[COSTMODEL]   decision=" << stringifySimdSimtCandidate(report.decision).str() << "\n";
+    llvm::errs() << "[COSTMODEL]   candidateCosts: allSimd=" << report.candidateCosts.allSimd
+                << " allSimtOnly=" << report.candidateCosts.allSimtOnly
+                << " mixedSimdSimt=" << report.candidateCosts.mixedSimdSimt << "\n";
+    llvm::errs() << "[COSTMODEL]   candidateLegal: allSimd=" << (report.allSimdCandidateLegal ? "true" : "false")
+                << " allSimtOnly=" << (report.allSimtOnlyCandidateLegal ? "true" : "false")
+                << " mixed=" << (report.mixedCandidateLegal ? "true" : "false") << "\n";
+    llvm::errs() << "[COSTMODEL]   stageModel.applied=" << (report.stageModel.applied ? "true" : "false")
+                << " domain=" << report.stageModel.domain << "\n";
+    if (report.stageModel.applied) {
+      llvm::errs() << "[COSTMODEL]   allSimd: legal=" << (report.stageModel.allSimd.legal ? "true" : "false")
+                   << " totalCycles=" << report.stageModel.allSimd.totalCycles << "\n";
+      llvm::errs() << "[COSTMODEL]   allSimt: legal=" << (report.stageModel.allSimt.legal ? "true" : "false")
+                   << " totalCycles=" << report.stageModel.allSimt.totalCycles << "\n";
+      llvm::errs() << "[COSTMODEL]   mixed:   legal=" << (report.stageModel.mixed.legal ? "true" : "false")
+                   << " totalCycles=" << report.stageModel.mixed.totalCycles << "\n";
+    }
 
     std::string recommended = stringifySimdSimtCandidate(report.decision).str();
     std::string effective = kBackendDefault.str();
@@ -238,10 +287,19 @@ struct SelectSimdSimtCostModelPass
 
     // Selector and Materializer consume the same immutable anchor plan in one
     // pass invocation.  No per-operation marker is persisted in TTIR.
-    if (effective == kMixedSimdSimt &&
-        failed(materializeSimtAnchorPlan(module, selectedMixedAnchorPlan))) {
-      signalPassFailure();
-      return;
+    if (effective == kMixedSimdSimt) {
+      llvm::errs() << "[COSTMODEL] ----- Step 4: Materialize SIMT Scopes -----\n";
+      llvm::errs() << "[COSTMODEL]   selectedMixedAnchorPlan.anchors=" << selectedMixedAnchorPlan.anchors.size() << "\n";
+      llvm::errs() << "[COSTMODEL]   mixedAnchors=" << mixedAnchors.size()
+                   << " superblockFactor=" << selectedSuperblockFactor << "\n";
+      if (failed(materializeSimtAnchorPlan(module, selectedMixedAnchorPlan))) {
+        llvm::errs() << "[COSTMODEL]   Materialization FAILED\n";
+        signalPassFailure();
+        return;
+      }
+      llvm::errs() << "[COSTMODEL]   Materialization SUCCEEDED\n";
+    } else {
+      llvm::errs() << "[COSTMODEL] ----- Step 4: Skip Materialization (effective=" << effective << ") -----\n";
     }
 
     llvm::json::Object reportJSON = report.toJSON();
@@ -261,6 +319,15 @@ struct SelectSimdSimtCostModelPass
     if (failed(appendJSONLine(reportFile.getValue(), json)))
       module.emitWarning("failed to append C++ SIMD/SIMT report to ")
           << reportFile.getValue();
+
+    llvm::errs() << "[COSTMODEL] ----- Final Result -----\n";
+    llvm::errs() << "[COSTMODEL]   recommended=" << recommended
+                << " effective=" << effective
+                << " selectionSource=" << selectionSource << "\n";
+    llvm::errs() << "[COSTMODEL]   actionSupported=" << (actionSupported ? "true" : "false")
+                << " applicationReason=" << applicationReason << "\n";
+    llvm::errs() << "[COSTMODEL] ===== SelectSimdSimtCostModelPass END =====\n";
+    llvm::errs() << "[COSTMODEL] ============================================================\n\n";
   }
 };
 
