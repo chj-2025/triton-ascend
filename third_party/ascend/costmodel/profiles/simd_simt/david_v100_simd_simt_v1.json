@@ -1,9 +1,9 @@
 {
   "$schema": "./simd_simt_profile_schema.json",
-  "schema_version": 4,
-  "profile_version": "david-v100-simd-simt-20260806-v11",
+  "schema_version": 10,
+  "profile_version": "david-v100-simd-simt-20260820-v17",
   "target": "Ascend950PR/dav-c310",
-  "description": "Route Model policy and target-specific calibration used to rank all-SIMD, all-SIMT, and mixed SIMD/SIMT candidates. Model-neutral hardware measurements are referenced from microbenchmark_profile instead of duplicated here.",
+  "description": "Stage Route Model hardware profile. Stage partitions and workloads are generated online from transformed TTIR; this file contains no workload-specific Stage template or route multiplier.",
   "microbenchmark_profile": "../microbench/ascend_davidv100_v1.json",
   "compatible_targets": [
     "Ascend950*",
@@ -11,34 +11,10 @@
     "dav-c310"
   ],
   "score_unit": "system_cycle_selection_score",
-  "policy": {
-    "description": "Admission policy for turning a ranking into an actionable route decision. Only minimum_confidence_for_decision is currently consumed by the C++ loader.",
-    "minimum_confidence_for_decision": "low",
-    "unknown_op": "mark_low_confidence",
-    "notes": "Analytical payloads use SYS_CNT cycles, but Event-calibrated structural residuals make final values selection scores rather than literal measured cycles. Low-confidence rankings may act only inside the bounded calibration domain and must still pass target, unsupported-term, legality, and gain gates."
-  },
   "selection_calibration": {
-    "description": "Route-specific calibration that converts analytical resource costs into relative selection scores and bounds where those scores may make decisions. Mixed cost is partitioned from the materializable anchor plan; the removed legacy mixed_simd_fraction blend no longer participates.",
+    "description": "Cost parameters used by Stage models. They influence numerical cost only; coverage, confidence, Event validation, and gain-margin admission gates are not part of online route selection.",
     "program_issue_scale": 8.0,
-    "ranking_confidence": "low",
-    "source": "v11 keeps the measured masked-rowwise and tiny-gather-dot calibration, but invalidates the previous label-only triangular mixed result. Mixed scoring now uses the exact materialized scope operation set and insertion point, including safely movable mask setup but excluding the initial SIMD loads and dense dot tail; recognized 16x16 triangular recurrences use the structurally derived 14-trip full-block estimate; and SIMT predicate/shuffle work uses loop-weighted lane counts. Triangular route multipliers remain identity and non-SIMD production selection remains disabled until a real hivm.vf_mode<SIMT> A5 run is measured. No directional SIMD/SIMT boundary latency has been measured.",
-    "coverage": {
-      "description": "Feature-domain limits within which Event-calibrated structural ranking is admitted; these are model validity bounds rather than hardware limits. Masked-rowwise, rank-1 and triangular-solve use independent thresholds. The triangular bounds describe one BT64 scope containing four 16x16 recurrences and 56 structurally modeled loop trips/reductions; they do not reuse the rowwise ceiling of 16.",
-      "minimum_irregular_density": 0.25,
-      "tiny_dot_flops_max": 16384,
-      "tiny_dot_max_tensor_numel": 256,
-      "rowwise_loop_trip_sum_max": 32,
-      "rowwise_mask_rank_sum_max": 48,
-      "rowwise_weighted_reductions_max": 16,
-      "rowwise_max_tensor_numel": 128,
-      "rank1_weighted_reductions_max": 8,
-      "rank1_max_tensor_numel": 2048,
-      "triangular_loop_count_max": 4,
-      "triangular_loop_trip_sum_max": 56,
-      "triangular_mask_rank_sum_max": 64,
-      "triangular_weighted_reductions_max": 56,
-      "triangular_max_tensor_numel": 256
-    },
+    "source": "Stage costs are calibrated from shared microbenchmarks and the same-shape, one-physical-core Ascend950PR_9599 solve_tril CaModel runs. Event data is retained outside the online profile as validation evidence, not as a route multiplier or admission gate.",
     "simd_structural_penalty_ratio": {
       "description": "Additive SIMD-only residual ratios for irregular addressing, mask materialization, reductions, loops, control flow, tiny dot, and rank-1 indirect reduction patterns. Their sum multiplies A_SIMD; A_SIMT never participates in the all-SIMD cost.",
       "irregular_per_density": 0.8,
@@ -55,38 +31,6 @@
       "rank1_indirect_vector_reduction": 0.75,
       "tiny_dot": 0.06,
       "tiny_dot_flops_max": 16384
-    },
-    "event_route_score_multiplier": {
-      "description": "Low-confidence route-relative residual calibration. For each bounded feature domain, calibrated_score = raw_analytical_structural_score * route_multiplier. Masked-rowwise and tiny-irregular-dot retain their measured A5 multipliers; triangular-solve uses identity placeholders after its former label-only mixed evidence was invalidated. Raw scores and multipliers are both emitted in the report. A validated flag may promote a non-default route only after correctness and real lowering were independently verified.",
-      "domains": {
-        "masked_rowwise_reduction": {
-          "all_simd": 67.628046,
-          "all_simt_only": 0.807671,
-          "mixed_simd_simt": 3.537276,
-          "all_simt_only_validated": true,
-          "mixed_simd_simt_validated": true,
-          "source": "A5 card 0, FBGEMM T128/D128/H8/num_warps4, 30 warmup + 100 NPU Event samples: median all-SIMD 68.9340 us, all-SIMT 26.7795 us, Auto mixed 36.0365 us; all routes correctness PASS.",
-          "confidence": "low"
-        },
-        "tiny_irregular_dot": {
-          "all_simd": 1.321185,
-          "all_simt_only": 1.0,
-          "mixed_simd_simt": 0.666478,
-          "all_simt_only_validated": false,
-          "mixed_simd_simt_validated": true,
-          "source": "A5 card 0, gather-dot-min M16/N16/K16/num_warps4, one process with routes interleaved after 50 warmup, 200 NPU Event samples each: median all-SIMD 29.2525 us and correctness PASS; all-SIMT 25.1570 us but mismatched 256/256 elements; C++-materialized 2-scope mixed 25.3980 us and correctness PASS after lowering buffer-semantics identity vtranspose to copy and using cross-core GSS instead of the delayed variant whose split-side anchor interval is reversed. Mixed is 13.18% faster than all-SIMD.",
-          "confidence": "low"
-        },
-        "triangular_solve_loop": {
-          "all_simd": 1.0,
-          "all_simt_only": 1.0,
-          "mixed_simd_simt": 1.0,
-          "all_simt_only_validated": false,
-          "mixed_simd_simt_validated": false,
-          "source": "Identity placeholders after invalidating the previous solve-tril calibration. The old feature extractor treated each dynamic 16x16 recurrence as one iteration instead of the structurally known 14 and the earlier 22.3130 us mixed label did not pass --enable-simd-simt-mix-compile. Both non-SIMD production routes stay disabled until the canonical TTIR vector_mode scope is observed as hivm.vf_mode<SIMT>, the corrected raw scores are emitted, and all routes are remeasured on A5 card 0.",
-          "confidence": "low"
-        }
-      }
     }
   },
   "simd": {
@@ -188,6 +132,24 @@
       "flops_per_system_cycle": 4096.0,
       "source": "AscendModel cube startup/throughput seed; DES feedback is expected to refine scheduled lowering",
       "confidence": "low"
+    },
+    "stage_resources": {
+      "description": "Generic SIMD front-end, spill, indirect-memory, and control-flow rates used by every SIMD StageCostModel. The indirect values are provisional seeds pending the next same-shape CaModel calibration.",
+      "scalar_operations_per_system_cycle": 1.0,
+      "issue_instructions_per_system_cycle": 6.0,
+      "spill_transactions_per_system_cycle": 1.0,
+      "indirect_memory": {
+        "load_transactions_per_system_cycle": 0.125,
+        "store_transactions_per_system_cycle": 0.125,
+        "dependency_latency_system_cycles": 200.0
+      },
+      "control_flow": {
+        "loop_backedge_system_cycles": 1.0,
+        "conditional_branch_system_cycles": 1.0,
+        "divergent_branch_penalty_system_cycles": 0.0,
+        "synchronization_system_cycles": 1.0
+      },
+      "source": "Ascend950 microarchitecture issue limits plus provisional conservative dependency rates; replace numeric seeds only through versioned CaModel/microbenchmark evidence."
     }
   },
   "simt": {
@@ -304,6 +266,38 @@
       "load_throughput_measurement": "simt.gm.load.throughput",
       "store_throughput_measurement": "simt.gm.store.throughput",
       "confidence": "low"
+    },
+    "stage_resources": {
+      "description": "Generic SIMT front-end, spill, indirect-memory, and control-flow rates used by every SIMT StageCostModel. The indirect values are provisional seeds pending the next same-shape CaModel calibration.",
+      "scalar_operations_per_system_cycle": 4.0,
+      "issue_instructions_per_system_cycle": 4.0,
+      "spill_transactions_per_system_cycle": 1.0,
+      "indirect_memory": {
+        "load_transactions_per_system_cycle": 0.5,
+        "store_transactions_per_system_cycle": 0.5,
+        "dependency_latency_system_cycles": 100.0
+      },
+      "control_flow": {
+        "loop_backedge_system_cycles": 1.0,
+        "conditional_branch_system_cycles": 1.0,
+        "divergent_branch_penalty_system_cycles": 4.0,
+        "synchronization_system_cycles": 1.0
+      },
+      "superblock": {
+        "useful_factor_limit": 4,
+        "persistent_state_pressure_free_factor": 2,
+        "persistent_state_bytes_per_system_cycle": 8.0,
+        "description": "Independent logical programs may continue hiding latency through F4. Loop-carried live state is pressure-free only through F2 and is charged above that point. Keeping the two limits separate lets straight-line FBGEMM-like work benefit from F4 without making recurrence-heavy solve_tril pressure-free."
+      },
+      "scope_handoff": {
+        "fixed_directional_system_cycles": 0.0,
+        "simd_ub_load_bytes_per_system_cycle": 512.0,
+        "simd_ub_store_bytes_per_system_cycle": 256.0,
+        "simt_ub_load_bytes_per_thread_per_system_cycle": 4.0,
+        "simt_ub_store_bytes_per_thread_per_system_cycle": 4.0,
+        "description": "Only exact tensor values captured by or returned from scope.scope are charged. A value crosses the distinct SIMD/SIMT register files through UB: producer store plus consumer load. SIMD rates reflect the 256-byte vector width with two load and one store issue slots; SIMT rates are explicitly per active thread and are aggregated over one logical warp."
+      },
+      "source": "Ascend950 SIMT issue limits plus provisional conservative dependency/reconvergence, SuperBlock state-pressure, and scope hand-off rates; replace numeric seeds only through versioned CaModel/microbenchmark evidence."
     },
     "mixed_setup_fallback": {
       "1": {

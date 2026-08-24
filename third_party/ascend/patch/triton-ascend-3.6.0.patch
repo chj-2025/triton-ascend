@@ -245,6 +245,7 @@ index 48049f026..e96284bc2 100644
 @@ -1,6 +1,36 @@
  #pragma once
 +#include "ascend/include/AutoBlockify/Passes.h"
++#include "ascend/include/AutoBlockifyV1/Passes.h"
 +#include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
 +#include "ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
 +#include "ascend/include/DynamicCVPipeline/AllocMultiCache/AddMultiBufferInnerScope.h"
@@ -279,7 +280,7 @@ index 48049f026..e96284bc2 100644
  #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
  #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
  #include "proton/Dialect/include/Conversion/ProtonGPUToLLVM/Passes.h"
-@@ -85,6 +114,19 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
+@@ -85,6 +115,20 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
    mlir::triton::registerConvertTritonGPUToLLVMPass();
    mlir::triton::registerConvertNVGPUToLLVMPass();
    mlir::triton::registerAllocateSharedMemoryNvPass();
@@ -293,6 +294,7 @@ index 48049f026..e96284bc2 100644
 +  mlir::triton::registerTritonToHFusionPasses();
 +  mlir::triton::registerTritonToLLVMPasses();
 +  mlir::triton::registerAutoBlockifyPasses();
++  mlir::triton::registerAutoBlockifyV1Passes();
 +  mlir::triton::cfg::registerTritonToGraphPasses();
 +  mlir::triton::registerBubbleUpOperationPass();
 +

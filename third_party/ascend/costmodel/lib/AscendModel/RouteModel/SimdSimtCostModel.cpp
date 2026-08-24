@@ -9,6 +9,8 @@
 #include "AscendModel/RouteModel/SimdSimtCostModel.h"
 #include "AscendModel/Profile/MicrobenchmarkProfile.h"
 #include "AscendModel/RouteModel/SimtAnchorAnalysis.h"
+#include "AscendModel/RouteModel/StageCostModels.h"
+#include "AscendModel/RouteModel/StagePartitioner.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -52,23 +54,6 @@ struct OpProfile {
   std::string confidence = "none";
 };
 
-struct CoverageProfile {
-  double minimumIrregularDensity = 0.0;
-  int64_t tinyDotFlopsMax = 0;
-  int64_t tinyDotMaxTensorNumel = 0;
-  int64_t rowwiseLoopTripSumMax = 0;
-  int64_t rowwiseMaskRankSumMax = 0;
-  int64_t rowwiseWeightedReductionsMax = 0;
-  int64_t rowwiseMaxTensorNumel = 0;
-  int64_t rank1WeightedReductionsMax = 0;
-  int64_t rank1MaxTensorNumel = 0;
-  int64_t triangularLoopCountMax = 0;
-  int64_t triangularLoopTripSumMax = 0;
-  int64_t triangularMaskRankSumMax = 0;
-  int64_t triangularWeightedReductionsMax = 0;
-  int64_t triangularMaxTensorNumel = 0;
-};
-
 struct StructuralProfile {
   double irregularPerDensity = 0.0;
   double irregularCap = 0.0;
@@ -91,14 +76,28 @@ struct MixedSetupFallbackProfile {
   double emptySimtSetupCycles = 0.0;
 };
 
-struct EventRouteCalibrationProfile {
-  double allSimdMultiplier = 1.0;
-  double allSimtOnlyMultiplier = 1.0;
-  double mixedSimdSimtMultiplier = 1.0;
-  bool allSimtOnlyValidated = false;
-  bool mixedSimdSimtValidated = false;
-  std::string source;
-  std::string confidence = "none";
+struct StageResourceProfile {
+  double scalarOperationsPerCycle = 0.0;
+  double issueOperationsPerCycle = 0.0;
+  double spillTransactionsPerCycle = 0.0;
+  double indirectLoadTransactionsPerCycle = 0.0;
+  double indirectStoreTransactionsPerCycle = 0.0;
+  double indirectDependencyLatencyCycles = 0.0;
+  StageControlFlowRates controlFlow;
+
+  bool isValid() const {
+    const std::array<double, 5> positive = {
+        scalarOperationsPerCycle, issueOperationsPerCycle,
+        spillTransactionsPerCycle, indirectLoadTransactionsPerCycle,
+        indirectStoreTransactionsPerCycle};
+    return llvm::all_of(positive,
+                        [](double value) {
+                          return std::isfinite(value) && value > 0.0;
+                        }) &&
+           std::isfinite(indirectDependencyLatencyCycles) &&
+           indirectDependencyLatencyCycles >= 0.0 &&
+           controlFlow.isFiniteAndNonNegative();
+  }
 };
 
 struct CandidateProfile {
@@ -106,7 +105,6 @@ struct CandidateProfile {
   std::string target;
   std::vector<std::string> compatibleTargets;
   std::string scoreUnit;
-  std::string minimumConfidence = "medium";
   std::string contentSha256;
   std::string selectionContentSha256;
   std::string microbenchmarkProfileVersion;
@@ -114,12 +112,7 @@ struct CandidateProfile {
   std::string microbenchmarkContentSha256;
 
   double programIssueScale = 1.0;
-  std::string rankingConfidence = "low";
-  std::string calibrationSource;
-  CoverageProfile coverage;
   StructuralProfile structural;
-  llvm::StringMap<EventRouteCalibrationProfile> eventRouteCalibration;
-
   int64_t simdVectorWidthBits = 2048;
   double simdSetupCycles = 0.0;
   llvm::StringMap<OpProfile> simdOps;
@@ -129,6 +122,7 @@ struct CandidateProfile {
   double simdDotSetupCycles = 0.0;
   double simdDotFlopsPerCycle = 0.0;
   std::string simdDotConfidence = "none";
+  StageResourceProfile simdStageResources;
 
   int64_t simtWarpSize = 32;
   double simtSetupCycles = 0.0;
@@ -143,6 +137,15 @@ struct CandidateProfile {
   double simtLoadWarpRate = 0.0;
   double simtStoreWarpRate = 0.0;
   std::string simtMemoryConfidence = "none";
+  StageResourceProfile simtStageResources;
+  int64_t superblockUsefulFactorLimit = 1;
+  int64_t superblockPersistentStatePressureFreeFactor = 1;
+  double superblockPersistentStateBytesPerCycle = 0.0;
+  double scopeHandoffFixedDirectionalCycles = 0.0;
+  double scopeSimdUbLoadBytesPerCycle = 0.0;
+  double scopeSimdUbStoreBytesPerCycle = 0.0;
+  double scopeSimtUbLoadBytesPerThreadPerCycle = 0.0;
+  double scopeSimtUbStoreBytesPerThreadPerCycle = 0.0;
   std::vector<MixedSetupFallbackProfile> mixedSetupFallbacks;
   std::string mixedSetupFallbackConfidence = "none";
 };
@@ -275,6 +278,44 @@ static bool isPointerType(Type type) {
   return llvm::StringRef(typeToString(type)).contains("!tt.ptr");
 }
 
+/// Return true only when a loop-carried value is used exclusively to derive
+/// load/store addresses (plus the loop yield).  This recognizes pointer and
+/// integer-offset induction without confusing it with a recurrence whose
+/// value feeds arithmetic, predicates, or stored data.
+static bool isAddressOnlyLoopCarriedValue(Value root) {
+  llvm::SmallVector<Value> worklist{root};
+  llvm::DenseSet<Value> visited;
+  bool reachesAddressUse = false;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      llvm::StringRef name = user->getName().getStringRef();
+      if (name == "scf.yield")
+        continue;
+      if ((name == "tt.load" || name == "tt.store") &&
+          use.getOperandNumber() == 0) {
+        reachesAddressUse = true;
+        continue;
+      }
+      const bool addressForwarding =
+          name == "tt.addptr" || name == "tt.splat" || name == "tt.broadcast" ||
+          name == "tt.expand_dims" || name == "arith.addi" ||
+          name == "arith.subi" || name == "arith.muli" ||
+          name == "arith.index_cast";
+      if (!addressForwarding)
+        return false;
+      if (name == "tt.addptr")
+        reachesAddressUse = true;
+      for (Value result : user->getResults())
+        worklist.push_back(result);
+    }
+  }
+  return reachesAddressUse;
+}
+
 static Type getElementType(Type type) {
   if (auto tensor = dyn_cast<RankedTensorType>(type))
     return tensor.getElementType();
@@ -395,6 +436,12 @@ static int64_t getLoopMultiplier(
   for (Operation *parent = op->getParentOp(); parent;
        parent = parent->getParentOp()) {
     if (parent->getName().getStringRef() != "scf.for")
+      continue;
+    // AutoBlockify V1 wraps the original logical program in a physical-core
+    // scheduling loop.  Its dispatch cost is modeled as a separate phase;
+    // it must not multiply every algorithm operation as if it were an
+    // algorithmic loop.
+    if (parent->hasAttr("ta.auto_blockify_v1.schedule"))
       continue;
     int64_t tripCount =
         getModeledLoopTripCount(parent, structuralTripEstimates);
@@ -670,12 +717,10 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
     return llvm::createStringError(std::errc::invalid_argument,
                                    "SIMD/SIMT profile root must be an object");
   auto selectionSchemaVersion = root->getInteger("schema_version");
-  if (!selectionSchemaVersion ||
-      (*selectionSchemaVersion != 1 && *selectionSchemaVersion != 2 &&
-       *selectionSchemaVersion != 3 && *selectionSchemaVersion != 4))
+  if (!selectionSchemaVersion || *selectionSchemaVersion != 10)
     return llvm::createStringError(
         std::errc::invalid_argument,
-        "SIMD/SIMT profile schema_version must be 1, 2, 3, or 4");
+        "SIMD/SIMT profile schema_version must be 10");
 
   CandidateProfile profile;
   ProfileJSONReader reader;
@@ -700,12 +745,7 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
       microbenchmarkProfile ? &*microbenchmarkProfile : nullptr;
 
   profile.profileVersion = reader.string(*root, "profile_version", "profile");
-  const bool usesAnchorPartitionProfile =
-      profile.profileVersion == "david-v100-simd-simt-20260730-v7" ||
-      profile.profileVersion == "david-v100-simd-simt-20260803-v8" ||
-      profile.profileVersion == "david-v100-simd-simt-20260804-v9" ||
-      profile.profileVersion == "david-v100-simd-simt-20260804-v10" ||
-      profile.profileVersion == "david-v100-simd-simt-20260806-v11";
+  const bool usesAnchorPartitionProfile = true;
   profile.target = reader.string(*root, "target", "profile");
   if (microbench && llvm::StringRef(profile.target) != microbench->getTarget())
     reader.setError("selection profile target '" + profile.target +
@@ -721,54 +761,11 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
         reader.setError("profile.compatible_targets entries must be strings");
     }
   }
-  if (const auto *policy = reader.object(*root, "policy", "profile"))
-    profile.minimumConfidence = reader.optionalString(
-        *policy, "minimum_confidence_for_decision", "medium");
-
   const auto *calibration =
       reader.object(*root, "selection_calibration", "profile");
   if (calibration) {
     profile.programIssueScale = reader.number(
         *calibration, "program_issue_scale", "profile.selection_calibration");
-    profile.rankingConfidence =
-        reader.optionalString(*calibration, "ranking_confidence", "low");
-    profile.calibrationSource =
-        reader.optionalString(*calibration, "source", "");
-
-    if (const auto *coverage = reader.object(*calibration, "coverage",
-                                             "profile.selection_calibration")) {
-      profile.coverage.minimumIrregularDensity =
-          reader.number(*coverage, "minimum_irregular_density", "coverage");
-      profile.coverage.tinyDotFlopsMax =
-          reader.integer(*coverage, "tiny_dot_flops_max", "coverage");
-      profile.coverage.tinyDotMaxTensorNumel =
-          reader.integer(*coverage, "tiny_dot_max_tensor_numel", "coverage");
-      profile.coverage.rowwiseLoopTripSumMax =
-          reader.integer(*coverage, "rowwise_loop_trip_sum_max", "coverage");
-      profile.coverage.rowwiseMaskRankSumMax =
-          reader.integer(*coverage, "rowwise_mask_rank_sum_max", "coverage");
-      profile.coverage.rowwiseWeightedReductionsMax = reader.integer(
-          *coverage, "rowwise_weighted_reductions_max", "coverage");
-      profile.coverage.rowwiseMaxTensorNumel =
-          reader.integer(*coverage, "rowwise_max_tensor_numel", "coverage");
-      profile.coverage.rank1WeightedReductionsMax = reader.integer(
-          *coverage, "rank1_weighted_reductions_max", "coverage");
-      profile.coverage.rank1MaxTensorNumel =
-          reader.integer(*coverage, "rank1_max_tensor_numel", "coverage");
-      // These fields were introduced by v11. Keep bounded defaults only for
-      // reading older diagnostic profiles; the v11 JSON schema requires all
-      // five values explicitly.
-      profile.coverage.triangularLoopCountMax =
-          reader.optionalInteger(*coverage, "triangular_loop_count_max", 4);
-      profile.coverage.triangularLoopTripSumMax =
-          reader.optionalInteger(*coverage, "triangular_loop_trip_sum_max", 56);
-      profile.coverage.triangularMaskRankSumMax =
-          reader.optionalInteger(*coverage, "triangular_mask_rank_sum_max", 64);
-      profile.coverage.triangularWeightedReductionsMax = reader.optionalInteger(
-          *coverage, "triangular_weighted_reductions_max", 56);
-      profile.coverage.triangularMaxTensorNumel =
-          reader.optionalInteger(*coverage, "triangular_max_tensor_numel", 256);
-    }
 
     if (const auto *structural =
             reader.object(*calibration, "simd_structural_penalty_ratio",
@@ -801,52 +798,6 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
           reader.number(*structural, "tiny_dot", "structural");
       profile.structural.tinyDotFlopsMax =
           reader.integer(*structural, "tiny_dot_flops_max", "structural");
-    }
-
-    if (calibration->get("event_route_score_multiplier")) {
-      const auto *eventCalibration =
-          reader.object(*calibration, "event_route_score_multiplier",
-                        "profile.selection_calibration");
-      if (!eventCalibration)
-        return llvm::createStringError(
-            std::errc::invalid_argument,
-            "invalid event_route_score_multiplier object");
-      if (const auto *domains = reader.object(*eventCalibration, "domains",
-                                              "event_route_score_multiplier")) {
-        for (const auto &entry : *domains) {
-          const auto *domain = entry.second.getAsObject();
-          if (!domain) {
-            reader.setError("event_route_score_multiplier.domains." +
-                            entry.first.str() + " must be an object");
-            continue;
-          }
-          EventRouteCalibrationProfile route;
-          const std::string context =
-              "event_route_score_multiplier.domains." + entry.first.str();
-          route.allSimdMultiplier = reader.number(*domain, "all_simd", context);
-          route.allSimtOnlyMultiplier =
-              reader.number(*domain, "all_simt_only", context);
-          route.mixedSimdSimtMultiplier =
-              reader.number(*domain, "mixed_simd_simt", context);
-          auto allSimtValidated = domain->getBoolean("all_simt_only_validated");
-          if (!allSimtValidated) {
-            reader.setError(context +
-                            ".all_simt_only_validated must be a boolean");
-          } else {
-            route.allSimtOnlyValidated = *allSimtValidated;
-          }
-          auto mixedValidated = domain->getBoolean("mixed_simd_simt_validated");
-          if (!mixedValidated) {
-            reader.setError(context +
-                            ".mixed_simd_simt_validated must be a boolean");
-          } else {
-            route.mixedSimdSimtValidated = *mixedValidated;
-          }
-          route.source = reader.string(*domain, "source", context);
-          route.confidence = reader.string(*domain, "confidence", context);
-          profile.eventRouteCalibration[entry.first.str()] = std::move(route);
-        }
-      }
     }
   }
 
@@ -889,6 +840,45 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
           reader.number(*dot, "flops_per_system_cycle", "simd.dot");
       profile.simdDotConfidence =
           reader.optionalString(*dot, "confidence", "none");
+    }
+    if (const auto *resources =
+            reader.object(*simd, "stage_resources", "simd")) {
+      profile.simdStageResources.scalarOperationsPerCycle =
+          reader.number(*resources, "scalar_operations_per_system_cycle",
+                        "simd.stage_resources");
+      profile.simdStageResources.issueOperationsPerCycle =
+          reader.number(*resources, "issue_instructions_per_system_cycle",
+                        "simd.stage_resources");
+      profile.simdStageResources.spillTransactionsPerCycle =
+          reader.number(*resources, "spill_transactions_per_system_cycle",
+                        "simd.stage_resources");
+      if (const auto *indirect = reader.object(*resources, "indirect_memory",
+                                               "simd.stage_resources")) {
+        profile.simdStageResources.indirectLoadTransactionsPerCycle =
+            reader.number(*indirect, "load_transactions_per_system_cycle",
+                          "simd.stage_resources.indirect_memory");
+        profile.simdStageResources.indirectStoreTransactionsPerCycle =
+            reader.number(*indirect, "store_transactions_per_system_cycle",
+                          "simd.stage_resources.indirect_memory");
+        profile.simdStageResources.indirectDependencyLatencyCycles =
+            reader.number(*indirect, "dependency_latency_system_cycles",
+                          "simd.stage_resources.indirect_memory");
+      }
+      if (const auto *control = reader.object(*resources, "control_flow",
+                                              "simd.stage_resources")) {
+        profile.simdStageResources.controlFlow.loopBackedgeCycles =
+            reader.number(*control, "loop_backedge_system_cycles",
+                          "simd.stage_resources.control_flow");
+        profile.simdStageResources.controlFlow.conditionalBranchCycles =
+            reader.number(*control, "conditional_branch_system_cycles",
+                          "simd.stage_resources.control_flow");
+        profile.simdStageResources.controlFlow.divergentBranchPenaltyCycles =
+            reader.number(*control, "divergent_branch_penalty_system_cycles",
+                          "simd.stage_resources.control_flow");
+        profile.simdStageResources.controlFlow.synchronizationCycles =
+            reader.number(*control, "synchronization_system_cycles",
+                          "simd.stage_resources.control_flow");
+      }
     }
   }
 
@@ -958,6 +948,75 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
           *memory, "confidence",
           minimumConfidence({loadConfidence, storeConfidence}));
     }
+    if (const auto *resources =
+            reader.object(*simt, "stage_resources", "simt")) {
+      profile.simtStageResources.scalarOperationsPerCycle =
+          reader.number(*resources, "scalar_operations_per_system_cycle",
+                        "simt.stage_resources");
+      profile.simtStageResources.issueOperationsPerCycle =
+          reader.number(*resources, "issue_instructions_per_system_cycle",
+                        "simt.stage_resources");
+      profile.simtStageResources.spillTransactionsPerCycle =
+          reader.number(*resources, "spill_transactions_per_system_cycle",
+                        "simt.stage_resources");
+      if (const auto *indirect = reader.object(*resources, "indirect_memory",
+                                               "simt.stage_resources")) {
+        profile.simtStageResources.indirectLoadTransactionsPerCycle =
+            reader.number(*indirect, "load_transactions_per_system_cycle",
+                          "simt.stage_resources.indirect_memory");
+        profile.simtStageResources.indirectStoreTransactionsPerCycle =
+            reader.number(*indirect, "store_transactions_per_system_cycle",
+                          "simt.stage_resources.indirect_memory");
+        profile.simtStageResources.indirectDependencyLatencyCycles =
+            reader.number(*indirect, "dependency_latency_system_cycles",
+                          "simt.stage_resources.indirect_memory");
+      }
+      if (const auto *control = reader.object(*resources, "control_flow",
+                                              "simt.stage_resources")) {
+        profile.simtStageResources.controlFlow.loopBackedgeCycles =
+            reader.number(*control, "loop_backedge_system_cycles",
+                          "simt.stage_resources.control_flow");
+        profile.simtStageResources.controlFlow.conditionalBranchCycles =
+            reader.number(*control, "conditional_branch_system_cycles",
+                          "simt.stage_resources.control_flow");
+        profile.simtStageResources.controlFlow.divergentBranchPenaltyCycles =
+            reader.number(*control, "divergent_branch_penalty_system_cycles",
+                          "simt.stage_resources.control_flow");
+        profile.simtStageResources.controlFlow.synchronizationCycles =
+            reader.number(*control, "synchronization_system_cycles",
+                          "simt.stage_resources.control_flow");
+      }
+      if (const auto *superblock =
+              reader.object(*resources, "superblock", "simt.stage_resources")) {
+        profile.superblockUsefulFactorLimit =
+            reader.integer(*superblock, "useful_factor_limit",
+                           "simt.stage_resources.superblock");
+        profile.superblockPersistentStatePressureFreeFactor =
+            reader.integer(*superblock, "persistent_state_pressure_free_factor",
+                           "simt.stage_resources.superblock");
+        profile.superblockPersistentStateBytesPerCycle = reader.number(
+            *superblock, "persistent_state_bytes_per_system_cycle",
+            "simt.stage_resources.superblock");
+      }
+      if (const auto *handoff = reader.object(*resources, "scope_handoff",
+                                              "simt.stage_resources")) {
+        profile.scopeHandoffFixedDirectionalCycles =
+            reader.number(*handoff, "fixed_directional_system_cycles",
+                          "simt.stage_resources.scope_handoff");
+        profile.scopeSimdUbLoadBytesPerCycle =
+            reader.number(*handoff, "simd_ub_load_bytes_per_system_cycle",
+                          "simt.stage_resources.scope_handoff");
+        profile.scopeSimdUbStoreBytesPerCycle =
+            reader.number(*handoff, "simd_ub_store_bytes_per_system_cycle",
+                          "simt.stage_resources.scope_handoff");
+        profile.scopeSimtUbLoadBytesPerThreadPerCycle = reader.number(
+            *handoff, "simt_ub_load_bytes_per_thread_per_system_cycle",
+            "simt.stage_resources.scope_handoff");
+        profile.scopeSimtUbStoreBytesPerThreadPerCycle = reader.number(
+            *handoff, "simt_ub_store_bytes_per_thread_per_system_cycle",
+            "simt.stage_resources.scope_handoff");
+      }
+    }
     const llvm::json::Object *mixedSetupFallback = nullptr;
     if (usesAnchorPartitionProfile)
       mixedSetupFallback = reader.object(*simt, "mixed_setup_fallback", "simt");
@@ -989,83 +1048,42 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
     return llvm::createStringError(
         std::errc::invalid_argument, "invalid SIMD/SIMT profile '%s': %s",
         path.c_str(), reader.getError().str().c_str());
-  if (profile.profileVersion != "david-v100-simd-simt-20260727-v3" &&
-      profile.profileVersion != "david-v100-simd-simt-20260727-v4" &&
-      profile.profileVersion != "david-v100-simd-simt-20260728-v5" &&
-      profile.profileVersion != "david-v100-simd-simt-20260730-v6" &&
-      profile.profileVersion != "david-v100-simd-simt-20260730-v7" &&
-      profile.profileVersion != "david-v100-simd-simt-20260803-v8" &&
-      profile.profileVersion != "david-v100-simd-simt-20260804-v9" &&
-      profile.profileVersion != "david-v100-simd-simt-20260804-v10" &&
-      profile.profileVersion != "david-v100-simd-simt-20260806-v11")
+  if (profile.profileVersion != "david-v100-simd-simt-20260820-v17")
     return llvm::createStringError(
         std::errc::invalid_argument,
         "unsupported SIMD/SIMT profile version '%s' "
-        "(expected v3, v4, v5, v6, v7, v8, v9, v10, or v11)",
+        "(expected david-v100-simd-simt-20260820-v17)",
         profile.profileVersion.c_str());
-  const bool usesSharedMicrobench =
-      profile.profileVersion == "david-v100-simd-simt-20260728-v5" ||
-      profile.profileVersion == "david-v100-simd-simt-20260730-v6" ||
-      profile.profileVersion == "david-v100-simd-simt-20260730-v7" ||
-      profile.profileVersion == "david-v100-simd-simt-20260803-v8" ||
-      profile.profileVersion == "david-v100-simd-simt-20260804-v9" ||
-      profile.profileVersion == "david-v100-simd-simt-20260804-v10" ||
-      profile.profileVersion == "david-v100-simd-simt-20260806-v11";
+  const bool usesSharedMicrobench = true;
   if (usesSharedMicrobench && !microbench)
-    return llvm::createStringError(
-        std::errc::invalid_argument,
-        "SIMD/SIMT v5/v6/v7/v8/v9/v10/v11 profile must reference "
-        "microbenchmark_profile");
-  const bool usesEventCalibrationSchema =
-      profile.profileVersion == "david-v100-simd-simt-20260804-v9" ||
-      profile.profileVersion == "david-v100-simd-simt-20260804-v10" ||
-      profile.profileVersion == "david-v100-simd-simt-20260806-v11";
-  if (usesSharedMicrobench &&
-      ((!usesAnchorPartitionProfile && *selectionSchemaVersion != 2) ||
-       (!usesEventCalibrationSchema && usesAnchorPartitionProfile &&
-        *selectionSchemaVersion != 3) ||
-       (usesEventCalibrationSchema && *selectionSchemaVersion != 4)))
-    return llvm::createStringError(
-        std::errc::invalid_argument,
-        "SIMD/SIMT v5/v6 requires schema_version 2 and v7 requires "
-        "schema_version 3; v9/v10/v11 require schema_version 4");
+    return llvm::createStringError(std::errc::invalid_argument,
+                                   "SIMD/SIMT v17 profile must reference "
+                                   "microbenchmark_profile");
+  if (*selectionSchemaVersion != 10)
+    return llvm::createStringError(std::errc::invalid_argument,
+                                   "SIMD/SIMT v17 requires schema_version 10");
   if (profile.simdVectorWidthBits <= 0 || profile.simtWarpSize <= 0 ||
       profile.simdMte2BytesPerCycle <= 0.0 ||
       profile.simdMte3BytesPerCycle <= 0.0 || profile.simtLoadWarpRate <= 0.0 ||
       profile.simtStoreWarpRate <= 0.0 || profile.simtShuffleRate <= 0.0 ||
-      profile.simtPredicateRate <= 0.0 || profile.mixedSetupFallbacks.empty())
+      profile.simtPredicateRate <= 0.0 ||
+      profile.superblockUsefulFactorLimit <= 0 ||
+      profile.superblockPersistentStatePressureFreeFactor <= 0 ||
+      profile.superblockPersistentStatePressureFreeFactor >
+          profile.superblockUsefulFactorLimit ||
+      profile.superblockPersistentStateBytesPerCycle <= 0.0 ||
+      profile.scopeHandoffFixedDirectionalCycles < 0.0 ||
+      profile.scopeSimdUbLoadBytesPerCycle <= 0.0 ||
+      profile.scopeSimdUbStoreBytesPerCycle <= 0.0 ||
+      profile.scopeSimtUbLoadBytesPerThreadPerCycle <= 0.0 ||
+      profile.scopeSimtUbStoreBytesPerThreadPerCycle <= 0.0 ||
+      !profile.simdStageResources.isValid() ||
+      !profile.simtStageResources.isValid() ||
+      profile.mixedSetupFallbacks.empty())
     return llvm::createStringError(
         std::errc::invalid_argument,
         "SIMD/SIMT profile contains non-positive rates or no mixed setup "
         "fallbacks");
-  if (profile.coverage.triangularLoopCountMax <= 0 ||
-      profile.coverage.triangularLoopTripSumMax <= 0 ||
-      profile.coverage.triangularMaskRankSumMax <= 0 ||
-      profile.coverage.triangularWeightedReductionsMax <= 0 ||
-      profile.coverage.triangularMaxTensorNumel <= 0)
-    return llvm::createStringError(
-        std::errc::invalid_argument,
-        "SIMD/SIMT profile contains non-positive triangular-solve "
-        "coverage bounds");
-  if (usesEventCalibrationSchema && profile.eventRouteCalibration.empty())
-    return llvm::createStringError(
-        std::errc::invalid_argument,
-        "SIMD/SIMT v9/v10/v11 profile requires event route calibration "
-        "domains");
-  for (const auto &entry : profile.eventRouteCalibration) {
-    const EventRouteCalibrationProfile &route = entry.second;
-    if (!std::isfinite(route.allSimdMultiplier) ||
-        !std::isfinite(route.allSimtOnlyMultiplier) ||
-        !std::isfinite(route.mixedSimdSimtMultiplier) ||
-        route.allSimdMultiplier <= 0.0 || route.allSimtOnlyMultiplier <= 0.0 ||
-        route.mixedSimdSimtMultiplier <= 0.0)
-      return llvm::createStringError(
-          std::errc::invalid_argument,
-          "event route calibration domain '%s' has a non-positive or "
-          "non-finite multiplier",
-          entry.first().str().c_str());
-  }
-
   std::string canonicalProfile;
   llvm::raw_string_ostream canonicalStream(canonicalProfile);
   emitPythonCanonicalJSON(*parsed, canonicalStream);
@@ -1141,53 +1159,131 @@ getProfileOpElements(const SimtAnchorFeatureSummary &features) {
   };
 }
 
-static std::pair<bool, std::string>
-rankingCalibrationCoverage(const SimdSimtFeatureSummary &features,
-                           int64_t weightedReductions, int64_t dotFlops,
-                           const CandidateProfile &profile,
-                           double irregularDensity) {
-  if (features.hasDynamicShape)
-    return {false, "dynamic_shape"};
-  const CoverageProfile &coverage = profile.coverage;
-  const int64_t maxNumel = features.maxTensorNumel;
-  const int64_t staticLoopTrips = features.staticLoopTripCountSum;
-  const int64_t maskRankSum = features.maskRankSum;
-  const bool hasTriangularSolve = llvm::is_contained(
-      features.simtAnchors.mechanismKinds, "triangular_solve_loop");
-  // The triangular solve has intentionally dynamic loop bounds (min(T, 16),
-  // min(T, 32), ...), so the generic unknown-trip-count rejection is too
-  // coarse. Admit only the independently bounded BT64 anchor shape. Do not
-  // borrow masked-rowwise limits: a full tile has four loops and 56 weighted
-  // reductions after structural trip modeling.
-  if (hasTriangularSolve && features.simtAnchors.count == 1 &&
-      features.simtAnchors.staticLoopCount > 0 &&
-      features.simtAnchors.staticLoopCount <= coverage.triangularLoopCountMax &&
-      features.simtAnchors.staticLoopTripCountSum <=
-          coverage.triangularLoopTripSumMax &&
-      maxNumel <= coverage.triangularMaxTensorNumel &&
-      maskRankSum <= coverage.triangularMaskRankSumMax &&
-      weightedReductions <= coverage.triangularWeightedReductionsMax)
-    return {true, "triangular_solve_loop"};
-  if (features.hasUnknownTripCount)
-    return {false, "unknown_loop_trip_count"};
-  if (dotFlops > 0 && dotFlops <= coverage.tinyDotFlopsMax &&
-      staticLoopTrips == 0 && maxNumel <= coverage.tinyDotMaxTensorNumel &&
-      irregularDensity >= coverage.minimumIrregularDensity)
-    return {true, "tiny_irregular_dot"};
-  if (dotFlops == 0 && features.rank1IndirectVectorReduce &&
-      weightedReductions > 0 &&
-      weightedReductions <= coverage.rank1WeightedReductionsMax &&
-      maxNumel <= coverage.rank1MaxTensorNumel &&
-      staticLoopTrips <= coverage.rowwiseLoopTripSumMax)
-    return {true, "rank1_indirect_vector_reduction"};
-  if (dotFlops == 0 && staticLoopTrips > 0 &&
-      staticLoopTrips <= coverage.rowwiseLoopTripSumMax && maskRankSum > 0 &&
-      maskRankSum <= coverage.rowwiseMaskRankSumMax && weightedReductions > 0 &&
-      weightedReductions <= coverage.rowwiseWeightedReductionsMax &&
-      maxNumel <= coverage.rowwiseMaxTensorNumel &&
-      irregularDensity >= coverage.minimumIrregularDensity)
-    return {true, "masked_rowwise_reduction"};
-  return {false, "out_of_calibration_domain"};
+static HardwareProfile
+buildStageHardwareProfile(const CandidateProfile &profile, unsigned numWarps) {
+  HardwareProfile hardware;
+  hardware.profileVersion = profile.profileVersion;
+  hardware.target = profile.target;
+  hardware.logicalWarpGroupCount = std::max<int64_t>(1, numWarps);
+  hardware.superblockUsefulFactorLimit = profile.superblockUsefulFactorLimit;
+  hardware.superblockPersistentStatePressureFreeFactor =
+      profile.superblockPersistentStatePressureFreeFactor;
+  hardware.superblockPersistentStateBytesPerCycle =
+      profile.superblockPersistentStateBytesPerCycle;
+  hardware.simd.setupCycles = profile.simdSetupCycles;
+  hardware.simd.vectorWidth =
+      std::max<int64_t>(1, profile.simdVectorWidthBits / 32);
+  hardware.simd.issueWidth = hardware.simd.vectorWidth;
+  hardware.simt.setupCycles = profile.simtSetupCycles;
+  hardware.simt.vectorWidth = 1;
+  hardware.simt.issueWidth = std::max<int64_t>(1, profile.simtWarpSize);
+  for (const auto &entry : profile.simdOps)
+    hardware.simd.operationRates[entry.first()] = {entry.second.throughput,
+                                                   entry.second.factor};
+  for (const auto &entry : profile.simtOps)
+    hardware.simt.operationRates[entry.first()] = {entry.second.throughput,
+                                                   entry.second.factor};
+  hardware.simd.loadBytesPerCycle = profile.simdMte2BytesPerCycle;
+  hardware.simd.storeBytesPerCycle = profile.simdMte3BytesPerCycle;
+  hardware.simt.loadWarpInstructionsPerCycle = profile.simtLoadWarpRate;
+  hardware.simt.storeWarpInstructionsPerCycle = profile.simtStoreWarpRate;
+  const OpProfile simdPredicate = profile.simdOps.lookup("predicate.cmp");
+  const OpProfile simtPredicate = profile.simtOps.lookup("predicate.cmp");
+  hardware.simd.predicateOperationsPerCycle =
+      simdPredicate.throughput / std::max(1.0, simdPredicate.factor);
+  hardware.simt.predicateOperationsPerCycle =
+      simtPredicate.throughput / std::max(1.0, simtPredicate.factor);
+  hardware.simd.shuffleLanesPerCycle = hardware.simd.vectorWidth;
+  hardware.simt.shuffleLanesPerCycle =
+      profile.simtWarpSize * profile.simtShuffleRate;
+  hardware.simd.dotSetupCycles = profile.simdDotSetupCycles;
+  hardware.simd.dotFlopsPerCycle = profile.simdDotFlopsPerCycle;
+  hardware.simt.dotSetupCycles = profile.simtDotSetupCycles;
+  hardware.simt.dotFlopsPerCycle = profile.simtDotFlopsPerCycle;
+  hardware.simd.scalarOperationsPerCycle =
+      profile.simdStageResources.scalarOperationsPerCycle;
+  hardware.simt.scalarOperationsPerCycle =
+      profile.simtStageResources.scalarOperationsPerCycle;
+  hardware.simd.issueOperationsPerCycle =
+      profile.simdStageResources.issueOperationsPerCycle;
+  hardware.simt.issueOperationsPerCycle =
+      profile.simtStageResources.issueOperationsPerCycle;
+  hardware.simd.spillTransactionsPerCycle =
+      profile.simdStageResources.spillTransactionsPerCycle;
+  hardware.simt.spillTransactionsPerCycle =
+      profile.simtStageResources.spillTransactionsPerCycle;
+  hardware.simd.indirectLoadTransactionsPerCycle =
+      profile.simdStageResources.indirectLoadTransactionsPerCycle;
+  hardware.simd.indirectStoreTransactionsPerCycle =
+      profile.simdStageResources.indirectStoreTransactionsPerCycle;
+  hardware.simd.indirectDependencyLatencyCycles =
+      profile.simdStageResources.indirectDependencyLatencyCycles;
+  hardware.simt.indirectLoadTransactionsPerCycle =
+      profile.simtStageResources.indirectLoadTransactionsPerCycle;
+  hardware.simt.indirectStoreTransactionsPerCycle =
+      profile.simtStageResources.indirectStoreTransactionsPerCycle;
+  hardware.simt.indirectDependencyLatencyCycles =
+      profile.simtStageResources.indirectDependencyLatencyCycles;
+  hardware.simd.controlFlow = profile.simdStageResources.controlFlow;
+  hardware.simt.controlFlow = profile.simtStageResources.controlFlow;
+  hardware.transition.simdToSimtCycles =
+      profile.scopeHandoffFixedDirectionalCycles;
+  hardware.transition.simtToSimdCycles =
+      profile.scopeHandoffFixedDirectionalCycles;
+  hardware.transition.simdUbLoadBytesPerCycle =
+      profile.scopeSimdUbLoadBytesPerCycle;
+  hardware.transition.simdUbStoreBytesPerCycle =
+      profile.scopeSimdUbStoreBytesPerCycle;
+  hardware.transition.simtUbLoadBytesPerThreadPerCycle =
+      profile.scopeSimtUbLoadBytesPerThreadPerCycle;
+  hardware.transition.simtUbStoreBytesPerThreadPerCycle =
+      profile.scopeSimtUbStoreBytesPerThreadPerCycle;
+  hardware.transition.simtWarpSize = profile.simtWarpSize;
+  hardware.transition.source =
+      "exact scope tensor bytes crossing SIMD/SIMT register files through UB; "
+      "directional setup remains separate from standalone SIMT VF startup";
+  return hardware;
+}
+
+static llvm::Expected<std::optional<StageCostModelSummary>> evaluateStageModel(
+    const SimdSimtFeatureSummary &features, const CandidateProfile &profile,
+    unsigned numWarps, bool wholeKernelSuperblockMaterializable,
+    bool scopeSuperblockMaterializable, ModuleOp module = nullptr,
+    const SimtAnchorPlan *anchorPlan = nullptr) {
+  StagePartitionerOptions partitionerOptions;
+  partitionerOptions.tinyDotFlopsMax = profile.structural.tinyDotFlopsMax;
+  partitionerOptions.maximumSuperblockFactor =
+      (wholeKernelSuperblockMaterializable || features.autoBlockifyV1Applied)
+          ? 4
+          : 1;
+  partitionerOptions.scopeSuperblockMaterializable =
+      scopeSuperblockMaterializable;
+  StagePartitioner partitioner;
+  auto partition =
+      module && anchorPlan ? partitioner.partition(module, *anchorPlan,
+                                                   features, partitionerOptions)
+      : anchorPlan
+          ? partitioner.partition(features, partitionerOptions, *anchorPlan)
+          : partitioner.partition(features, partitionerOptions);
+  if (!partition)
+    return partition.takeError();
+  if (!*partition)
+    return std::optional<StageCostModelSummary>{};
+
+  HardwareProfile hardwareProfile =
+      buildStageHardwareProfile(profile, numWarps);
+  ProfileProvider provider(std::move(hardwareProfile));
+  auto snapshot = provider.getSnapshot(profile.target, profile.profileVersion);
+  if (!snapshot)
+    return snapshot.takeError();
+  StageCostEvaluator evaluator;
+  auto costTable = evaluator.evaluate(**partition, **snapshot);
+  if (!costTable)
+    return costTable.takeError();
+  auto routes = solveStageRoutes(*costTable, (*snapshot)->transition);
+  if (!routes)
+    return routes.takeError();
+  return std::optional<StageCostModelSummary>{std::move(*routes)};
 }
 
 static SimtApplicabilityResult
@@ -1349,6 +1445,19 @@ toPlainCumsumFactsJSON(const PlainCumsumFacts &facts) {
   return result;
 }
 
+static llvm::json::Object
+toTriangularSolveFactsJSON(const TriangularSolveFacts &facts) {
+  llvm::json::Object result;
+  result["block_rows"] = facts.blockRows;
+  result["block_columns"] = facts.blockColumns;
+  result["accumulator_type"] = facts.accumulatorType;
+  result["recurrence_start_row"] = facts.recurrenceStartRow;
+  result["recurrence_loop_count"] = facts.recurrenceLoopCount;
+  result["dense_dot_tail_ops"] = facts.denseDotTailOps;
+  result["requires_cube_tail_partition"] = facts.requiresCubeTailPartition;
+  return result;
+}
+
 llvm::json::Object SimtAnchorFeatureSummary::toJSON() const {
   llvm::json::Object result;
   result["recognized_count"] = recognizedCount;
@@ -1381,6 +1490,9 @@ llvm::json::Object SimtAnchorFeatureSummary::toJSON() const {
   result["modeled_dynamic_loop_count"] = modeledDynamicLoopCount;
   result["modeled_dynamic_loop_trip_count_sum"] =
       modeledDynamicLoopTripCountSum;
+  result["conditional_branch_count"] = conditionalBranchCount;
+  result["divergent_branch_count"] = divergentBranchCount;
+  result["active_lane_ratio"] = activeLaneRatio;
   result["has_control_flow"] = hasControlFlow;
   result["weighted_ops"] = ::toJSON(weightedOps);
   result["op_elements"] = ::toJSON(opElements);
@@ -1409,6 +1521,10 @@ llvm::json::Object SimtAnchorFeatureSummary::toJSON() const {
   for (const PlainCumsumFacts &facts : plainCumsums)
     cumsumFacts.push_back(toPlainCumsumFactsJSON(facts));
   result["plain_cumsums"] = std::move(cumsumFacts);
+  llvm::json::Array triangularFacts;
+  for (const TriangularSolveFacts &facts : triangularSolves)
+    triangularFacts.push_back(toTriangularSolveFactsJSON(facts));
+  result["triangular_solves"] = std::move(triangularFacts);
   result["kernel_lowerability"] = toLowerabilityJSON(kernelLowerability);
   return result;
 }
@@ -1483,6 +1599,23 @@ llvm::json::Object SimdSimtFeatureSummary::toJSON() const {
   result["modeled_dynamic_loop_count"] = modeledDynamicLoopCount;
   result["modeled_dynamic_loop_trip_count_sum"] =
       modeledDynamicLoopTripCountSum;
+  result["loop_carried_data_dependency_count"] = loopCarriedDataDependencyCount;
+  result["pointer_induction_dependency_count"] =
+      pointerInductionDependencyCount;
+  result["conditional_branch_count"] = conditionalBranchCount;
+  result["divergent_branch_count"] = divergentBranchCount;
+  result["active_lane_ratio"] = activeLaneRatio;
+  llvm::json::Object postTransform;
+  postTransform["ttir_layout_merge_applied"] = ttirLayoutMergeApplied;
+  postTransform["coalesce_factor"] = coalesceFactor;
+  postTransform["coalesce_axis"] = coalesceAxis;
+  postTransform["auto_blockify_v1_applied"] = autoBlockifyV1Applied;
+  postTransform["auto_blockify_v1_loop_count"] = autoBlockifyV1LoopCount;
+  postTransform["auto_blockify_v1_schedule_op_count"] =
+      autoBlockifyV1ScheduleOpCount;
+  postTransform["auto_blockify_v1_dynamic_trip_count"] =
+      autoBlockifyV1HasDynamicTripCount;
+  result["post_transform"] = std::move(postTransform);
   result["has_dot"] = hasDot;
   result["has_gather"] = hasGather;
   result["has_atomic"] = hasAtomic;
@@ -1579,6 +1712,10 @@ SimdSimtCostBreakdown::toJSON(const SimdSimtFeatureSummary &features) const {
   partition["simt_anchor_predicate_system_cycles"] =
       mixedSimtAnchorPredicateCycles;
   partition["simt_anchor_payload_system_cycles"] = mixedSimtAnchorPayloadCycles;
+  partition["simt_anchor_calibrated_payload_system_cycles"] =
+      mixedSimtAnchorCalibratedPayloadCycles;
+  partition["cube_tail_dot_ops"] = cubeTailDotOps;
+  partition["cube_tail_dot_flops"] = cubeTailDotFlops;
   partition["measured_boundary_system_cycles"] = nullptr;
   partition["applied_boundary_fallback_system_cycles"] = mixedBoundaryCycles;
   partition["remaining_simd_structural_penalty_ratio"] =
@@ -1623,49 +1760,11 @@ llvm::json::Object SimdSimtCostReport::toJSON() const {
   result["shared_microbenchmark_profile"] = std::move(sharedEvidence);
   result["unit"] = scoreUnit;
   result["score_scope"] = scoreScope;
-  result["selection_score_valid"] = selectionScoreValid;
-  result["absolute_cost_valid"] = absoluteCostValid;
   result["excludes"] = llvm::json::Array({"host_launch", "grid_wave_count"});
-  result["candidate_costs_evaluated"] = candidateCostsEvaluated;
-  if (candidateCostsEvaluated) {
-    result["candidate_costs"] = candidateCosts.toJSON();
-    result["candidate_ratios_to_best"] = candidateRatiosToBest.toJSON();
-    result["decision_kind"] = stringifySimdSimtCandidate(decision);
-    result["runner_up_kind"] = stringifySimdSimtCandidate(runnerUp);
-    result["best_score"] = bestScore;
-    result["runner_up_score"] = runnerUpScore;
-    result["gain_score"] = gainScore;
-    result["decision_advantage"] = decisionAdvantage;
-    result["required_gain_score"] = requiredGainScore;
-  } else {
-    result["candidate_costs"] = nullptr;
-    result["candidate_ratios_to_best"] = nullptr;
-    result["decision_kind"] = nullptr;
-    result["runner_up_kind"] = nullptr;
-    result["best_score"] = nullptr;
-    result["runner_up_score"] = nullptr;
-    result["gain_score"] = nullptr;
-    result["decision_advantage"] = nullptr;
-    result["required_gain_score"] = nullptr;
-  }
-  llvm::json::Object eventCalibration;
-  eventCalibration["applied"] = eventRouteCalibrationApplied;
-  eventCalibration["domain"] = eventRouteCalibrationApplied
-                                   ? llvm::json::Value(calibrationDomain)
-                                   : llvm::json::Value(nullptr);
-  eventCalibration["all_simt_only_validated"] = eventAllSimtOnlyValidated;
-  eventCalibration["mixed_simd_simt_validated"] = eventMixedSimdSimtValidated;
-  eventCalibration["source"] = eventRouteCalibrationSource;
-  eventCalibration["confidence"] = eventRouteCalibrationConfidence;
-  if (candidateCostsEvaluated) {
-    eventCalibration["raw_candidate_costs"] =
-        uncalibratedCandidateCosts.toJSON();
-    eventCalibration["score_multipliers"] = eventRouteScoreMultipliers.toJSON();
-  } else {
-    eventCalibration["raw_candidate_costs"] = nullptr;
-    eventCalibration["score_multipliers"] = nullptr;
-  }
-  result["event_route_calibration"] = std::move(eventCalibration);
+  result["candidate_costs"] = candidateCosts.toJSON();
+  result["candidate_ratios_to_best"] = candidateRatiosToBest.toJSON();
+  result["decision_kind"] = stringifySimdSimtCandidate(decision);
+  result["best_score"] = bestScore;
   llvm::json::Array selectableCandidates;
   if (allSimdCandidateLegal)
     selectableCandidates.push_back(kAllSimd);
@@ -1674,44 +1773,12 @@ llvm::json::Object SimdSimtCostReport::toJSON() const {
   if (mixedCandidateLegal)
     selectableCandidates.push_back(kMixedSimdSimt);
   result["selectable_candidates"] = std::move(selectableCandidates);
-  result["margin_ratio"] = marginRatio;
-  result["ranking_confidence"] = rankingConfidence;
-  result["minimum_confidence_for_decision"] = minimumConfidenceForDecision;
-  result["absolute_confidence"] = absoluteConfidence;
-  result["confidence"] = rankingConfidence;
-  result["gate_passed"] = gatePassed;
-
-  llvm::json::Array reasons;
-  for (const std::string &reason : gateReasons)
-    reasons.push_back(reason);
-  result["gate_reasons"] = std::move(reasons);
   llvm::json::Array unsupportedValues;
   for (const std::string &value : unsupported)
     unsupportedValues.push_back(value);
-  result["unsupported"] = std::move(unsupportedValues);
-
-  llvm::json::Object structure;
-  structure["calibration_covered"] = calibrationCovered;
-  structure["calibration_domain"] = calibrationDomain;
-  structure["calibration_sample_domain"] = calibrationDomain;
-  result["calibration"] = std::move(structure);
+  result["unmodeled_cost_terms"] = std::move(unsupportedValues);
   result["applicability"] = applicability.toJSON();
-
-  llvm::json::Object contract;
-  contract["version"] = 2;
-  contract["enabled"] = false;
-  contract["requested"] = !features.observedMixedKinds.empty();
-  contract["mandatory_override_suppressed"] =
-      !features.observedMixedKinds.empty();
-  contract["mandatory"] = false;
-  contract["required"] = false;
-  contract["target_kind"] = nullptr;
-  llvm::json::Array routeKinds;
-  for (const std::string &kind : features.observedMixedKinds)
-    routeKinds.push_back(kind);
-  contract["route_kinds"] = std::move(routeKinds);
-  contract["all_simt_only_reference_only"] = false;
-  result["mixed_execution_contract"] = std::move(contract);
+  result["stage_model"] = stageModel.toJSON();
 
   llvm::json::Object roles;
   roles[kAllSimd] =
@@ -1722,33 +1789,16 @@ llvm::json::Object SimdSimtCostReport::toJSON() const {
       mixedCandidateLegal ? "selectable_candidate" : "inapplicable";
   result["candidate_roles"] = std::move(roles);
 
-  if (candidateCostsEvaluated) {
-    llvm::json::Object analytical;
-    analytical[kAllSimd] = breakdown.simdAnalyticalCycles;
-    analytical[kAllSimtOnly] = breakdown.simtAnalyticalCycles;
-    result["analytical_candidate_costs"] = std::move(analytical);
+  llvm::json::Object analytical;
+  analytical[kAllSimd] = breakdown.simdAnalyticalCycles;
+  analytical[kAllSimtOnly] = breakdown.simtAnalyticalCycles;
+  result["analytical_candidate_costs"] = std::move(analytical);
 
-    llvm::json::Object detail = breakdown.toJSON(features);
-    for (auto &entry : detail)
-      result[entry.first] = std::move(entry.second);
-    if (auto *structureObject = result.getObject("structure")) {
-      (*structureObject)["calibration_covered"] = calibrationCovered;
-      (*structureObject)["calibration_domain"] = calibrationDomain;
-      (*structureObject)["calibration_sample_domain"] = calibrationDomain;
-    }
-  } else {
-    result["analytical_candidate_costs"] = nullptr;
-    llvm::json::Object structure;
-    structure["irregular_density"] = breakdown.irregularDensity;
-    structure["calibration_covered"] = calibrationCovered;
-    structure["calibration_domain"] = calibrationDomain;
-    structure["calibration_sample_domain"] = calibrationDomain;
-    result["structure"] = std::move(structure);
-  }
+  llvm::json::Object detail = breakdown.toJSON(features);
+  for (auto &entry : detail)
+    result[entry.first] = std::move(entry.second);
   if (includeFeaturesInJSON)
     result["features"] = features.toJSON();
-  result["des_feedback_applied"] = llvm::json::Array();
-  result["des_feedback_validation_errors"] = llvm::json::Array();
   return result;
 }
 
@@ -1790,6 +1840,24 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
   SimdSimtFeatureSummary features;
   initializeWorkMaps(features);
   initializeWorkMaps(features.simtAnchors);
+  features.ttirLayoutMergeApplied =
+      module->hasAttr("ta.ttir_layout_merge.applied");
+  if (auto factor = module->getAttrOfType<IntegerAttr>("hacc.coalesce_factor"))
+    features.coalesceFactor = std::max<int64_t>(1, factor.getInt());
+  if (auto axis = module->getAttrOfType<IntegerAttr>("hacc.coalesce_axis"))
+    features.coalesceAxis = axis.getInt();
+  module.walk([&](Operation *op) {
+    if (op->hasAttr("ta.auto_blockify_v1"))
+      features.autoBlockifyV1Applied = true;
+    if (op->hasAttr("ta.auto_blockify_v1.schedule"))
+      ++features.autoBlockifyV1ScheduleOpCount;
+    if (!op->hasAttr("ta.auto_blockify_v1.loop"))
+      return;
+    features.autoBlockifyV1Applied = true;
+    ++features.autoBlockifyV1LoopCount;
+    if (!getKnownStaticLoopTripCount(op))
+      features.autoBlockifyV1HasDynamicTripCount = true;
+  });
   llvm::DenseSet<Operation *> anchorSet;
   llvm::DenseMap<Operation *, int64_t> structuralTripEstimates;
   for (const SimtAnchorDescriptor &anchor : anchorPlan.anchors) {
@@ -1828,6 +1896,9 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
       features.simtAnchors.histograms.push_back(*facts);
     else if (const auto *facts = std::get_if<PlainCumsumFacts>(&anchor.facts))
       features.simtAnchors.plainCumsums.push_back(*facts);
+    else if (const auto *facts =
+                 std::get_if<TriangularSolveFacts>(&anchor.facts))
+      features.simtAnchors.triangularSolves.push_back(*facts);
   }
 
   auto isInAnchor = [&](Operation *op) {
@@ -1893,6 +1964,12 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
   };
 
   module.walk([&](Operation *op) {
+    // V1 scheduling is a separate dispatch phase.  Keep it in post_transform
+    // diagnostics, but do not reinterpret its dynamic physical-core loop as
+    // an unknown-trip algorithm loop or charge its scalar prologue at
+    // candidate-specific SIMD/SIMT rates.
+    if (op->hasAttr("ta.auto_blockify_v1.schedule"))
+      return;
     llvm::StringRef name = op->getName().getStringRef();
     const int64_t elements = getOperationElements(op);
     const int64_t loopMultiplier =
@@ -1918,6 +1995,19 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
       features.hasControlFlow = true;
       if (inAnchor)
         features.simtAnchors.hasControlFlow = true;
+    }
+    if (name == "scf.if" || name == "cf.cond_br") {
+      ++features.conditionalBranchCount;
+      if (inAnchor)
+        ++features.simtAnchors.conditionalBranchCount;
+      const bool laneVarying =
+          op->getNumOperands() > 0 &&
+          isa<RankedTensorType>(op->getOperand(0).getType());
+      if (laneVarying) {
+        ++features.divergentBranchCount;
+        if (inAnchor)
+          ++features.simtAnchors.divergentBranchCount;
+      }
     }
     if (name == "scope.scope")
       features.hasExplicitScope = true;
@@ -2017,6 +2107,22 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
         if (usedStructuralEstimate) {
           ++features.simtAnchors.modeledDynamicLoopCount;
           features.simtAnchors.modeledDynamicLoopTripCountSum += tripCount;
+        }
+      }
+      if (op->getNumRegions() > 0 && !op->getRegion(0).empty()) {
+        Block &body = op->getRegion(0).front();
+        // scf.for block argument 0 is the induction variable; remaining
+        // arguments are loop-carried iter_args.
+        for (unsigned argumentIndex = 1; argumentIndex < body.getNumArguments();
+             ++argumentIndex) {
+          BlockArgument argument = body.getArgument(argumentIndex);
+          if (argument.use_empty())
+            continue;
+          if (isPointerType(argument.getType()) ||
+              isAddressOnlyLoopCarriedValue(argument))
+            ++features.pointerInductionDependencyCount;
+          else
+            ++features.loopCarriedDataDependencyCount;
         }
       }
     }
@@ -2285,13 +2391,11 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
   return features;
 }
 
-llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
-    const SimdSimtFeatureSummary &features,
-    const SimdSimtCostModelOptions &options) {
-  if (!std::isfinite(options.marginRatio) || options.marginRatio < 0.0)
-    return llvm::createStringError(
-        std::errc::invalid_argument,
-        "SIMD/SIMT marginRatio must be finite and non-negative");
+static llvm::Expected<SimdSimtCostReport>
+estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
+                               const SimdSimtCostModelOptions &options,
+                               ModuleOp module,
+                               const SimtAnchorPlan *anchorPlan) {
   auto profileOrError = loadCandidateProfile(options.profilePath);
   if (!profileOrError)
     return profileOrError.takeError();
@@ -2308,7 +2412,6 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
   report.microbenchmarkProfileContentSha256 =
       profile.microbenchmarkContentSha256;
   report.scoreUnit = profile.scoreUnit;
-  report.minimumConfidenceForDecision = profile.minimumConfidence;
   report.targetCompatible = targetMatches(profile, options.actualTarget);
   report.features = features;
   report.applicability =
@@ -2316,76 +2419,65 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
   report.allSimdCandidateLegal =
       features.simtAnchors.kernelLowerability.allSimd ==
       CandidateLoweringStatus::Native;
+  const CandidateLoweringStatus allSimtStatus =
+      features.simtAnchors.kernelLowerability.allSimtOnly;
+  // BackendConditional means the anchor itself has no TTIR legality blocker;
+  // the 910/95 pure-SIMT backend is the remaining condition.  Once that
+  // backend is selected, let the complete Stage model decide the route.
   report.allSimtOnlyCandidateLegal =
       options.compileOn91095 && !features.hasExplicitScope &&
-      features.simtAnchors.kernelLowerability.allSimtOnly ==
-          CandidateLoweringStatus::Native;
+      (allSimtStatus == CandidateLoweringStatus::Native ||
+       allSimtStatus == CandidateLoweringStatus::BackendConditional);
   report.mixedCandidateLegal = !features.hasExplicitScope &&
                                report.applicability.materializable &&
                                features.simtAnchors.kernelLowerability.mixed ==
                                    CandidateLoweringStatus::Native;
   report.includeFeaturesInJSON = options.includeFeaturesInJSON;
-  report.marginRatio = options.marginRatio;
 
-  // Coverage is a validity check over extracted features, not a cost term.
-  // Evaluate it before all resource, structural, and transition scoring so
-  // production auto selection can reject out-of-domain kernels cheaply.
   const int64_t weightedReductions =
       mapValue(features.weightedOps, "reduce", features.reduceOps);
   const int64_t dotFlops = features.dotFlops;
   const int64_t pointerOps = std::max<int64_t>(1, features.pointerTensorOps);
   report.breakdown.irregularDensity = std::min(
       1.0, static_cast<double>(features.laneDependentPointerOps) / pointerOps);
-  auto [covered, domain] =
-      rankingCalibrationCoverage(features, weightedReductions, dotFlops,
-                                 profile, report.breakdown.irregularDensity);
-  report.calibrationCovered = covered;
-  report.calibrationDomain = std::move(domain);
-  report.selectionScoreValid = covered;
-
-  const EventRouteCalibrationProfile *eventRouteCalibration = nullptr;
-  if (report.calibrationCovered) {
-    auto calibration =
-        profile.eventRouteCalibration.find(report.calibrationDomain);
-    if (calibration != profile.eventRouteCalibration.end()) {
-      eventRouteCalibration = &calibration->second;
-      report.eventRouteCalibrationApplied = true;
-      report.eventAllSimtOnlyValidated =
-          eventRouteCalibration->allSimtOnlyValidated;
-      report.eventMixedSimdSimtValidated =
-          eventRouteCalibration->mixedSimdSimtValidated;
-      report.eventRouteCalibrationSource = eventRouteCalibration->source;
-      report.eventRouteCalibrationConfidence =
-          eventRouteCalibration->confidence;
-      report.eventRouteScoreMultipliers = {
-          eventRouteCalibration->allSimdMultiplier,
-          eventRouteCalibration->allSimtOnlyMultiplier,
-          eventRouteCalibration->mixedSimdSimtMultiplier};
-
-      // BackendConditional is deliberately not globally selectable.  A
-      // bounded Event domain may promote it only after the whole-kernel pure
-      // SIMT path passed correctness on the target represented by this
-      // versioned profile.  Unsupported/AliasesMixed statuses never promote.
-      if (options.compileOn91095 && !features.hasExplicitScope &&
-          eventRouteCalibration->allSimtOnlyValidated &&
-          features.simtAnchors.kernelLowerability.allSimtOnly ==
-              CandidateLoweringStatus::BackendConditional)
-        report.allSimtOnlyCandidateLegal = true;
-      if (!eventRouteCalibration->mixedSimdSimtValidated)
-        report.mixedCandidateLegal = false;
-    }
-  }
-
-  if (!report.calibrationCovered && !options.scoreOutsideCalibrationCoverage) {
-    if (!report.targetCompatible)
-      report.gateReasons.push_back("target_incompatible");
-    report.gateReasons.push_back("selection_score_invalid");
-    report.gatePassed = false;
-    return report;
-  }
 
   const int64_t numWarps =
       std::max<int64_t>(1, static_cast<int64_t>(options.numWarps));
+  auto stageModel = evaluateStageModel(
+      features, profile, static_cast<unsigned>(numWarps),
+      options.wholeKernelSuperblockMaterializable,
+      options.scopeSuperblockMaterializable, module, anchorPlan);
+  if (!stageModel)
+    return stageModel.takeError();
+  if (*stageModel) {
+    report.stageModel = std::move(**stageModel);
+    report.candidateCosts.allSimd = report.stageModel.allSimd.totalCycles;
+    report.candidateCosts.allSimtOnly = report.stageModel.allSimt.totalCycles;
+    report.candidateCosts.mixedSimdSimt = report.stageModel.mixed.totalCycles;
+    report.allSimdCandidateLegal &= report.stageModel.allSimd.legal;
+    report.allSimtOnlyCandidateLegal &= report.stageModel.allSimt.legal;
+    report.mixedCandidateLegal &= report.stageModel.mixed.legal;
+    report.breakdown.mixedCostSource = "stage_cost_evaluator_route_sum";
+    const unsigned legalCandidateCount =
+        static_cast<unsigned>(report.allSimdCandidateLegal) +
+        static_cast<unsigned>(report.allSimtOnlyCandidateLegal) +
+        static_cast<unsigned>(report.mixedCandidateLegal);
+    if (legalCandidateCount == 0)
+      return llvm::createStringError(
+          std::errc::not_supported,
+          "Stage Route Model found no materializable candidate");
+    report.decision = chooseBest(
+        report.candidateCosts, report.allSimdCandidateLegal,
+        report.allSimtOnlyCandidateLegal, report.mixedCandidateLegal);
+    report.bestScore = report.candidateCosts.get(report.decision);
+    const double denominator = std::max(1.0e-9, report.bestScore);
+    report.candidateRatiosToBest = {
+        report.candidateCosts.allSimd / denominator,
+        report.candidateCosts.allSimtOnly / denominator,
+        report.candidateCosts.mixedSimdSimt / denominator};
+    return report;
+  }
+
   const int64_t maxNumel = std::max<int64_t>(1, features.maxTensorNumel);
   const int64_t elementBits =
       features.maxElementBits > 0
@@ -2393,13 +2485,6 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
           : 32;
   const int64_t vectorWidth =
       std::max<int64_t>(1, profile.simdVectorWidthBits / elementBits);
-  std::vector<std::string> resourceConfidence;
-  if (report.allSimtOnlyCandidateLegal)
-    resourceConfidence.push_back(profile.simtSetupConfidence);
-  if (report.mixedCandidateLegal)
-    resourceConfidence.push_back(profile.mixedSetupFallbackConfidence);
-  if (eventRouteCalibration)
-    resourceConfidence.push_back(eventRouteCalibration->confidence);
 
   llvm::StringMap<int64_t> rawCountByKind;
   rawCountByKind["gather"] = features.gatherOps;
@@ -2447,8 +2532,6 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
     report.breakdown.simtOpSystemCycles[opName] = simtCycles;
     report.breakdown.simdComputeCycles += simdCycles;
     report.breakdown.simtComputeCycles += simtCycles;
-    resourceConfidence.push_back(simd.confidence);
-    resourceConfidence.push_back(simt.confidence);
   }
 
   for (const auto &[opName, elements] :
@@ -2489,8 +2572,6 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
       profile.simdMte3BytesPerCycle;
   report.breakdown.mixedSimdRegularMemoryCycles =
       std::max(mixedSimdRegularLoadCycles, mixedSimdRegularStoreCycles);
-  if (features.loadBytes != 0.0 || features.storeBytes != 0.0)
-    resourceConfidence.push_back(profile.simdMemoryConfidence);
 
   const int64_t loadWarpInstructions =
       features.loadWarpInstructions != 0
@@ -2515,8 +2596,6 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
   report.breakdown.mixedSimtAnchorMemoryCycles =
       features.simtAnchors.loadWarpInstructions / profile.simtLoadWarpRate +
       features.simtAnchors.storeWarpInstructions / profile.simtStoreWarpRate;
-  if (loadWarpInstructions != 0 || storeWarpInstructions != 0)
-    resourceConfidence.push_back(profile.simtMemoryConfidence);
 
   const int64_t weightedScans =
       mapValue(features.weightedOps, "scan", features.scanOps);
@@ -2553,8 +2632,6 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
                 shuffleLevels;
   report.breakdown.mixedSimtAnchorShuffleCycles =
       anchorShuffleInstructions / profile.simtShuffleRate;
-  if (report.breakdown.simtShuffleInstructions != 0.0)
-    resourceConfidence.push_back(profile.simtShuffleConfidence);
 
   report.breakdown.simtPredicateInstructions =
       features.predicateLaneEvaluations > 0
@@ -2582,11 +2659,12 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
     report.breakdown.simtDotCycles =
         profile.simtDotSetupCycles +
         static_cast<double>(dotFlops) / profile.simtDotFlopsPerCycle;
-    resourceConfidence.push_back(profile.simdDotConfidence);
-    resourceConfidence.push_back(profile.simtDotConfidence);
   }
   const int64_t regularDotFlops =
       std::max<int64_t>(0, dotFlops - features.simtAnchors.dotFlops);
+  report.breakdown.cubeTailDotOps =
+      std::max<int64_t>(0, features.dotOps - features.simtAnchors.dotOps);
+  report.breakdown.cubeTailDotFlops = regularDotFlops;
   if (regularDotFlops)
     report.breakdown.mixedSimdRegularDotCycles =
         profile.simdDotSetupCycles +
@@ -2660,7 +2738,6 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
   report.candidateCosts.allSimd = report.breakdown.simdAnalyticalCycles +
                                   report.breakdown.simdStructuralPenaltyCycles;
   report.candidateCosts.allSimtOnly = report.breakdown.simtAnalyticalCycles;
-
   const MixedSetupFallbackProfile *nearestSetupFallback = nullptr;
   for (const MixedSetupFallbackProfile &fallback : profile.mixedSetupFallbacks)
     if (!nearestSetupFallback ||
@@ -2759,11 +2836,15 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
     const double regularPayloadWithResidual =
         report.breakdown.mixedSimdRegularPayloadCycles *
         (1.0 + remainingStructuralPenalty);
+    double anchorPayloadForCost = report.breakdown.mixedSimtAnchorPayloadCycles;
+    report.breakdown.mixedSimtAnchorCalibratedPayloadCycles =
+        anchorPayloadForCost;
+    report.breakdown.mixedSimtAnchorCalibratedPayloadCycles =
+        anchorPayloadForCost;
     report.candidateCosts.mixedSimdSimt =
         report.breakdown.mixedSetupFallbackCycles +
         profile.programIssueScale *
-            (regularPayloadWithResidual +
-             report.breakdown.mixedSimtAnchorPayloadCycles) +
+            (regularPayloadWithResidual + anchorPayloadForCost) +
         report.breakdown.mixedBoundaryCycles;
     report.breakdown.mixedCostSource =
         "materializable_anchor_resource_partition";
@@ -2776,21 +2857,6 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
         "inapplicable_without_materializable_anchor";
   }
 
-  report.uncalibratedCandidateCosts = report.candidateCosts;
-  if (eventRouteCalibration) {
-    // The analytical/structural formula supplies the feature-sensitive base.
-    // A bounded, versioned Event multiplier corrects its route-relative
-    // residual for the admitted domain.  Keeping the raw score in the report
-    // makes the empirical correction explicit instead of hiding it in a
-    // structural penalty or a Python heuristic.
-    report.candidateCosts.allSimd *= eventRouteCalibration->allSimdMultiplier;
-    report.candidateCosts.allSimtOnly *=
-        eventRouteCalibration->allSimtOnlyMultiplier;
-    report.candidateCosts.mixedSimdSimt *=
-        eventRouteCalibration->mixedSimdSimtMultiplier;
-  }
-
-  report.candidateCostsEvaluated = true;
   sortAndUnique(report.unsupported);
   const unsigned legalCandidateCount =
       static_cast<unsigned>(report.allSimdCandidateLegal) +
@@ -2803,68 +2869,19 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
   report.decision =
       chooseBest(report.candidateCosts, report.allSimdCandidateLegal,
                  report.allSimtOnlyCandidateLegal, report.mixedCandidateLegal);
-  report.runnerUp =
-      chooseRunnerUp(report.candidateCosts, report.allSimdCandidateLegal,
-                     report.allSimtOnlyCandidateLegal,
-                     report.mixedCandidateLegal, report.decision);
   report.bestScore = report.candidateCosts.get(report.decision);
-  report.runnerUpScore = report.candidateCosts.get(report.runnerUp);
-  if (legalCandidateCount <= 1) {
-    report.decisionAdvantage = 0.0;
-  } else if (report.allSimdCandidateLegal) {
-    report.decisionAdvantage =
-        report.decision == SimdSimtCandidateKind::AllSIMD
-            ? report.runnerUpScore - report.bestScore
-            : report.candidateCosts.allSimd - report.bestScore;
-  } else {
-    report.decisionAdvantage = report.runnerUpScore - report.bestScore;
-  }
-  report.gainScore = report.decisionAdvantage;
-  const double gainBaseline = report.allSimdCandidateLegal
-                                  ? report.candidateCosts.allSimd
-                                  : report.runnerUpScore;
-  report.requiredGainScore =
-      legalCandidateCount > 1
-          ? std::max(64.0, gainBaseline * options.marginRatio)
-          : 0.0;
-  double ratioDenominator =
-      std::max(1.0e-9, std::min({report.candidateCosts.allSimd,
-                                 report.candidateCosts.allSimtOnly,
-                                 report.candidateCosts.mixedSimdSimt}));
+  const double ratioDenominator = std::max(1.0e-9, report.bestScore);
   report.candidateRatiosToBest = {
       report.candidateCosts.allSimd / ratioDenominator,
       report.candidateCosts.allSimtOnly / ratioDenominator,
       report.candidateCosts.mixedSimdSimt / ratioDenominator};
-
-  report.absoluteConfidence = minimumConfidence(resourceConfidence);
-  if (!report.unsupported.empty()) {
-    report.rankingConfidence = "none";
-  } else if (report.breakdown.structuralPenaltyRatio > 0.0 && covered) {
-    report.rankingConfidence = minimumConfidence(
-        {report.absoluteConfidence, profile.rankingConfidence});
-  } else {
-    report.rankingConfidence = report.absoluteConfidence;
-  }
-  if (!report.targetCompatible)
-    report.rankingConfidence = "none";
-
-  if (!report.targetCompatible)
-    report.gateReasons.push_back("target_incompatible");
-  if (!report.selectionScoreValid)
-    report.gateReasons.push_back("selection_score_invalid");
-  if (!report.unsupported.empty())
-    report.gateReasons.push_back("unsupported_cost_terms");
-  if (confidenceRank(report.rankingConfidence) <
-      confidenceRank(report.minimumConfidenceForDecision))
-    report.gateReasons.push_back("ranking_confidence_" +
-                                 report.rankingConfidence + "_below_" +
-                                 report.minimumConfidenceForDecision);
-  if (legalCandidateCount > 1 &&
-      report.decision != SimdSimtCandidateKind::AllSIMD &&
-      !(report.decisionAdvantage > report.requiredGainScore))
-    report.gateReasons.push_back("decision_advantage_not_above_required_gain");
-  report.gatePassed = report.gateReasons.empty();
   return report;
+}
+
+llvm::Expected<SimdSimtCostReport> mlir::ascend::estimateSimdSimtCandidates(
+    const SimdSimtFeatureSummary &features,
+    const SimdSimtCostModelOptions &options) {
+  return estimateSimdSimtCandidatesImpl(features, options, nullptr, nullptr);
 }
 
 llvm::Expected<SimdSimtCostReport> mlir::ascend::analyzeSimdSimtCandidates(
@@ -2883,5 +2900,6 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::analyzeSimdSimtCandidates(
   auto features = analyzeSimdSimtFeatures(module, anchorPlan);
   if (!features)
     return features.takeError();
-  return estimateSimdSimtCandidates(*features, options);
+  return estimateSimdSimtCandidatesImpl(*features, options, module,
+                                        &anchorPlan);
 }

@@ -6,6 +6,9 @@ add_compile_definitions(
 
 add_mlir_library(AscendModelRouteModel
   SimtAnchorAnalysis.cpp
+  StagePartitioner.cpp
+  StageCostModels.cpp
+  StageRouteCostModel.cpp
   SimdSimtCostModel.cpp
   Transforms/SelectSimdSimtCostModel.cpp
   Transforms/MaterializeSimtScopes.cpp
