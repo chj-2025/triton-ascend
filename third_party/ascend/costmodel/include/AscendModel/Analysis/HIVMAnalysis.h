@@ -26,8 +26,6 @@
 namespace mlir {
 namespace ascend {
 
-enum class HIVMSchedulerMode { Static, DES };
-
 enum class HIVMPipe {
   Unknown,
   Vector,
@@ -71,7 +69,6 @@ struct HIVMOp {
 struct HIVMAnalysisReport {
   std::string sourcePath;
   std::string sourceMode;
-  HIVMSchedulerMode schedulerMode = HIVMSchedulerMode::Static;
   int64_t oneIterationCycles = 0;
   int64_t weightedCycles = 0;
   int64_t totalBusyCycles = 0;
@@ -89,16 +86,12 @@ struct HIVMAnalysisReport {
   void print(llvm::raw_ostream &os, const HardwareConfig &config) const;
   void emitPerfettoTrace(llvm::raw_ostream &os,
                          const HardwareConfig &config) const;
-  void emitDESGraph(llvm::raw_ostream &os, const HardwareConfig &config) const;
-  void emitFeedbackJSON(llvm::raw_ostream &os,
-                        const HardwareConfig &config) const;
 };
 
 class HIVMAnalyzer {
 public:
   HIVMAnalyzer(const HardwareConfig &config,
-               llvm::StringRef argBindings = llvm::StringRef(),
-               HIVMSchedulerMode schedulerMode = HIVMSchedulerMode::Static);
+               llvm::StringRef argBindings = llvm::StringRef());
 
   bool analyzeModule(mlir::ModuleOp module, HIVMAnalysisReport &report,
                      std::string &error) const;
@@ -107,12 +100,10 @@ public:
                    std::string &error) const;
 
   static llvm::StringRef stringifyPipe(HIVMPipe pipe);
-  static llvm::StringRef stringifySchedulerMode(HIVMSchedulerMode mode);
 
 private:
   const HardwareConfig &config;
   std::string argBindingsStr;
-  HIVMSchedulerMode schedulerMode;
 };
 
 } // namespace ascend

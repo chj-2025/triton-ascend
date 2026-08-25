@@ -1,6 +1,6 @@
 //===- StagePartitioner.cpp - Build semantic Phase/Stage IR -------------===//
 
-#include "AscendModel/RouteModel/StagePartitioner.h"
+#include "AscendModel/Analysis/StagePartitioner.h"
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/DenseSet.h"
@@ -20,41 +20,6 @@ using namespace mlir;
 using namespace mlir::ascend;
 
 namespace {
-
-static double mapValue(const llvm::StringMap<int64_t> &map,
-                       llvm::StringRef name) {
-  auto iterator = map.find(name);
-  return iterator == map.end()
-             ? 0.0
-             : static_cast<double>(std::max<int64_t>(0, iterator->second));
-}
-
-static StageWorkload buildWorkload(const SimtAnchorFeatureSummary &features) {
-  StageWorkload work;
-  const std::pair<llvm::StringLiteral, llvm::StringLiteral> names[] = {
-      {"f32.add", "add"},     {"f32.sub", "sub"}, {"f32.mul", "mul"},
-      {"f32.div", "div"},     {"f32.max", "max"}, {"f32.abs", "abs"},
-      {"f32.exp", "exp"},     {"f32.log", "log"}, {"convert.cast", "cast"},
-      {"f32.clamp", "clamp"},
-  };
-  for (const auto &[profileName, featureName] : names) {
-    const double elements = mapValue(features.opElements, featureName);
-    if (elements > 0.0)
-      work.operationElements[profileName] = elements;
-  }
-  work.scalarOperations = mapValue(features.weightedOps, "scalar");
-  work.loadBytes = features.loadBytes;
-  work.storeBytes = features.storeBytes;
-  work.loadWarpInstructions =
-      static_cast<double>(features.loadWarpInstructions);
-  work.storeWarpInstructions =
-      static_cast<double>(features.storeWarpInstructions);
-  work.predicateElements = static_cast<double>(std::max<int64_t>(
-      features.predicateLaneEvaluations, features.predicateElements));
-  work.shuffleLaneSteps = static_cast<double>(features.shuffleLaneSteps);
-  work.dotFlops = static_cast<double>(features.dotFlops);
-  return work;
-}
 
 static void recomputeIssueElements(StageWorkload &work) {
   double elements = work.scalarOperations + work.predicateElements;
@@ -348,98 +313,6 @@ static int64_t countAlgorithmLoops(const LogicalStage &stage) {
   return count;
 }
 
-static double consume(double &remaining, double requested) {
-  const double value =
-      std::min(std::max(0.0, remaining), std::max(0.0, requested));
-  remaining -= value;
-  return value;
-}
-
-static StageWorkload consumeExact(StageWorkload &remaining,
-                                  const StageWorkload &requested) {
-  StageWorkload result;
-  result.scalarOperations =
-      consume(remaining.scalarOperations, requested.scalarOperations);
-  result.loadBytes = consume(remaining.loadBytes, requested.loadBytes);
-  result.storeBytes = consume(remaining.storeBytes, requested.storeBytes);
-  result.loadWarpInstructions =
-      consume(remaining.loadWarpInstructions, requested.loadWarpInstructions);
-  result.storeWarpInstructions =
-      consume(remaining.storeWarpInstructions, requested.storeWarpInstructions);
-  result.predicateElements =
-      consume(remaining.predicateElements, requested.predicateElements);
-  result.shuffleLaneSteps =
-      consume(remaining.shuffleLaneSteps, requested.shuffleLaneSteps);
-  result.dotFlops = consume(remaining.dotFlops, requested.dotFlops);
-  result.estimatedSpillTransactions =
-      consume(remaining.estimatedSpillTransactions,
-              requested.estimatedSpillTransactions);
-  for (const auto &[name, elements] : requested.operationElements) {
-    double &available = remaining.operationElements[name];
-    const double owned = consume(available, elements);
-    if (owned > 0.0)
-      result.operationElements[name] = owned;
-  }
-  recomputeIssueElements(result);
-  recomputeIssueElements(remaining);
-  return result;
-}
-
-static StageWorkload takeScalarAndPredicate(StageWorkload &remaining) {
-  StageWorkload result;
-  result.scalarOperations = std::exchange(remaining.scalarOperations, 0.0);
-  result.predicateElements = std::exchange(remaining.predicateElements, 0.0);
-  recomputeIssueElements(result);
-  recomputeIssueElements(remaining);
-  return result;
-}
-
-static StageWorkload takeLoads(StageWorkload &remaining) {
-  StageWorkload result;
-  result.loadBytes = std::exchange(remaining.loadBytes, 0.0);
-  result.loadWarpInstructions =
-      std::exchange(remaining.loadWarpInstructions, 0.0);
-  recomputeIssueElements(result);
-  recomputeIssueElements(remaining);
-  return result;
-}
-
-static StageWorkload takeStores(StageWorkload &remaining) {
-  StageWorkload result;
-  result.storeBytes = std::exchange(remaining.storeBytes, 0.0);
-  result.storeWarpInstructions =
-      std::exchange(remaining.storeWarpInstructions, 0.0);
-  recomputeIssueElements(result);
-  recomputeIssueElements(remaining);
-  return result;
-}
-
-static StageWorkload takeDot(StageWorkload &remaining) {
-  StageWorkload result;
-  result.dotFlops = std::exchange(remaining.dotFlops, 0.0);
-  recomputeIssueElements(result);
-  recomputeIssueElements(remaining);
-  return result;
-}
-
-static void moveOperation(StageWorkload &from, StageWorkload &to,
-                          llvm::StringRef name) {
-  auto iterator = from.operationElements.find(name);
-  if (iterator == from.operationElements.end())
-    return;
-  to.operationElements[name] += iterator->second;
-  from.operationElements.erase(iterator);
-}
-
-static StageWorkload takeAllOperations(StageWorkload &remaining) {
-  StageWorkload result;
-  result.operationElements = std::move(remaining.operationElements);
-  remaining.operationElements.clear();
-  recomputeIssueElements(result);
-  recomputeIssueElements(remaining);
-  return result;
-}
-
 static void mergeWorkload(StageWorkload &into, StageWorkload from) {
   into.scalarOperations += from.scalarOperations;
   into.loadBytes += from.loadBytes;
@@ -473,13 +346,11 @@ static void makePerIteration(LogicalStage &stage) {
   recomputeIssueElements(work);
 }
 
-static LogicalStage makeStage(llvm::StringRef id, llvm::StringRef description,
-                              StageCostModelKind kind,
+static LogicalStage makeStage(llvm::StringRef id, StageCostModelKind kind,
                               StageScheduleKind schedule, int64_t iterations,
                               StageWorkload workload) {
   LogicalStage stage;
   stage.id = id.str();
-  stage.description = description.str();
   stage.costModelKind = kind;
   stage.scheduleKind = schedule;
   stage.iterationCount = std::max<int64_t>(1, iterations);
@@ -505,254 +376,148 @@ static LogicalStage asLocalSIMT(LogicalStage stage) {
 }
 
 static void addPhase(StagePartition &partition, llvm::StringRef id,
-                     llvm::StringRef description, LogicalStage stage) {
+                     LogicalStage stage) {
   LogicalPhase phase;
   phase.id = id.str();
-  phase.description = description.str();
   phase.stages.push_back(std::move(stage));
   partition.phases.push_back(std::move(phase));
 }
 
 static bool operationTreeContainsName(Operation *root, llvm::StringRef name);
 
-static bool hasWork(const StageWorkload &work) {
-  if (work.scalarOperations > 0.0 || work.loadBytes > 0.0 ||
-      work.storeBytes > 0.0 || work.predicateElements > 0.0 ||
-      work.shuffleLaneSteps > 0.0 || work.dotFlops > 0.0 ||
-      work.estimatedSpillTransactions > 0.0)
-    return true;
-  return llvm::any_of(work.operationElements,
-                      [](const auto &entry) { return entry.second > 0.0; });
+static bool hasPhase(const PhaseBoundaryPlan *plan, llvm::StringRef id) {
+  return plan && llvm::is_contained(plan->rootPhaseIds, id);
 }
 
 static void prependAutoBlockifyStages(StagePartition &partition,
-                                      StageWorkload &remaining,
                                       const SimdSimtFeatureSummary &features,
-                                      bool operationGraphHasAutoBlockify) {
-  if (!features.autoBlockifyV1Applied && !operationGraphHasAutoBlockify)
+                                      const PhaseBoundaryPlan *plan) {
+  if (!features.autoBlockifyV1Applied &&
+      !hasPhase(plan, "auto_blockify_dispatch"))
     return;
-  StageWorkload dispatch;
-  dispatch.scalarOperations =
-      consume(remaining.scalarOperations,
-              static_cast<double>(features.autoBlockifyV1ScheduleOpCount));
-  recomputeIssueElements(dispatch);
   LogicalPhase phase;
   phase.id = "auto_blockify_dispatch";
-  phase.description = "AutoBlockify V1 physical/logical program dispatch";
-  phase.stages.push_back(makeStage(
-      "physical_program_dispatch", "Map physical PID to logical block range",
-      StageCostModelKind::AutoBlockifyDispatch, StageScheduleKind::StraightLine,
-      1, std::move(dispatch)));
-  if (features.autoBlockifyV1LoopCount > 0 || operationGraphHasAutoBlockify) {
-    StageWorkload loop;
-    loop.scalarOperations =
-        consume(remaining.scalarOperations,
-                static_cast<double>(features.autoBlockifyV1LoopCount));
-    recomputeIssueElements(loop);
-    phase.stages.push_back(makeStage(
-        "logical_program_loop", "Iterate AutoBlockify V1 logical programs",
-        StageCostModelKind::AutoBlockifyLoop,
-        StageScheduleKind::IndependentPipelined,
-        std::max<int64_t>(1, features.autoBlockifyV1LoopCount),
-        std::move(loop)));
-  }
+  phase.stages.push_back(makeStage("physical_program_dispatch",
+                                   StageCostModelKind::AutoBlockifyDispatch,
+                                   StageScheduleKind::StraightLine, 1, {}));
+  if (features.autoBlockifyV1LoopCount > 0 ||
+      hasPhase(plan, "auto_blockify_dispatch"))
+    phase.stages.push_back(
+        makeStage("logical_program_loop", StageCostModelKind::AutoBlockifyLoop,
+                  StageScheduleKind::IndependentPipelined,
+                  std::max<int64_t>(1, features.autoBlockifyV1LoopCount), {}));
   partition.phases.push_back(std::move(phase));
 }
 
 static StagePartition
 partitionTriangular(const SimdSimtFeatureSummary &features,
                     const TriangularSolveFacts &facts,
-                    const PhaseBoundaryPlan *operationGraphPlan) {
+                    const PhaseBoundaryPlan *plan) {
   StagePartition partition;
   partition.domain = "triangular_recurrence";
-  StageWorkload remaining = buildKernelStageWorkload(features);
-  StageWorkload anchor = buildWorkload(features.simtAnchors);
-  anchor = consumeExact(remaining, anchor);
+  prependAutoBlockifyStages(partition, features, plan);
 
-  const bool graphHasAutoBlockify =
-      operationGraphPlan && llvm::is_contained(operationGraphPlan->rootPhaseIds,
-                                               "auto_blockify_dispatch");
-  prependAutoBlockifyStages(partition, remaining, features,
-                            graphHasAutoBlockify);
+  LogicalStage head = withControl(
+      makeStage("head_index_mask", StageCostModelKind::PredicateMask,
+                StageScheduleKind::StraightLine, 1, {}),
+      features.conditionalBranchCount -
+          features.simtAnchors.conditionalBranchCount,
+      features.divergentBranchCount - features.simtAnchors.divergentBranchCount,
+      features.activeLaneRatio);
+  head.workload.paysKernelSetup = true;
+  addPhase(partition, "head", std::move(head));
 
-  StageWorkload head = takeScalarAndPredicate(remaining);
-  mergeWorkload(head, takeAllOperations(remaining));
-  head.paysKernelSetup = true;
-  addPhase(partition, "head", "Tile offset and triangular mask setup",
-           withControl(makeStage("head_index_mask",
-                                 "Scalar indices and triangular masks",
-                                 StageCostModelKind::PredicateMask,
-                                 StageScheduleKind::StraightLine, 1,
-                                 std::move(head)),
-                       features.conditionalBranchCount -
-                           features.simtAnchors.conditionalBranchCount,
-                       features.divergentBranchCount -
-                           features.simtAnchors.divergentBranchCount,
-                       features.activeLaneRatio));
-
-  StageWorkload loads = takeLoads(remaining);
-  const bool graphHasDiagonalLoad =
-      operationGraphPlan &&
-      llvm::is_contained(operationGraphPlan->rootPhaseIds, "diagonal_load");
-  if (hasWork(loads) || graphHasDiagonalLoad)
-    addPhase(partition, "diagonal_load", "Load diagonal tile data",
-             makeStage("load_diagonal_tiles", "Continuous diagonal tile loads",
+  if (hasPhase(plan, "diagonal_load"))
+    addPhase(partition, "diagonal_load",
+             makeStage("load_diagonal_tiles",
                        StageCostModelKind::ContinuousTileMemory,
-                       StageScheduleKind::IndependentPipelined, 1,
-                       std::move(loads)));
+                       StageScheduleKind::IndependentPipelined, 1, {}));
 
-  const int64_t recurrenceIterations =
-      std::max<int64_t>(1, facts.recurrenceLoopCount);
-  // The feature-summary fallback has no owned operation graph from which to
-  // count sibling loops.  Derive the number of independent 16x16 recurrence
-  // groups from the structural triangular facts.  Production operation-graph
-  // analysis below recomputes the same field directly from owned loops.
+  const int64_t iterations = std::max<int64_t>(1, facts.recurrenceLoopCount);
   LogicalStage recurrence = asLocalSIMT(withControl(
       makeStage("diagonal_inverse_recurrence",
-                "Predicate, short reduction and recurrent state update",
                 StageCostModelKind::LoopCarriedRecurrence,
-                StageScheduleKind::LoopCarriedSerial, recurrenceIterations,
-                std::move(anchor)),
+                StageScheduleKind::LoopCarriedSerial, iterations, {}),
       features.simtAnchors.conditionalBranchCount,
       features.simtAnchors.divergentBranchCount,
       features.simtAnchors.activeLaneRatio));
-  const int64_t iterationsPerGroup =
+  const int64_t rows =
       std::max<int64_t>(1, facts.blockRows - facts.recurrenceStartRow);
-  recurrence.features.parallelRecurrenceGroupCount = std::max<int64_t>(
-      1, (recurrenceIterations + iterationsPerGroup - 1) / iterationsPerGroup);
-  addPhase(partition, "diagonal_inverse",
-           "Loop-carried blockwise triangular recurrence",
-           std::move(recurrence));
+  recurrence.features.parallelRecurrenceGroupCount =
+      std::max<int64_t>(1, (iterations + rows - 1) / rows);
+  addPhase(partition, "diagonal_inverse", std::move(recurrence));
 
-  StageWorkload dot = takeDot(remaining);
-  StageWorkload stores = takeStores(remaining);
-  mergeWorkload(stores, std::move(remaining));
-  bool graphHasDot = false;
-  bool graphHasStore = false;
-  if (operationGraphPlan)
-    for (auto indexedRoot :
-         llvm::enumerate(operationGraphPlan->rootOperations)) {
-      if (operationGraphPlan->rootPhaseIds[indexedRoot.index()] !=
-          "merge_store")
+  if (hasPhase(plan, "merge_store")) {
+    bool hasDot = false;
+    bool hasStore = false;
+    for (auto root : llvm::enumerate(plan->rootOperations)) {
+      if (plan->rootPhaseIds[root.index()] != "merge_store")
         continue;
-      graphHasDot |= operationTreeContainsName(indexedRoot.value(), "tt.dot");
-      graphHasStore |=
-          operationTreeContainsName(indexedRoot.value(), "tt.store");
+      hasDot |= operationTreeContainsName(root.value(), "tt.dot");
+      hasStore |= operationTreeContainsName(root.value(), "tt.store");
     }
-  if (hasWork(dot) || hasWork(stores) || graphHasDot || graphHasStore) {
-    LogicalPhase mergeStore;
-    mergeStore.id = "merge_store";
-    mergeStore.description = "Dense off-diagonal merge and result store";
-    if (hasWork(dot) || graphHasDot)
-      mergeStore.stages.push_back(makeStage(
-          "dense_dot_tail", "Dense dot tail preserved for Cube",
-          StageCostModelKind::CubeRoofline,
-          StageScheduleKind::IndependentPipelined,
-          std::max<int64_t>(1, facts.denseDotTailOps), std::move(dot)));
-    if (hasWork(stores) || graphHasStore)
-      mergeStore.stages.push_back(
-          makeStage("store_inverse_tile", "Continuous result tile store",
-                    StageCostModelKind::ContinuousTileStore,
-                    StageScheduleKind::StraightLine, 1, std::move(stores)));
-    partition.phases.push_back(std::move(mergeStore));
+    LogicalPhase phase;
+    phase.id = "merge_store";
+    if (hasDot)
+      phase.stages.push_back(
+          makeStage("dense_dot_tail", StageCostModelKind::CubeRoofline,
+                    StageScheduleKind::IndependentPipelined,
+                    std::max<int64_t>(1, facts.denseDotTailOps), {}));
+    if (hasStore)
+      phase.stages.push_back(makeStage("store_inverse_tile",
+                                       StageCostModelKind::ContinuousTileStore,
+                                       StageScheduleKind::StraightLine, 1, {}));
+    if (!phase.stages.empty())
+      partition.phases.push_back(std::move(phase));
   }
   return partition;
 }
 
-static StagePartition
-partitionRowwise(const SimdSimtFeatureSummary &features,
-                 const PhaseBoundaryPlan *operationGraphPlan) {
+static StagePartition partitionRowwise(const SimdSimtFeatureSummary &features,
+                                       const PhaseBoundaryPlan *plan) {
   StagePartition partition;
   partition.domain = "loaded_index_rowwise_reduction";
-  StageWorkload remaining = buildKernelStageWorkload(features);
-  const bool graphHasAutoBlockify =
-      operationGraphPlan && llvm::is_contained(operationGraphPlan->rootPhaseIds,
-                                               "auto_blockify_dispatch");
-  prependAutoBlockifyStages(partition, remaining, features,
-                            graphHasAutoBlockify);
-
-  StageWorkload index = takeScalarAndPredicate(remaining);
-  index.paysKernelSetup = true;
-  addPhase(partition, "row_dispatch", "Resolve token and row indices",
-           withControl(
-               makeStage("row_index_generation", "Scalar row index and masks",
-                         StageCostModelKind::IndexGeneration,
-                         StageScheduleKind::StraightLine, 1, std::move(index)),
-               features.conditionalBranchCount, features.divergentBranchCount,
-               features.activeLaneRatio));
-
-  addPhase(partition, "row_load", "Loaded-index-dependent row access",
-           asLocalSIMT(makeStage("indirect_row_gather",
-                                 "Gather the selected row tile",
-                                 StageCostModelKind::IndirectGatherMemory,
-                                 StageScheduleKind::PartiallyDependent, 1,
-                                 takeLoads(remaining))));
-
-  StageWorkload reduction;
-  reduction.shuffleLaneSteps = std::exchange(remaining.shuffleLaneSteps, 0.0);
-  moveOperation(remaining, reduction, "f32.max");
-  recomputeIssueElements(reduction);
-  const int64_t reductionIterations =
+  prependAutoBlockifyStages(partition, features, plan);
+  addPhase(partition, "row_dispatch",
+           makeStage("row_index_generation",
+                     StageCostModelKind::IndexGeneration,
+                     StageScheduleKind::StraightLine, 1, {}));
+  addPhase(partition, "row_load",
+           asLocalSIMT(makeStage(
+               "indirect_row_gather", StageCostModelKind::IndirectGatherMemory,
+               StageScheduleKind::PartiallyDependent, 1, {})));
+  const int64_t iterations =
       std::max<int64_t>(1, features.staticLoopTripCountMax);
-  addPhase(partition, "row_reduction", "Reduce each selected row",
-           makeStage("rowwise_reduction", "Row-local reduction tree",
-                     StageCostModelKind::RowwiseReduction,
-                     StageScheduleKind::PartiallyDependent, reductionIterations,
-                     std::move(reduction)));
-
-  StageWorkload convert = takeStores(remaining);
-  mergeWorkload(convert, takeAllOperations(remaining));
-  mergeWorkload(convert, std::move(remaining));
-  addPhase(partition, "convert_store", "Scale, convert, pack and store",
-           makeStage("conversion_pack_store", "Conversion and packed output",
+  addPhase(partition, "row_reduction",
+           makeStage("rowwise_reduction", StageCostModelKind::RowwiseReduction,
+                     StageScheduleKind::PartiallyDependent, iterations, {}));
+  addPhase(partition, "convert_store",
+           makeStage("conversion_pack_store",
                      StageCostModelKind::ConversionPack,
-                     StageScheduleKind::IndependentPipelined,
-                     reductionIterations, std::move(convert)));
+                     StageScheduleKind::IndependentPipelined, iterations, {}));
   return partition;
 }
 
 static StagePartition
 partitionIndirectDot(const SimdSimtFeatureSummary &features,
-                     const PhaseBoundaryPlan *operationGraphPlan) {
+                     const PhaseBoundaryPlan *plan) {
   StagePartition partition;
   partition.domain = "indirect_underfilled_dot";
-  StageWorkload remaining = buildKernelStageWorkload(features);
-  const bool graphHasAutoBlockify =
-      operationGraphPlan && llvm::is_contained(operationGraphPlan->rootPhaseIds,
-                                               "auto_blockify_dispatch");
-  prependAutoBlockifyStages(partition, remaining, features,
-                            graphHasAutoBlockify);
-
-  StageWorkload index = takeScalarAndPredicate(remaining);
-  mergeWorkload(index, takeAllOperations(remaining));
-  index.paysKernelSetup = true;
-  addPhase(partition, "index_setup", "Generate gather indices and masks",
-           withControl(
-               makeStage("index_generation", "Index and predicate generation",
-                         StageCostModelKind::IndexGeneration,
-                         StageScheduleKind::StraightLine, 1, std::move(index)),
-               features.conditionalBranchCount, features.divergentBranchCount,
-               features.activeLaneRatio));
-
-  addPhase(partition, "gather_tiles", "Gather dot input tiles",
-           asLocalSIMT(makeStage("indirect_tile_gather",
-                                 "Loaded-index-dependent operand gathers",
-                                 StageCostModelKind::IndirectGatherMemory,
-                                 StageScheduleKind::PartiallyDependent, 1,
-                                 takeLoads(remaining))));
-
-  addPhase(partition, "dot", "Under-filled matrix product",
-           makeStage("tiny_cube_dot", "Small dot with Cube underfill",
-                     StageCostModelKind::TinyCubeRoofline,
-                     StageScheduleKind::IndependentPipelined, 1,
-                     takeDot(remaining)));
-
-  StageWorkload store = takeStores(remaining);
-  mergeWorkload(store, std::move(remaining));
-  addPhase(partition, "output_store", "Write dot result",
-           makeStage("store_dot_result", "Continuous result store",
+  prependAutoBlockifyStages(partition, features, plan);
+  addPhase(partition, "index_setup",
+           makeStage("index_generation", StageCostModelKind::IndexGeneration,
+                     StageScheduleKind::StraightLine, 1, {}));
+  addPhase(partition, "gather_tiles",
+           asLocalSIMT(makeStage(
+               "indirect_tile_gather", StageCostModelKind::IndirectGatherMemory,
+               StageScheduleKind::PartiallyDependent, 1, {})));
+  addPhase(partition, "dot",
+           makeStage("tiny_cube_dot", StageCostModelKind::TinyCubeRoofline,
+                     StageScheduleKind::IndependentPipelined, 1, {}));
+  addPhase(partition, "output_store",
+           makeStage("store_dot_result",
                      StageCostModelKind::ContinuousTileStore,
-                     StageScheduleKind::StraightLine, 1, std::move(store)));
+                     StageScheduleKind::StraightLine, 1, {}));
   return partition;
 }
 
@@ -770,38 +535,6 @@ static bool anchorMatchesStage(const SimtAnchorDescriptor &anchor,
 }
 
 static Operation *getTopLevelSemanticRoot(Operation *operation);
-
-static void attachAnchorOperationOwnership(StagePartition &partition,
-                                           const SimtAnchorPlan &anchorPlan) {
-  for (LogicalPhase &phase : partition.phases) {
-    for (LogicalStage &stage : phase.stages) {
-      if (!stage.localSimtMaterializable)
-        continue;
-      for (auto indexedAnchor : llvm::enumerate(anchorPlan.anchors)) {
-        const SimtAnchorDescriptor &anchor = indexedAnchor.value();
-        if (!anchorMatchesStage(anchor, stage))
-          continue;
-        stage.simtAnchorIndices.push_back(
-            static_cast<unsigned>(indexedAnchor.index()));
-        if (anchor.scopeOperations.empty()) {
-          if (anchor.operation &&
-              !llvm::is_contained(stage.operations, anchor.operation))
-            stage.operations.push_back(anchor.operation);
-          continue;
-        }
-        for (Operation *operation : anchor.scopeOperations)
-          if (operation && !llvm::is_contained(stage.operations, operation))
-            stage.operations.push_back(operation);
-      }
-      // A production mixed Stage must be backed by the exact operations that
-      // the materializer will consume.  Synthetic feature-only tests use the
-      // overload without an anchor plan and retain fallback behavior.
-      stage.localSimtMaterializable = !stage.operations.empty();
-      if (!stage.localSimtMaterializable)
-        stage.localSimtFactors.clear();
-    }
-  }
-}
 
 static bool stageOwnsAnchor(const LogicalStage &stage,
                             const SimtAnchorDescriptor &anchor) {
@@ -915,12 +648,6 @@ static bool operationTreeContainsLoadedIndexMemory(Operation *root) {
 /// monotone: after a boundary is crossed, a later root cannot move back to an
 /// earlier Phase.  Cost and candidate mode are intentionally absent here.
 static llvm::Error assignRootPhaseIds(PhaseBoundaryPlan &plan) {
-  enum class TriangularPhase { Head, Load, Recurrence, MergeStore };
-  enum class RowwisePhase { Index, Gather, Reduction, ConvertStore };
-  enum class IndirectDotPhase { Index, Gather, Dot, OutputStore };
-  TriangularPhase triangular = TriangularPhase::Head;
-  RowwisePhase rowwise = RowwisePhase::Index;
-  IndirectDotPhase indirectDot = IndirectDotPhase::Index;
   llvm::DenseSet<Operation *> anchorRoots(plan.localSimtAnchorRoots.begin(),
                                           plan.localSimtAnchorRoots.end());
   std::optional<size_t> firstAnchorIndex;
@@ -949,6 +676,7 @@ static llvm::Error assignRootPhaseIds(PhaseBoundaryPlan &plan) {
 
   plan.rootPhaseIds.clear();
   plan.rootPhaseIds.reserve(plan.rootOperations.size());
+  llvm::StringRef current;
   for (auto indexedRoot : llvm::enumerate(plan.rootOperations)) {
     Operation *root = indexedRoot.value();
     if (!root)
@@ -965,79 +693,43 @@ static llvm::Error assignRootPhaseIds(PhaseBoundaryPlan &plan) {
     case PhaseBoundaryDomain::TriangularRecurrence:
       if (firstAnchorIndex && indexedRoot.index() >= *firstAnchorIndex &&
           indexedRoot.index() <= *lastAnchorIndex)
-        triangular = TriangularPhase::Recurrence;
+        current = "diagonal_inverse";
       else if (lastAnchorIndex && indexedRoot.index() > *lastAnchorIndex)
-        triangular = TriangularPhase::MergeStore;
+        current = "merge_store";
       else if (operationTreeContainsName(root, "tt.dot") ||
                operationTreeContainsName(root, "tt.store"))
-        triangular = TriangularPhase::MergeStore;
-      else if (triangular == TriangularPhase::Head &&
+        current = "merge_store";
+      else if ((current.empty() || current == "head") &&
                operationTreeContainsName(root, "tt.load"))
-        triangular = TriangularPhase::Load;
-      switch (triangular) {
-      case TriangularPhase::Head:
-        plan.rootPhaseIds.push_back("head");
-        break;
-      case TriangularPhase::Load:
-        plan.rootPhaseIds.push_back("diagonal_load");
-        break;
-      case TriangularPhase::Recurrence:
-        plan.rootPhaseIds.push_back("diagonal_inverse");
-        break;
-      case TriangularPhase::MergeStore:
-        plan.rootPhaseIds.push_back("merge_store");
-        break;
-      }
+        current = "diagonal_load";
+      else if (current.empty())
+        current = "head";
       break;
     case PhaseBoundaryDomain::LoadedIndexRowwiseReduction:
       if (operationTreeContainsName(root, "tt.reduce"))
-        rowwise = RowwisePhase::Reduction;
-      else if (rowwise == RowwisePhase::Reduction ||
+        current = "row_reduction";
+      else if (current == "row_reduction" ||
                operationTreeContainsName(root, "tt.store"))
-        rowwise = RowwisePhase::ConvertStore;
-      else if (rowwise == RowwisePhase::Index &&
+        current = "convert_store";
+      else if ((current.empty() || current == "row_dispatch") &&
                operationTreeContainsLoadedIndexMemory(root))
-        rowwise = RowwisePhase::Gather;
-      switch (rowwise) {
-      case RowwisePhase::Index:
-        plan.rootPhaseIds.push_back("row_dispatch");
-        break;
-      case RowwisePhase::Gather:
-        plan.rootPhaseIds.push_back("row_load");
-        break;
-      case RowwisePhase::Reduction:
-        plan.rootPhaseIds.push_back("row_reduction");
-        break;
-      case RowwisePhase::ConvertStore:
-        plan.rootPhaseIds.push_back("convert_store");
-        break;
-      }
+        current = "row_load";
+      else if (current.empty())
+        current = "row_dispatch";
       break;
     case PhaseBoundaryDomain::IndirectUnderfilledDot:
       if (operationTreeContainsName(root, "tt.dot"))
-        indirectDot = IndirectDotPhase::Dot;
-      else if (indirectDot == IndirectDotPhase::Dot ||
-               operationTreeContainsName(root, "tt.store"))
-        indirectDot = IndirectDotPhase::OutputStore;
-      else if (indirectDot == IndirectDotPhase::Index &&
+        current = "dot";
+      else if (current == "dot" || operationTreeContainsName(root, "tt.store"))
+        current = "output_store";
+      else if ((current.empty() || current == "index_setup") &&
                operationTreeContainsLoadedIndexMemory(root))
-        indirectDot = IndirectDotPhase::Gather;
-      switch (indirectDot) {
-      case IndirectDotPhase::Index:
-        plan.rootPhaseIds.push_back("index_setup");
-        break;
-      case IndirectDotPhase::Gather:
-        plan.rootPhaseIds.push_back("gather_tiles");
-        break;
-      case IndirectDotPhase::Dot:
-        plan.rootPhaseIds.push_back("dot");
-        break;
-      case IndirectDotPhase::OutputStore:
-        plan.rootPhaseIds.push_back("output_store");
-        break;
-      }
+        current = "gather_tiles";
+      else if (current.empty())
+        current = "index_setup";
       break;
     }
+    plan.rootPhaseIds.push_back(current.str());
   }
   if (plan.rootPhaseIds.size() != plan.rootOperations.size())
     return llvm::createStringError(
@@ -1066,6 +758,29 @@ static LogicalStage *findStage(StagePartition &partition, llvm::StringRef id) {
       if (stage.id == id)
         return &stage;
   return nullptr;
+}
+
+static llvm::StringRef stageIdForPhase(PhaseBoundaryDomain domain,
+                                       llvm::StringRef phaseId) {
+  if (domain == PhaseBoundaryDomain::TriangularRecurrence)
+    return llvm::StringSwitch<llvm::StringRef>(phaseId)
+        .Case("head", "head_index_mask")
+        .Case("diagonal_load", "load_diagonal_tiles")
+        .Case("diagonal_inverse", "diagonal_inverse_recurrence")
+        .Default({});
+  if (domain == PhaseBoundaryDomain::LoadedIndexRowwiseReduction)
+    return llvm::StringSwitch<llvm::StringRef>(phaseId)
+        .Case("row_dispatch", "row_index_generation")
+        .Case("row_load", "indirect_row_gather")
+        .Case("row_reduction", "rowwise_reduction")
+        .Case("convert_store", "conversion_pack_store")
+        .Default({});
+  return llvm::StringSwitch<llvm::StringRef>(phaseId)
+      .Case("index_setup", "index_generation")
+      .Case("gather_tiles", "indirect_tile_gather")
+      .Case("dot", "tiny_cube_dot")
+      .Case("output_store", "store_dot_result")
+      .Default({});
 }
 
 static int64_t getStageOrdinal(const StagePartition &partition,
@@ -1125,44 +840,14 @@ attachCompleteOperationOwnership(StagePartition &partition,
                                : "physical_program_dispatch");
     }
 
-    if (!target) {
-      switch (plan.domain) {
-      case PhaseBoundaryDomain::TriangularRecurrence:
-        if (phaseId == "head")
-          target = findStage(partition, "head_index_mask");
-        else if (phaseId == "diagonal_load")
-          target = findStage(partition, "load_diagonal_tiles");
-        else if (phaseId == "diagonal_inverse")
-          target = findStage(partition, "diagonal_inverse_recurrence");
-        else if (phaseId == "merge_store") {
-          if (operationTreeContainsName(root, "tt.store"))
-            mergeStoreReached = true;
-          target = findStage(partition, mergeStoreReached ? "store_inverse_tile"
-                                                          : "dense_dot_tail");
-        }
-        break;
-      case PhaseBoundaryDomain::LoadedIndexRowwiseReduction:
-        if (phaseId == "row_dispatch")
-          target = findStage(partition, "row_index_generation");
-        else if (phaseId == "row_load")
-          target = findStage(partition, "indirect_row_gather");
-        else if (phaseId == "row_reduction")
-          target = findStage(partition, "rowwise_reduction");
-        else if (phaseId == "convert_store")
-          target = findStage(partition, "conversion_pack_store");
-        break;
-      case PhaseBoundaryDomain::IndirectUnderfilledDot:
-        if (phaseId == "index_setup")
-          target = findStage(partition, "index_generation");
-        else if (phaseId == "gather_tiles")
-          target = findStage(partition, "indirect_tile_gather");
-        else if (phaseId == "dot")
-          target = findStage(partition, "tiny_cube_dot");
-        else if (phaseId == "output_store")
-          target = findStage(partition, "store_dot_result");
-        break;
-      }
+    if (!target && plan.domain == PhaseBoundaryDomain::TriangularRecurrence &&
+        phaseId == "merge_store") {
+      mergeStoreReached |= operationTreeContainsName(root, "tt.store");
+      target = findStage(partition, mergeStoreReached ? "store_inverse_tile"
+                                                      : "dense_dot_tail");
     }
+    if (!target)
+      target = findStage(partition, stageIdForPhase(plan.domain, phaseId));
     const int64_t ordinal = getStageOrdinal(partition, target);
     if (ordinal < 0)
       return llvm::createStringError(
@@ -1183,7 +868,6 @@ attachCompleteOperationOwnership(StagePartition &partition,
     return llvm::createStringError(
         std::errc::invalid_argument,
         "StageBoundaryAnalysis did not conserve TTIR operation ownership");
-  partition.boundarySource = "operation_graph";
   partition.operationOwnershipComplete = true;
   partition.modeledOperationCount =
       static_cast<int64_t>(plan.rootOperations.size());
@@ -1284,25 +968,17 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
       stage.localSimtScopeCount = 0;
       stage.scopeInputTensorBytes = 0;
       stage.scopeOutputTensorBytes = 0;
-      llvm::DenseSet<Operation *> coveredByRange;
-
-      for (unsigned anchorIndex : stage.simtAnchorIndices) {
-        if (anchorIndex >= anchorPlan.anchors.size())
-          continue;
-        const SimtAnchorDescriptor &anchor = anchorPlan.anchors[anchorIndex];
-        if (!anchor.materializable || !anchor.operation ||
-            coveredByRange.contains(anchor.operation))
-          continue;
-
+      auto merged = mergeSimtStageAnchors(anchorPlan, stage.simtAnchorIndices);
+      if (!merged)
+        continue;
+      {
+        const SimtAnchorDescriptor &anchor = *merged;
         llvm::SmallVector<Operation *> roots;
         const bool isRange = anchor.scopeOperations.size() > 1;
-        if (isRange) {
+        if (isRange)
           llvm::append_range(roots, anchor.scopeOperations);
-          for (Operation *operation : roots)
-            coveredByRange.insert(operation);
-        } else {
+        else
           roots.push_back(anchor.operation);
-        }
 
         llvm::DenseSet<Operation *> inside;
         for (Operation *root : roots) {
@@ -1333,6 +1009,21 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
           }
         }
 
+        // TritonToUnstructure cannot reconstruct offset information for a
+        // tensor-of-pointer returned by scope.scope.  Capturing pointers is
+        // legal (the scope is not isolated from above), but returning pointer
+        // state would make this local Mixed implementation fail after route
+        // selection.  Reject that implementation before it is scored; the
+        // same Stage remains legal in a whole-kernel pure-SIMT route.
+        if (llvm::any_of(returned, [](Value value) {
+              return isPointerLikeType(value.getType());
+            })) {
+          stage.localSimtMaterializable = false;
+          stage.localSimtFactors.clear();
+          stage.simtAnchorIndices.clear();
+          continue;
+        }
+
         ++stage.localSimtScopeCount;
         stage.scopeInputTensorBytes +=
             staticTensorBytes(captured.getArrayRef());
@@ -1343,61 +1034,7 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
   }
 }
 
-static double totalOperationElements(const StageWorkload &work) {
-  double result = 0.0;
-  for (const auto &entry : work.operationElements)
-    result += entry.second;
-  return result;
-}
-
-static StageWorkload accumulatePartition(const StagePartition &partition) {
-  StageWorkload total;
-  for (const LogicalPhase &phase : partition.phases) {
-    for (const LogicalStage &stage : phase.stages) {
-      StageWorkload work = stage.workload;
-      const double count =
-          static_cast<double>(std::max<int64_t>(1, stage.iterationCount));
-      work.scalarOperations *= count;
-      work.loadBytes *= count;
-      work.storeBytes *= count;
-      work.loadWarpInstructions *= count;
-      work.storeWarpInstructions *= count;
-      work.predicateElements *= count;
-      work.shuffleLaneSteps *= count;
-      work.dotFlops *= count;
-      work.estimatedSpillTransactions *= count;
-      for (auto &entry : work.operationElements)
-        entry.second *= count;
-      mergeWorkload(total, std::move(work));
-    }
-  }
-  return total;
-}
-
-static bool near(double lhs, double rhs) {
-  return std::abs(lhs - rhs) <= 1.0e-6 * std::max({1.0, lhs, rhs});
-}
-
 } // namespace
-
-StageWorkload
-mlir::ascend::buildKernelStageWorkload(const SimdSimtFeatureSummary &features) {
-  SimtAnchorFeatureSummary kernel;
-  kernel.opElements = features.opElements;
-  kernel.weightedOps = features.weightedOps;
-  kernel.loadBytes = features.loadBytes;
-  kernel.storeBytes = features.storeBytes;
-  kernel.loadWarpInstructions = features.loadWarpInstructions;
-  kernel.storeWarpInstructions = features.storeWarpInstructions;
-  kernel.predicateElements = features.predicateElements;
-  kernel.predicateLaneEvaluations = features.predicateLaneEvaluations;
-  kernel.shuffleLaneSteps = features.shuffleLaneSteps;
-  kernel.dotFlops = features.dotFlops;
-  StageWorkload work = buildWorkload(kernel);
-  work.scalarOperations = static_cast<double>(features.scalarOps);
-  recomputeIssueElements(work);
-  return work;
-}
 
 llvm::Expected<ProgramStructure>
 ProgramStructureAnalysis::analyze(ModuleOp module,
@@ -1474,22 +1111,22 @@ ProgramStructureAnalysis::analyze(ModuleOp module,
   return structure;
 }
 
-llvm::Expected<std::optional<PhaseBoundaryPlan>>
-PhaseBoundaryAnalysis::analyze(const SimdSimtFeatureSummary &features,
-                               const StagePartitionerOptions &options) const {
+static std::optional<PhaseBoundaryPlan>
+identifyPhaseBoundary(const SimdSimtFeatureSummary &features,
+                      const StagePartitionerOptions &options) {
   if (features.simtAnchors.triangularSolves.size() == 1 &&
       features.simtAnchors.count > 0) {
     PhaseBoundaryPlan plan{PhaseBoundaryDomain::TriangularRecurrence,
                            "triangular_recurrence",
                            features.simtAnchors.triangularSolves.front()};
-    return std::optional<PhaseBoundaryPlan>{std::move(plan)};
+    return plan;
   }
   if (features.dotOps == 0 && features.reduceOps > 0 &&
       features.loadedIndexDependentMemoryOps > 0 && features.loadOps > 0 &&
       features.storeOps > 0) {
     PhaseBoundaryPlan plan{PhaseBoundaryDomain::LoadedIndexRowwiseReduction,
                            "loaded_index_rowwise_reduction", std::nullopt};
-    return std::optional<PhaseBoundaryPlan>{std::move(plan)};
+    return plan;
   }
   if (features.dotOps > 0 && features.reduceOps == 0 &&
       features.loadedIndexDependentMemoryOps > 0 &&
@@ -1497,7 +1134,7 @@ PhaseBoundaryAnalysis::analyze(const SimdSimtFeatureSummary &features,
       features.storeOps > 0) {
     PhaseBoundaryPlan plan{PhaseBoundaryDomain::IndirectUnderfilledDot,
                            "indirect_underfilled_dot", std::nullopt};
-    return std::optional<PhaseBoundaryPlan>{std::move(plan)};
+    return plan;
   }
   return std::optional<PhaseBoundaryPlan>{};
 }
@@ -1507,25 +1144,27 @@ PhaseBoundaryAnalysis::analyze(ModuleOp module,
                                const SimtAnchorPlan &anchorPlan,
                                const SimdSimtFeatureSummary &features,
                                const StagePartitionerOptions &options) const {
-  auto plan = analyze(features, options);
+  auto plan = identifyPhaseBoundary(features, options);
   if (!plan)
-    return plan.takeError();
-  if (!*plan)
-    return plan;
+    return std::optional<PhaseBoundaryPlan>{};
   auto structure = ProgramStructureAnalysis().analyze(module, anchorPlan);
   if (!structure)
     return structure.takeError();
-  (*plan)->rootOperations = std::move(structure->rootOperations);
-  (*plan)->localSimtAnchorRoots = std::move(structure->localSimtAnchorRoots);
-  if (llvm::Error error = assignRootPhaseIds(**plan))
+  plan->rootOperations = std::move(structure->rootOperations);
+  plan->localSimtAnchorRoots = std::move(structure->localSimtAnchorRoots);
+  if (llvm::Error error = assignRootPhaseIds(*plan))
     return std::move(error);
-  return plan;
+  return std::optional<PhaseBoundaryPlan>{std::move(*plan)};
 }
 
 llvm::Expected<StagePartition>
 StageBoundaryAnalysis::analyze(const PhaseBoundaryPlan &phasePlan,
                                const SimdSimtFeatureSummary &features,
                                const SimtAnchorPlan *anchorPlan) const {
+  if (!phasePlan.hasOperationGraph() || !anchorPlan)
+    return llvm::createStringError(
+        std::errc::invalid_argument,
+        "StageBoundaryAnalysis requires PreparedTTIR ownership");
   StagePartition partition;
   switch (phasePlan.domain) {
   case PhaseBoundaryDomain::TriangularRecurrence:
@@ -1533,32 +1172,23 @@ StageBoundaryAnalysis::analyze(const PhaseBoundaryPlan &phasePlan,
       return llvm::createStringError(
           std::errc::invalid_argument,
           "triangular PhaseBoundaryPlan has no recurrence facts");
-    partition = partitionTriangular(features, *phasePlan.triangularSolve,
-                                    phasePlan.hasOperationGraph() ? &phasePlan
-                                                                  : nullptr);
+    partition =
+        partitionTriangular(features, *phasePlan.triangularSolve, &phasePlan);
     break;
   case PhaseBoundaryDomain::LoadedIndexRowwiseReduction:
-    partition = partitionRowwise(
-        features, phasePlan.hasOperationGraph() ? &phasePlan : nullptr);
+    partition = partitionRowwise(features, &phasePlan);
     break;
   case PhaseBoundaryDomain::IndirectUnderfilledDot:
-    partition = partitionIndirectDot(
-        features, phasePlan.hasOperationGraph() ? &phasePlan : nullptr);
+    partition = partitionIndirectDot(features, &phasePlan);
     break;
   }
   partition.domain = phasePlan.domainName;
-  if (phasePlan.hasOperationGraph()) {
-    if (llvm::Error error =
-            attachCompleteOperationOwnership(partition, phasePlan))
-      return std::move(error);
-    if (anchorPlan)
-      attachExactAnchorOwnership(partition, *anchorPlan);
-    deriveStageLiveValues(partition);
-    if (anchorPlan)
-      deriveLocalSimtScopeTraffic(partition, *anchorPlan);
-  } else if (anchorPlan) {
-    attachAnchorOperationOwnership(partition, *anchorPlan);
-  }
+  if (llvm::Error error =
+          attachCompleteOperationOwnership(partition, phasePlan))
+    return std::move(error);
+  attachExactAnchorOwnership(partition, *anchorPlan);
+  deriveStageLiveValues(partition);
+  deriveLocalSimtScopeTraffic(partition, *anchorPlan);
   return partition;
 }
 
@@ -1566,125 +1196,78 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
   for (LogicalPhase &phase : partition.phases) {
     for (LogicalStage &stage : phase.stages) {
       StageModelFeatures &facts = stage.features;
-      if (partition.operationOwnershipComplete) {
-        const double activeLaneRatio = facts.activeLaneRatio;
-        facts = StageModelFeatures{};
-        facts.activeLaneRatio = activeLaneRatio;
-        llvm::DenseSet<Operation *> owned;
-        for (Operation *root : stage.operations)
-          collectOwnedOperationTree(root, owned);
-        bool hasMemory = false;
-        int64_t algorithmLoopCount = 0;
-        for (Operation *operation : owned) {
-          const llvm::StringRef name = operation->getName().getStringRef();
-          if (name == "scf.for" || name == "scf.while") {
-            facts.hasLoop = true;
-            ++facts.loopBackedgeCount;
-            if (!operation->hasAttr("ta.auto_blockify_v1.loop"))
-              ++algorithmLoopCount;
-            if (!operation->hasAttr("ta.auto_blockify_v1.loop") &&
-                operation->getNumRegions() > 0 &&
-                !operation->getRegion(0).empty()) {
-              Block &body = operation->getRegion(0).front();
-              const unsigned firstCarriedArgument = name == "scf.for" ? 1 : 0;
-              for (unsigned argumentIndex = firstCarriedArgument;
-                   argumentIndex < body.getNumArguments(); ++argumentIndex) {
-                BlockArgument argument = body.getArgument(argumentIndex);
-                if (argument.use_empty())
-                  continue;
-                if (isPointerLikeType(argument.getType()) ||
-                    isAddressOnlyLoopValue(argument))
-                  facts.hasPointerInduction = true;
-                else
-                  facts.hasLoopCarriedDataDependency = true;
-              }
-              // The scf.for induction variable itself commonly feeds pointer
-              // arithmetic.  Record that work without treating it as a data
-              // recurrence.
-              if (name == "scf.for" && body.getNumArguments() > 0 &&
-                  isAddressOnlyLoopValue(body.getArgument(0)))
+      const double activeLaneRatio = facts.activeLaneRatio;
+      facts = StageModelFeatures{};
+      facts.activeLaneRatio = activeLaneRatio;
+      llvm::DenseSet<Operation *> owned;
+      for (Operation *root : stage.operations)
+        collectOwnedOperationTree(root, owned);
+      bool hasMemory = false;
+      int64_t algorithmLoopCount = 0;
+      for (Operation *operation : owned) {
+        const llvm::StringRef name = operation->getName().getStringRef();
+        if (name == "scf.for" || name == "scf.while") {
+          facts.hasLoop = true;
+          ++facts.loopBackedgeCount;
+          if (!operation->hasAttr("ta.auto_blockify_v1.loop"))
+            ++algorithmLoopCount;
+          if (!operation->hasAttr("ta.auto_blockify_v1.loop") &&
+              operation->getNumRegions() > 0 &&
+              !operation->getRegion(0).empty()) {
+            Block &body = operation->getRegion(0).front();
+            const unsigned firstCarriedArgument = name == "scf.for" ? 1 : 0;
+            for (unsigned argumentIndex = firstCarriedArgument;
+                 argumentIndex < body.getNumArguments(); ++argumentIndex) {
+              BlockArgument argument = body.getArgument(argumentIndex);
+              if (argument.use_empty())
+                continue;
+              if (isPointerLikeType(argument.getType()) ||
+                  isAddressOnlyLoopValue(argument))
                 facts.hasPointerInduction = true;
+              else
+                facts.hasLoopCarriedDataDependency = true;
             }
+            if (name == "scf.for" && body.getNumArguments() > 0 &&
+                isAddressOnlyLoopValue(body.getArgument(0)))
+              facts.hasPointerInduction = true;
           }
-          if (name == "scf.if" || name == "cf.cond_br") {
-            ++facts.conditionalBranchCount;
-            ++facts.divergentBranchCount;
-          }
-          if (name.contains("barrier") || name.contains("sync"))
-            ++facts.synchronizationCount;
-          if (name == "tt.load" || name == "tt.store" || name == "tt.gather" ||
-              name.starts_with("tt.atomic")) {
-            hasMemory = true;
-            facts.hasIndirectMemory |=
-                isLoadedIndexDependentMemoryOp(operation) ||
-                name == "tt.gather" || name.starts_with("tt.atomic");
-          }
-          facts.hasReduction |= name == "tt.reduce" || name == "tt.scan" ||
-                                name == "linalg.reduce";
-          facts.hasDot |= name == "tt.dot" || name.contains("matmul") ||
-                          name.contains("mmad");
-          facts.hasConversionPack |=
-              name == "arith.extf" || name == "arith.truncf" ||
-              name == "arith.fptosi" || name == "arith.fptoui" ||
-              name == "arith.sitofp" || name == "arith.uitofp" ||
-              name == "tt.fp_to_fp" || name.contains("convert") ||
-              name.contains("pack") || name.contains("unpack");
         }
-        facts.hasContiguousMemory = hasMemory && !facts.hasIndirectMemory;
-        // Counts consumed by StageCostEvaluator are per logical iteration.
-        // Multiple sibling recurrence loops are flattened into one Stage
-        // iteration space, so identical control events must be normalized by
-        // the number of sibling loops rather than charged once per loop on
-        // every flattened iteration.
-        if (algorithmLoopCount > 0 && stage.iterationCount > 1) {
-          if (facts.hasLoopCarriedDataDependency)
-            facts.parallelRecurrenceGroupCount = algorithmLoopCount;
-          facts.loopBackedgeCount = 1;
-          facts.conditionalBranchCount = std::max<int64_t>(
-              facts.conditionalBranchCount > 0 ? 1 : 0,
-              facts.conditionalBranchCount / algorithmLoopCount);
-          facts.divergentBranchCount = std::max<int64_t>(
-              facts.divergentBranchCount > 0 ? 1 : 0,
-              facts.divergentBranchCount / algorithmLoopCount);
+        if (name == "scf.if" || name == "cf.cond_br") {
+          ++facts.conditionalBranchCount;
+          ++facts.divergentBranchCount;
         }
-        facts.source =
-            "exact post-layout/post-AutoBlockify-V1 TTIR operation graph";
-        if (!facts.isValid())
-          return llvm::createStringError(std::errc::invalid_argument,
-                                         "Stage '%s' has invalid features",
-                                         stage.id.c_str());
-        continue;
+        if (name.contains("barrier") || name.contains("sync"))
+          ++facts.synchronizationCount;
+        if (name == "tt.load" || name == "tt.store" || name == "tt.gather" ||
+            name.starts_with("tt.atomic")) {
+          hasMemory = true;
+          facts.hasIndirectMemory |=
+              isLoadedIndexDependentMemoryOp(operation) ||
+              name == "tt.gather" || name.starts_with("tt.atomic");
+        }
+        facts.hasReduction |=
+            name == "tt.reduce" || name == "tt.scan" || name == "linalg.reduce";
+        facts.hasDot |= name == "tt.dot" || name.contains("matmul") ||
+                        name.contains("mmad");
+        facts.hasConversionPack |=
+            name == "arith.extf" || name == "arith.truncf" ||
+            name == "arith.fptosi" || name == "arith.fptoui" ||
+            name == "arith.sitofp" || name == "arith.uitofp" ||
+            name == "tt.fp_to_fp" || name.contains("convert") ||
+            name.contains("pack") || name.contains("unpack");
       }
-      facts.hasLoop =
-          stage.iterationCount > 1 ||
-          stage.costModelKind == StageCostModelKind::AutoBlockifyLoop ||
-          stage.costModelKind == StageCostModelKind::IndependentPipelinedLoop ||
-          stage.costModelKind == StageCostModelKind::LoopCarriedRecurrence;
-      facts.loopBackedgeCount = facts.hasLoop ? 1 : 0;
-      facts.hasLoopCarriedDataDependency =
-          stage.costModelKind == StageCostModelKind::LoopCarriedRecurrence;
-      facts.hasPointerInduction =
-          facts.hasLoop && !facts.hasLoopCarriedDataDependency;
-      facts.hasContiguousMemory =
-          llvm::is_contained({StageCostModelKind::ContinuousTileMemory,
-                              StageCostModelKind::ContinuousTileStore,
-                              StageCostModelKind::ContinuousShortLoad,
-                              StageCostModelKind::CachePolicyStore},
-                             stage.costModelKind);
-      facts.hasIndirectMemory =
-          llvm::is_contained({StageCostModelKind::IndirectScalarMemory,
-                              StageCostModelKind::IndirectGatherMemory},
-                             stage.costModelKind);
-      facts.hasReduction =
-          llvm::is_contained({StageCostModelKind::LoopCarriedRecurrence,
-                              StageCostModelKind::RowwiseReduction},
-                             stage.costModelKind);
-      facts.hasDot = llvm::is_contained({StageCostModelKind::CubeRoofline,
-                                         StageCostModelKind::TinyCubeRoofline},
-                                        stage.costModelKind);
-      facts.hasConversionPack =
-          stage.costModelKind == StageCostModelKind::ConversionPack;
-      facts.source = "feature-summary fallback structural facts";
+      facts.hasContiguousMemory = hasMemory && !facts.hasIndirectMemory;
+      if (algorithmLoopCount > 0 && stage.iterationCount > 1) {
+        if (facts.hasLoopCarriedDataDependency)
+          facts.parallelRecurrenceGroupCount = algorithmLoopCount;
+        facts.loopBackedgeCount = 1;
+        facts.conditionalBranchCount = std::max<int64_t>(
+            facts.conditionalBranchCount > 0 ? 1 : 0,
+            facts.conditionalBranchCount / algorithmLoopCount);
+        facts.divergentBranchCount =
+            std::max<int64_t>(facts.divergentBranchCount > 0 ? 1 : 0,
+                              facts.divergentBranchCount / algorithmLoopCount);
+      }
       if (!facts.isValid())
         return llvm::createStringError(std::errc::invalid_argument,
                                        "Stage '%s' has invalid features",
@@ -1698,67 +1281,43 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
                                          int64_t tinyDotFlopsMax) const {
   if (!partition.operationOwnershipComplete)
     return llvm::Error::success();
+  auto compatible = [](StageCostModelKind kind,
+                       const StageModelFeatures &facts) {
+    switch (kind) {
+    case StageCostModelKind::LoopCarriedRecurrence:
+      return facts.hasLoopCarriedDataDependency;
+    case StageCostModelKind::IndependentPipelinedLoop:
+      return facts.hasLoop && !facts.hasLoopCarriedDataDependency;
+    case StageCostModelKind::RowwiseReduction:
+      return facts.hasReduction;
+    case StageCostModelKind::CubeRoofline:
+    case StageCostModelKind::TinyCubeRoofline:
+      return facts.hasDot;
+    case StageCostModelKind::IndirectScalarMemory:
+    case StageCostModelKind::IndirectGatherMemory:
+      return facts.hasIndirectMemory;
+    case StageCostModelKind::ContinuousTileMemory:
+    case StageCostModelKind::ContinuousTileStore:
+    case StageCostModelKind::ContinuousShortLoad:
+    case StageCostModelKind::CachePolicyStore:
+      return facts.hasContiguousMemory;
+    case StageCostModelKind::ConversionPack:
+      return facts.hasConversionPack;
+    default:
+      return true;
+    }
+  };
   for (LogicalPhase &phase : partition.phases) {
     for (LogicalStage &stage : phase.stages) {
       const StageModelFeatures &facts = stage.features;
-      // Auxiliary scalar/index/predicate and memory work may live in a
-      // specialized Stage, but two independent dominant formulas may not.
-      // Reaching this check means StageBoundaryAnalysis missed a structural
-      // cut.  Silently selecting the first matching Kind would hide or
-      // double-count work, so report a stable boundary diagnostic instead.
-      // Conversion operations are not a split condition by themselves:
-      // predicate-to-float and accumulator casts are often auxiliary work of
-      // a recurrence/reduction/dot Stage.  ConversionPack becomes dominant
-      // only when no stronger structure owns the Stage (see deriveKind()).
-      const bool requiresSplit =
-          facts.hasDot && (facts.hasReduction || facts.hasIndirectMemory ||
-                           facts.hasLoopCarriedDataDependency);
-      if (requiresSplit)
+      if (facts.hasDot && (facts.hasReduction || facts.hasIndirectMemory ||
+                           facts.hasLoopCarriedDataDependency))
         return llvm::createStringError(
             std::errc::invalid_argument,
-            "requires_split: Stage '%s' owns incompatible dominant "
-            "structures (carried=%d, indirect=%d, reduction=%d, dot=%d, "
-            "conversion=%d, roots=%zu)",
-            stage.id.c_str(), facts.hasLoopCarriedDataDependency,
-            facts.hasIndirectMemory, facts.hasReduction, facts.hasDot,
-            facts.hasConversionPack, stage.operations.size());
-      auto kindMatchesFacts = [&](StageCostModelKind kind) {
-        switch (kind) {
-        case StageCostModelKind::AutoBlockifyDispatch:
-        case StageCostModelKind::AutoBlockifyLoop:
-        case StageCostModelKind::ScalarIssue:
-        case StageCostModelKind::ScalarControl:
-        case StageCostModelKind::ScalarMath:
-        case StageCostModelKind::IndexGeneration:
-        case StageCostModelKind::PredicateMask:
-        case StageCostModelKind::LoopPredicate:
-          return true;
-        case StageCostModelKind::LoopCarriedRecurrence:
-          return facts.hasLoopCarriedDataDependency;
-        case StageCostModelKind::IndependentPipelinedLoop:
-          return facts.hasLoop && !facts.hasLoopCarriedDataDependency;
-        case StageCostModelKind::RowwiseReduction:
-          return facts.hasReduction;
-        case StageCostModelKind::CubeRoofline:
-        case StageCostModelKind::TinyCubeRoofline:
-          return facts.hasDot;
-        case StageCostModelKind::IndirectScalarMemory:
-        case StageCostModelKind::IndirectGatherMemory:
-          return facts.hasIndirectMemory;
-        case StageCostModelKind::ContinuousTileMemory:
-        case StageCostModelKind::ContinuousTileStore:
-        case StageCostModelKind::ContinuousShortLoad:
-        case StageCostModelKind::CachePolicyStore:
-          return facts.hasContiguousMemory;
-        case StageCostModelKind::ConversionPack:
-          return facts.hasConversionPack;
-        }
-        return false;
-      };
-      auto deriveKind = [&]() {
-        // Preserve semantic specializations when their defining evidence is
-        // present.  Otherwise classify from the exact Stage operation graph;
-        // no workload name or experiment identity participates here.
+            "requires_split: Stage '%s' owns incompatible dominant structures",
+            stage.id.c_str());
+
+      auto derive = [&]() {
         if (facts.hasDot)
           return stage.workload.dotFlops * stage.iterationCount <=
                          static_cast<double>(
@@ -1782,103 +1341,23 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
                      : StageCostModelKind::ContinuousTileMemory;
         return StageCostModelKind::ScalarIssue;
       };
-      if (!kindMatchesFacts(stage.costModelKind)) {
-        stage.costModelKind = deriveKind();
-        if (stage.costModelKind == StageCostModelKind::IndependentPipelinedLoop)
-          stage.scheduleKind = StageScheduleKind::IndependentPipelined;
-        else if (stage.costModelKind ==
-                 StageCostModelKind::LoopCarriedRecurrence)
-          stage.scheduleKind = StageScheduleKind::LoopCarriedSerial;
-      }
-      const StageCostModelKind kind = stage.costModelKind;
-      auto mismatch = [&]() {
+      if (!compatible(stage.costModelKind, facts))
+        stage.costModelKind = derive();
+      if (!compatible(stage.costModelKind, facts) ||
+          (stage.costModelKind == StageCostModelKind::TinyCubeRoofline &&
+           stage.workload.dotFlops * stage.iterationCount >
+               static_cast<double>(std::max<int64_t>(1, tinyDotFlopsMax))))
         return llvm::createStringError(
             std::errc::invalid_argument,
-            "Stage '%s' operation graph does not match StageCostModelKind "
-            "'%s' (loop=%d, carried=%d, contiguous=%d, indirect=%d, "
-            "reduction=%d, dot=%d, conversion=%d, roots=%zu)",
-            stage.id.c_str(), stringifyStageCostModel(kind).str().c_str(),
-            facts.hasLoop, facts.hasLoopCarriedDataDependency,
-            facts.hasContiguousMemory, facts.hasIndirectMemory,
-            facts.hasReduction, facts.hasDot, facts.hasConversionPack,
-            stage.operations.size());
-      };
-      switch (kind) {
-      case StageCostModelKind::AutoBlockifyDispatch:
-      case StageCostModelKind::AutoBlockifyLoop:
-        break;
-      case StageCostModelKind::LoopCarriedRecurrence:
-        if (!facts.hasLoopCarriedDataDependency)
-          return mismatch();
-        break;
-      case StageCostModelKind::IndependentPipelinedLoop:
-        if (!facts.hasLoop || facts.hasLoopCarriedDataDependency)
-          return mismatch();
-        break;
-      case StageCostModelKind::RowwiseReduction:
-        if (!facts.hasReduction)
-          return mismatch();
-        break;
-      case StageCostModelKind::CubeRoofline:
-        if (!facts.hasDot)
-          return mismatch();
-        break;
-      case StageCostModelKind::TinyCubeRoofline:
-        if (!facts.hasDot ||
-            stage.workload.dotFlops * stage.iterationCount >
-                static_cast<double>(std::max<int64_t>(1, tinyDotFlopsMax)))
-          return mismatch();
-        break;
-      case StageCostModelKind::IndirectScalarMemory:
-      case StageCostModelKind::IndirectGatherMemory:
-        if (!facts.hasIndirectMemory)
-          return mismatch();
-        break;
-      case StageCostModelKind::ContinuousTileMemory:
-      case StageCostModelKind::ContinuousTileStore:
-      case StageCostModelKind::ContinuousShortLoad:
-      case StageCostModelKind::CachePolicyStore:
-        if (!facts.hasContiguousMemory)
-          return mismatch();
-        break;
-      case StageCostModelKind::ConversionPack:
-        if (!facts.hasConversionPack)
-          return mismatch();
-        break;
-      case StageCostModelKind::ScalarIssue:
-      case StageCostModelKind::ScalarControl:
-      case StageCostModelKind::ScalarMath:
-      case StageCostModelKind::IndexGeneration:
-      case StageCostModelKind::PredicateMask:
-      case StageCostModelKind::LoopPredicate:
-        // These kinds may legitimately contain auxiliary address, predicate,
-        // control, or short metadata memory work.  Their dominant semantics
-        // is established by the contiguous boundary plan.
-        break;
-      }
+            "Stage '%s' operation graph does not match StageCostModelKind '%s'",
+            stage.id.c_str(),
+            stringifyStageCostModel(stage.costModelKind).str().c_str());
+      if (stage.costModelKind == StageCostModelKind::IndependentPipelinedLoop)
+        stage.scheduleKind = StageScheduleKind::IndependentPipelined;
+      else if (stage.costModelKind == StageCostModelKind::LoopCarriedRecurrence)
+        stage.scheduleKind = StageScheduleKind::LoopCarriedSerial;
     }
   }
-  return llvm::Error::success();
-}
-
-llvm::Error
-StageWorkloadAnalysis::verify(const StagePartition &partition,
-                              const StageWorkload &kernelWorkload) const {
-  if (!kernelWorkload.isFiniteAndNonNegative())
-    return llvm::createStringError(std::errc::invalid_argument,
-                                   "kernel StageWorkload is invalid");
-  const StageWorkload owned = accumulatePartition(partition);
-  if (!near(owned.scalarOperations, kernelWorkload.scalarOperations) ||
-      !near(owned.loadBytes, kernelWorkload.loadBytes) ||
-      !near(owned.storeBytes, kernelWorkload.storeBytes) ||
-      !near(owned.predicateElements, kernelWorkload.predicateElements) ||
-      !near(owned.shuffleLaneSteps, kernelWorkload.shuffleLaneSteps) ||
-      !near(owned.dotFlops, kernelWorkload.dotFlops) ||
-      !near(totalOperationElements(owned),
-            totalOperationElements(kernelWorkload)))
-    return llvm::createStringError(
-        std::errc::invalid_argument,
-        "StagePartition does not conserve post-transform TTIR workload");
   return llvm::Error::success();
 }
 
@@ -1911,8 +1390,7 @@ llvm::Error StageWorkloadAnalysis::analyze(StagePartition &partition) const {
 }
 
 llvm::Error
-StagePartitionVerifier::verify(const StagePartition &partition,
-                               const StageWorkload &kernelWorkload) const {
+StagePartitionVerifier::verify(const StagePartition &partition) const {
   if (partition.phases.empty())
     return llvm::createStringError(std::errc::invalid_argument,
                                    "StagePartition has no Phase");
@@ -1969,9 +1447,11 @@ StagePartitionVerifier::verify(const StagePartition &partition,
     return llvm::createStringError(
         std::errc::invalid_argument,
         "StagePartition operation ownership is incomplete");
-  if (partition.operationOwnershipComplete)
-    return llvm::Error::success();
-  return StageWorkloadAnalysis().verify(partition, kernelWorkload);
+  if (!partition.operationOwnershipComplete)
+    return llvm::createStringError(
+        std::errc::invalid_argument,
+        "StagePartition requires complete TTIR operation ownership");
+  return llvm::Error::success();
 }
 
 llvm::Error
@@ -1979,6 +1459,11 @@ StageModeLegalityAnalysis::analyze(StagePartition &partition,
                                    int64_t maximumSuperblockFactor,
                                    bool scopeSuperblockMaterializable) const {
   const int64_t maximum = std::clamp<int64_t>(maximumSuperblockFactor, 1, 4);
+  // Local and whole-kernel SuperBlock candidates consume the same SIMT warp
+  // resources.  Do not regenerate F4 here after evaluateStageModel has
+  // already reduced the target maximum to F2 for num_warps=32 (or to F1 for
+  // a smaller runtime grid).
+  const int64_t localMaximum = scopeSuperblockMaterializable ? maximum : 1;
   for (LogicalPhase &phase : partition.phases) {
     for (LogicalStage &stage : phase.stages) {
       stage.simdLegal = true;
@@ -1994,18 +1479,21 @@ StageModeLegalityAnalysis::analyze(StagePartition &partition,
       if (maximum >= 4)
         stage.legalSimtFactors.push_back(4);
       if (stage.localSimtMaterializable) {
-        // A mixed F2/F4 implementation is legal only when backend integration
-        // can wrap the complete logical-program body with AutoBlockify V1.
-        // The local scope itself remains a single-mode Stage; factor changes
-        // its implementation, not the Stage boundary.
-        stage.localSimtFactors = scopeSuperblockMaterializable
-                                     ? stage.legalSimtFactors
-                                     : std::vector<int64_t>{1};
+        // The ABI-v2 scope materializer batches complete logical programs
+        // around this Stage.  F2/F4 therefore does not require multiple
+        // recurrence groups inside one logical program; that older W2/W4
+        // interpretation was only warp widening, not a SuperBlock.
+        stage.localSimtFactors = {1};
+        if (scopeSuperblockMaterializable)
+          for (int64_t factor : {2, 4})
+            if (factor <= localMaximum)
+              stage.localSimtFactors.push_back(factor);
       }
       if (stage.localSimtMaterializable &&
           (stage.localSimtFactors.empty() ||
            llvm::any_of(stage.localSimtFactors, [&](int64_t factor) {
-             return !llvm::is_contained(stage.legalSimtFactors, factor);
+             return factor < 1 || factor > localMaximum ||
+                    (factor != 1 && factor != 2 && factor != 4);
            })))
         return llvm::createStringError(
             std::errc::invalid_argument,
@@ -2013,35 +1501,6 @@ StageModeLegalityAnalysis::analyze(StagePartition &partition,
     }
   }
   return llvm::Error::success();
-}
-
-llvm::Expected<std::optional<StagePartition>>
-StagePartitioner::partition(const SimdSimtFeatureSummary &features,
-                            const StagePartitionerOptions &options) const {
-  auto phasePlan = PhaseBoundaryAnalysis().analyze(features, options);
-  if (!phasePlan)
-    return phasePlan.takeError();
-  if (!*phasePlan)
-    return std::optional<StagePartition>{};
-  auto result = StageBoundaryAnalysis().analyze(**phasePlan, features);
-  if (!result)
-    return result.takeError();
-
-  StageFeatureAnalysis featureAnalysis;
-  if (llvm::Error error = featureAnalysis.analyze(*result))
-    return std::move(error);
-  if (llvm::Error error =
-          StageKindClassifier().analyze(*result, options.tinyDotFlopsMax))
-    return std::move(error);
-  StageModeLegalityAnalysis legalityAnalysis;
-  if (llvm::Error error =
-          legalityAnalysis.analyze(*result, options.maximumSuperblockFactor,
-                                   options.scopeSuperblockMaterializable))
-    return std::move(error);
-  if (llvm::Error error = StagePartitionVerifier().verify(
-          *result, buildKernelStageWorkload(features)))
-    return std::move(error);
-  return std::optional<StagePartition>{std::move(*result)};
 }
 
 llvm::Expected<std::optional<StagePartition>>
@@ -2072,38 +1531,7 @@ StagePartitioner::partition(ModuleOp module, const SimtAnchorPlan &anchorPlan,
           legalityAnalysis.analyze(*result, options.maximumSuperblockFactor,
                                    options.scopeSuperblockMaterializable))
     return std::move(error);
-  if (llvm::Error error = StagePartitionVerifier().verify(
-          *result, buildKernelStageWorkload(features)))
-    return std::move(error);
-  return std::optional<StagePartition>{std::move(*result)};
-}
-
-llvm::Expected<std::optional<StagePartition>>
-StagePartitioner::partition(const SimdSimtFeatureSummary &features,
-                            const StagePartitionerOptions &options,
-                            const SimtAnchorPlan &anchorPlan) const {
-  auto phasePlan = PhaseBoundaryAnalysis().analyze(features, options);
-  if (!phasePlan)
-    return phasePlan.takeError();
-  if (!*phasePlan)
-    return std::optional<StagePartition>{};
-  auto result =
-      StageBoundaryAnalysis().analyze(**phasePlan, features, &anchorPlan);
-  if (!result)
-    return result.takeError();
-  StageFeatureAnalysis featureAnalysis;
-  if (llvm::Error error = featureAnalysis.analyze(*result))
-    return std::move(error);
-  if (llvm::Error error =
-          StageKindClassifier().analyze(*result, options.tinyDotFlopsMax))
-    return std::move(error);
-  StageModeLegalityAnalysis legalityAnalysis;
-  if (llvm::Error error =
-          legalityAnalysis.analyze(*result, options.maximumSuperblockFactor,
-                                   options.scopeSuperblockMaterializable))
-    return std::move(error);
-  if (llvm::Error error = StagePartitionVerifier().verify(
-          *result, buildKernelStageWorkload(features)))
+  if (llvm::Error error = StagePartitionVerifier().verify(*result))
     return std::move(error);
   return std::optional<StagePartition>{std::move(*result)};
 }

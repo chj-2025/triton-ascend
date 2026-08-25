@@ -21,7 +21,7 @@
  */
 
 #include "TritonToUnstructure/UnstructureConversionPass.h"
-#include "AscendModel/RouteModel/SimtSelection.h"
+#include "AscendModel/Transforms/SimtSelection.h"
 #include "TritonToLinalg/MaskAnalysis.h"
 #include "TritonToStructured/CannonicalizerConverter.h"
 #include "TritonToUnstructure/IndirectAtomicUtils.h"

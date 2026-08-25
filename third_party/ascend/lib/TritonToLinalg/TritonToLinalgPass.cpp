@@ -23,7 +23,7 @@
 
 #include <cstdlib>
 
-#include "AscendModel/RouteModel/SimtSelection.h"
+#include "AscendModel/Transforms/SimtSelection.h"
 #include "TritonToLinalg/BlockPtrAnalysis.h"
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
 #include "ascend/include/TritonToLinalg/ArgMinMaxConverter.h"
@@ -95,6 +95,36 @@
 
 using namespace mlir;
 using namespace triton;
+
+/// Translate the frontend Route Model contract into the native BiShengIR
+/// execution-region contract. `vector_mode` is intentionally the only
+/// attribute authored by TTIR producers, but the downstream mixed pipeline
+/// outlines a scope only when it carries the typed HIVM VF attributes.
+/// Keeping this bridge here makes hand-written and auto-materialized scopes
+/// follow the same lowering path without coupling the Route Model to HIVM.
+static void materializeSimtScopeExecutionContract(ModuleOp module) {
+  module.walk([&](scope::ScopeOp scopeOp) {
+    auto mode = mlir::ascend::simt_selection::getVectorMode(scopeOp);
+    if (!mode || mode.getValue() != "simt")
+      return;
+
+    OpBuilder builder(scopeOp);
+    // The Triton frontend historically emitted a discardable attribute named
+    // `noinline`.  BiShengIR's scope dialect instead models `no_inline` as an
+    // inherent property, and InlineScope only consults that property.  Make
+    // the boundary explicit here so the marked region survives until
+    // OutlineScope instead of being silently flattened back into SIMD code.
+    scopeOp->removeAttr("noinline");
+    scopeOp.setNoInline(true);
+    scopeOp->setAttr("outline", builder.getUnitAttr());
+    scopeOp->setAttr(hivm::TFuncCoreTypeAttr::name,
+                     hivm::TFuncCoreTypeAttr::get(module.getContext(),
+                                                  hivm::TFuncCoreType::AIV));
+    scopeOp->setAttr(
+        hivm::VFModeAttr::name,
+        hivm::VFModeAttr::get(module.getContext(), hivm::VFMode::SIMT));
+  });
+}
 
 int nd2nzFlag = 0;
 bool compileOn91095Flag = false;
@@ -985,6 +1015,7 @@ void TritonToLinalgPass::runOnOperation() {
   compileModeFlag = triton::ascend::parseCompileMode(this->compileMode);
 
   auto moduleOp = getOperation();
+  materializeSimtScopeExecutionContract(moduleOp);
 
   // Check if the kernel contains tl.dot. Without tl.dot,
   // the kernel would be pure AIV kernel.

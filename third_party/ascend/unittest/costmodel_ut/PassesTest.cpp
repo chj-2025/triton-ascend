@@ -1,8 +1,8 @@
 #include "AscendModel/Transforms/Passes.h"
+#include "AscendModel/Analysis/SimtAnchorAnalysis.h"
 #include "AscendModel/IR/AscendModelDialect.h"
 #include "AscendModel/RouteModel/SimdSimtCostModel.h"
-#include "AscendModel/RouteModel/SimtAnchorAnalysis.h"
-#include "AscendModel/RouteModel/SimtSelection.h"
+#include "AscendModel/Transforms/SimtSelection.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -15,7 +15,10 @@
 #include "mlir/Pass/PassManager.h"
 
 #include "bishengir/Dialect/Scope/IR/Scope.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
 
@@ -206,7 +209,7 @@ module {
 
   auto plan = buildMixedSimtAnchorPlan(*module, /*compileOn91095=*/true);
   ASSERT_EQ(plan.anchors.size(), 1u);
-  EXPECT_EQ(plan.materializableCount(), 1);
+  EXPECT_EQ(plan.materializableRoots().size(), 1u);
   EXPECT_EQ(mlir::ascend::stringifySimtAnchorKind(plan.anchors[0].kind),
             "loaded_index_dependent_memory");
 
@@ -215,26 +218,7 @@ module {
     FAIL() << llvm::toString(features.takeError());
 
   EXPECT_EQ(features->loadedIndexDependentMemoryOps, 1);
-  EXPECT_EQ(features->simtAnchors.loadedIndexDependentMemoryOps, 1);
-  EXPECT_EQ(features->simtAnchors.recognizedCount, 1);
   EXPECT_EQ(features->simtAnchors.count, 1);
-  ASSERT_EQ(features->simtAnchors.mechanismKinds.size(), 1u);
-  EXPECT_EQ(features->simtAnchors.mechanismKinds.front(),
-            "loaded_index_dependent_memory");
-
-  // The same predicate is produced once and consumed by tt.load.  The legacy
-  // rank sum sees both uses, while the hardware-facing fields count one SSA
-  // value and its 64 predicate elements exactly once.
-  EXPECT_GT(features->maskRankSum, features->uniqueMaskRankSum);
-  EXPECT_EQ(features->uniqueMaskValues, 1);
-  EXPECT_EQ(features->uniqueMaskRankSum, 2);
-  EXPECT_EQ(features->predicateElements, 64);
-  EXPECT_EQ(features->simtAnchors.uniqueMaskValues, 1);
-  EXPECT_EQ(features->simtAnchors.predicateElements, 64);
-
-  EXPECT_EQ(features->rowLocalReduceOps, 1);
-  EXPECT_EQ(features->maxReduceAxisExtent, 16);
-  EXPECT_EQ(features->weightedReduceAxisElements, 16);
 }
 
 TEST(CostModelPassesTest,
@@ -267,17 +251,13 @@ module {
 )mlir");
   ASSERT_TRUE(module);
 
+  // Loop dependency classification is owned by StageFeatureAnalysis; the
+  // kernel summary deliberately no longer duplicates it.
   auto plan = buildMixedSimtAnchorPlan(*module, /*compileOn91095=*/true);
-  auto features = analyzeSimdSimtFeatures(*module, plan);
-  if (!features)
-    FAIL() << llvm::toString(features.takeError());
-
-  EXPECT_EQ(features->pointerInductionDependencyCount, 1);
-  EXPECT_EQ(features->loopCarriedDataDependencyCount, 1);
+  EXPECT_TRUE(plan.anchors.empty());
 }
 
-TEST(CostModelPassesTest,
-     SimtAnchorAnalysisExtractsHistogramFactsAndLowerability) {
+TEST(CostModelPassesTest, SimtAnchorAnalysisClassifiesHistogramLowerability) {
   mlir::MLIRContext context;
   context.allowUnregisteredDialects();
   auto module = parseModule(context, R"mlir(
@@ -295,30 +275,16 @@ module {
   ASSERT_EQ(plan.anchors.size(), 1u);
   const auto &anchor = plan.anchors.front();
   EXPECT_EQ(anchor.kind, mlir::ascend::SimtAnchorKind::Histogram);
-  const auto *facts = std::get_if<mlir::ascend::HistogramFacts>(&anchor.facts);
-  ASSERT_NE(facts, nullptr);
-  EXPECT_EQ(facts->inputElements, 64);
-  EXPECT_EQ(facts->numBins, 256);
-  EXPECT_EQ(facts->inputType, "i32");
-  EXPECT_EQ(facts->resultType, "i32");
-
-  EXPECT_EQ(anchor.lowerability.allSimd,
-            mlir::ascend::CandidateLoweringStatus::Unsupported);
-  EXPECT_EQ(anchor.lowerability.allSimtOnly,
-            mlir::ascend::CandidateLoweringStatus::Unsupported);
-  EXPECT_EQ(anchor.lowerability.mixed,
-            mlir::ascend::CandidateLoweringStatus::Native);
+  EXPECT_FALSE(anchor.lowerability.allSimd);
+  EXPECT_FALSE(anchor.lowerability.allSimtOnly);
+  EXPECT_TRUE(anchor.lowerability.mixed);
   EXPECT_TRUE(anchor.materializable);
-  EXPECT_EQ(plan.kernelLowerability.allSimd,
-            mlir::ascend::CandidateLoweringStatus::Unsupported);
-  EXPECT_EQ(plan.kernelLowerability.allSimtOnly,
-            mlir::ascend::CandidateLoweringStatus::Unsupported);
-  EXPECT_EQ(plan.kernelLowerability.mixed,
-            mlir::ascend::CandidateLoweringStatus::Native);
+  EXPECT_FALSE(plan.kernelLowerability.allSimd);
+  EXPECT_FALSE(plan.kernelLowerability.allSimtOnly);
+  EXPECT_TRUE(plan.kernelLowerability.mixed);
 }
 
-TEST(CostModelPassesTest,
-     SimtAnchorAnalysisExtractsPlainCumsumFactsAndLowerability) {
+TEST(CostModelPassesTest, SimtAnchorAnalysisClassifiesPlainCumsumLowerability) {
   mlir::MLIRContext context;
   context.allowUnregisteredDialects();
   auto module = parseModule(context, R"mlir(
@@ -342,30 +308,17 @@ module {
   const auto &anchor = plan.anchors.front();
   EXPECT_EQ(anchor.kind,
             mlir::ascend::SimtAnchorKind::PlainOneDimensionalCumsum);
-  const auto *facts =
-      std::get_if<mlir::ascend::PlainCumsumFacts>(&anchor.facts);
-  ASSERT_NE(facts, nullptr);
-  EXPECT_EQ(facts->axisExtent, 128);
-  EXPECT_EQ(facts->elementType, "f32");
-  EXPECT_TRUE(facts->reverse);
-
-  EXPECT_EQ(anchor.lowerability.allSimd,
-            mlir::ascend::CandidateLoweringStatus::AliasesMixed);
-  EXPECT_EQ(anchor.lowerability.allSimtOnly,
-            mlir::ascend::CandidateLoweringStatus::BackendConditional);
-  EXPECT_EQ(anchor.lowerability.mixed,
-            mlir::ascend::CandidateLoweringStatus::Native);
+  EXPECT_FALSE(anchor.lowerability.allSimd);
+  EXPECT_TRUE(anchor.lowerability.allSimtOnly);
+  EXPECT_TRUE(anchor.lowerability.mixed);
   EXPECT_TRUE(anchor.materializable);
-  EXPECT_EQ(plan.kernelLowerability.allSimd,
-            mlir::ascend::CandidateLoweringStatus::AliasesMixed);
-  EXPECT_EQ(plan.kernelLowerability.allSimtOnly,
-            mlir::ascend::CandidateLoweringStatus::BackendConditional);
-  EXPECT_EQ(plan.kernelLowerability.mixed,
-            mlir::ascend::CandidateLoweringStatus::Native);
+  EXPECT_FALSE(plan.kernelLowerability.allSimd);
+  EXPECT_TRUE(plan.kernelLowerability.allSimtOnly);
+  EXPECT_TRUE(plan.kernelLowerability.mixed);
 }
 
 TEST(CostModelPassesTest,
-     SimtAnchorAnalysisExtractsTensorAtomicFactsAndLowerability) {
+     SimtAnchorAnalysisClassifiesTensorAtomicLowerability) {
   mlir::MLIRContext context;
   context.allowUnregisteredDialects();
   auto module = parseModule(context, R"mlir(
@@ -393,34 +346,13 @@ module {
   ASSERT_EQ(plan.anchors.size(), 1u);
   const auto &anchor = plan.anchors.front();
   EXPECT_EQ(anchor.kind, mlir::ascend::SimtAnchorKind::TensorAtomic);
-  const auto *facts =
-      std::get_if<mlir::ascend::TensorAtomicFacts>(&anchor.facts);
-  ASSERT_NE(facts, nullptr);
-  EXPECT_EQ(facts->updateElements, 64);
-  EXPECT_EQ(facts->addressRank, 1);
-  EXPECT_EQ(facts->valueType, "f32");
-  EXPECT_EQ(facts->offsetType, "i64");
-  EXPECT_EQ(facts->operation, "fadd");
-  EXPECT_TRUE(facts->hasMask);
-  ASSERT_TRUE(facts->staticMaskActiveFraction.has_value());
-  EXPECT_DOUBLE_EQ(*facts->staticMaskActiveFraction, 1.0);
-  EXPECT_TRUE(facts->resultUsed);
-  EXPECT_TRUE(facts->addressIsLaneVarying);
-  EXPECT_TRUE(facts->addressDependsOnLoadedIndex);
-
-  EXPECT_EQ(anchor.lowerability.allSimd,
-            mlir::ascend::CandidateLoweringStatus::Native);
-  EXPECT_EQ(anchor.lowerability.allSimtOnly,
-            mlir::ascend::CandidateLoweringStatus::BackendConditional);
-  EXPECT_EQ(anchor.lowerability.mixed,
-            mlir::ascend::CandidateLoweringStatus::Native);
+  EXPECT_TRUE(anchor.lowerability.allSimd);
+  EXPECT_TRUE(anchor.lowerability.allSimtOnly);
+  EXPECT_TRUE(anchor.lowerability.mixed);
   EXPECT_TRUE(anchor.materializable);
-  EXPECT_EQ(plan.kernelLowerability.allSimd,
-            mlir::ascend::CandidateLoweringStatus::Native);
-  EXPECT_EQ(plan.kernelLowerability.allSimtOnly,
-            mlir::ascend::CandidateLoweringStatus::BackendConditional);
-  EXPECT_EQ(plan.kernelLowerability.mixed,
-            mlir::ascend::CandidateLoweringStatus::Native);
+  EXPECT_TRUE(plan.kernelLowerability.allSimd);
+  EXPECT_TRUE(plan.kernelLowerability.allSimtOnly);
+  EXPECT_TRUE(plan.kernelLowerability.mixed);
 }
 
 TEST(CostModelPassesTest,
@@ -478,11 +410,10 @@ module {
 
   auto plan = buildMixedSimtAnchorPlan(*module, /*compileOn91095=*/true);
   ASSERT_EQ(plan.anchors.size(), 1u);
-  EXPECT_EQ(plan.materializableCount(), 1);
+  EXPECT_EQ(plan.materializableRoots().size(), 1u);
   for (const auto &anchor : plan.anchors) {
     EXPECT_EQ(anchor.kind, mlir::ascend::SimtAnchorKind::TriangularSolveLoop);
-    EXPECT_EQ(anchor.lowerability.mixed,
-              mlir::ascend::CandidateLoweringStatus::Native);
+    EXPECT_TRUE(anchor.lowerability.mixed);
     EXPECT_TRUE(anchor.materializable);
     // Both recurrence loops are one physical SIMT scope and therefore one
     // scored/materialized anchor, not two independent route decisions.
@@ -490,43 +421,31 @@ module {
     EXPECT_EQ(anchor.scopeInsertionPoint, anchor.operation);
     EXPECT_EQ(anchor.scopeOperations.front()->getName().getStringRef(),
               "tt.make_range");
-    const auto *facts =
-        std::get_if<mlir::ascend::TriangularSolveFacts>(&anchor.facts);
-    ASSERT_NE(facts, nullptr);
-    EXPECT_EQ(facts->blockRows, 16);
-    EXPECT_EQ(facts->blockColumns, 16);
-    EXPECT_EQ(facts->accumulatorType, "f32");
-    EXPECT_EQ(facts->recurrenceStartRow, 2);
-    EXPECT_EQ(facts->recurrenceLoopCount, 2);
-    EXPECT_EQ(facts->denseDotTailOps, 0);
-    EXPECT_FALSE(facts->requiresCubeTailPartition);
+    ASSERT_TRUE(anchor.triangularSolve);
+    EXPECT_EQ(anchor.triangularSolve->blockRows, 16);
+    EXPECT_EQ(anchor.triangularSolve->blockColumns, 16);
+    EXPECT_EQ(anchor.triangularSolve->accumulatorType, "f32");
+    EXPECT_EQ(anchor.triangularSolve->recurrenceStartRow, 2);
+    // Two recurrence loops, each with 14 body iterations.
+    EXPECT_EQ(anchor.triangularSolve->recurrenceLoopCount, 28);
+    EXPECT_EQ(anchor.triangularSolve->denseDotTailOps, 0);
+    EXPECT_FALSE(anchor.triangularSolve->requiresCubeTailPartition);
   }
-  EXPECT_EQ(plan.kernelLowerability.mixed,
-            mlir::ascend::CandidateLoweringStatus::Native);
+  EXPECT_TRUE(plan.kernelLowerability.mixed);
 
   auto features = analyzeSimdSimtFeatures(*module, plan);
   if (!features)
     FAIL() << llvm::toString(features.takeError());
   EXPECT_EQ(features->simtAnchors.count, 1);
-  EXPECT_EQ(features->simtAnchors.staticLoopCount, 2);
-  EXPECT_EQ(features->simtAnchors.staticLoopTripCountSum, 28);
-  EXPECT_EQ(features->simtAnchors.modeledDynamicLoopCount, 2);
-  EXPECT_EQ(features->simtAnchors.modeledDynamicLoopTripCountSum, 28);
-  EXPECT_EQ(features->simtAnchors.reduceOps, 2);
-  EXPECT_EQ(features->simtAnchors.weightedOps.lookup("reduce"), 28);
-  EXPECT_EQ(features->simtAnchors.shuffleLaneSteps, 28672);
-  // 2 loop-weighted mask uses: 2 * 256 * 14, plus the 256-lane mask setup
-  // that is moved into the same scope.
-  EXPECT_EQ(features->simtAnchors.predicateLaneEvaluations, 7424);
-  EXPECT_TRUE(features->hasUnknownTripCount);
-  EXPECT_EQ(features->loopCarriedDataDependencyCount, 2);
-  EXPECT_EQ(features->pointerInductionDependencyCount, 0);
-
-  ASSERT_TRUE(mlir::succeeded(materializeSimtAnchorPlan(*module, plan)));
+  ASSERT_TRUE(mlir::succeeded(materializeSimtAnchorPlan(*module, plan, 4)));
   Operation *scope = findFirstOp(*module, "scope.scope");
   ASSERT_NE(scope, nullptr);
   EXPECT_EQ(scope->getAttrOfType<mlir::StringAttr>("vector_mode").getValue(),
             "simt");
+  EXPECT_EQ(
+      scope->getAttrOfType<mlir::IntegerAttr>("ascend.scope_superblock.factor")
+          .getInt(),
+      4);
   Operation *initialLoad = findFirstOp(*module, "tt.load");
   ASSERT_NE(initialLoad, nullptr);
   EXPECT_NE(initialLoad->getParentOp(), scope);
@@ -599,7 +518,7 @@ TEST(CostModelPassesTest, PerfReportPassAcceptsEstimatedPipeline) {
                         createPipelineAnalysisPass(), createPerfReportPass()));
 }
 
-TEST(CostModelPassesTest, SimdSimtAutoAlwaysScoresLegalCandidates) {
+TEST(CostModelPassesTest, SimdSimtReturnsBackendDefaultOutsideStageDomain) {
   auto configureOptions = [](SelectSimdSimtCostModelPassOptions &options,
                              llvm::StringRef mode) {
     options.mode = mode.str();
@@ -629,23 +548,19 @@ TEST(CostModelPassesTest, SimdSimtAutoAlwaysScoresLegalCandidates) {
   ASSERT_TRUE(autoEffective);
   ASSERT_TRUE(autoRecommended);
   ASSERT_TRUE(autoReport);
-  EXPECT_EQ(autoEffective.getValue(), "all_simd");
-  EXPECT_EQ(autoRecommended.getValue(), "all_simd");
-  EXPECT_TRUE((*autoModule)->hasAttr("ascend.simt_costmodel.all_simd_score"));
+  EXPECT_EQ(autoEffective.getValue(), "backend_default");
+  EXPECT_EQ(autoRecommended.getValue(), "backend_default");
+  EXPECT_FALSE((*autoModule)->hasAttr("ascend.simt_costmodel.all_simd_score"));
   auto autoJSON = llvm::json::parse(autoReport.getValue());
   ASSERT_TRUE(static_cast<bool>(autoJSON));
   auto *autoObject = autoJSON->getAsObject();
   ASSERT_NE(autoObject, nullptr);
-  auto *autoCandidateCosts = autoObject->get("candidate_costs");
-  auto *autoDecision = autoObject->get("decision_kind");
-  ASSERT_NE(autoCandidateCosts, nullptr);
-  ASSERT_NE(autoDecision, nullptr);
-  EXPECT_NE(autoCandidateCosts->getAsObject(), nullptr);
-  ASSERT_TRUE(autoDecision->getAsString());
-  EXPECT_EQ(*autoDecision->getAsString(), "all_simd");
+  auto autoDecision = autoObject->getString("decision_kind");
+  ASSERT_TRUE(autoDecision);
+  EXPECT_EQ(*autoDecision, "backend_default");
   auto autoReason = autoObject->getString("application_reason");
   ASSERT_TRUE(autoReason);
-  EXPECT_EQ(*autoReason, "minimum_cost_candidate");
+  EXPECT_EQ(*autoReason, "stage_model_not_applicable");
 
   mlir::MLIRContext reportContext;
   auto reportModule = parseModule(reportContext, kOutOfSimdSimtCoverageModule);
@@ -664,17 +579,71 @@ TEST(CostModelPassesTest, SimdSimtAutoAlwaysScoresLegalCandidates) {
   ASSERT_TRUE(reportEffective);
   ASSERT_TRUE(reportJSONAttr);
   EXPECT_EQ(reportEffective.getValue(), "backend_default");
-  EXPECT_TRUE((*reportModule)->hasAttr("ascend.simt_costmodel.all_simd_score"));
+  EXPECT_FALSE(
+      (*reportModule)->hasAttr("ascend.simt_costmodel.all_simd_score"));
   auto reportJSON = llvm::json::parse(reportJSONAttr.getValue());
   ASSERT_TRUE(static_cast<bool>(reportJSON));
   auto *reportObject = reportJSON->getAsObject();
   ASSERT_NE(reportObject, nullptr);
   auto reportDecision = reportObject->getString("decision_kind");
   ASSERT_TRUE(reportDecision);
-  EXPECT_EQ(*reportDecision, "all_simd");
+  EXPECT_EQ(*reportDecision, "backend_default");
   auto reportReason = reportObject->getString("application_reason");
   ASSERT_TRUE(reportReason);
-  EXPECT_EQ(*reportReason, "report_mode");
+  EXPECT_EQ(*reportReason, "stage_model_not_applicable");
+}
+
+TEST(CostModelPassesTest, SimdSimtSelectionUsesExternalAnalysisIR) {
+  mlir::MLIRContext context;
+  auto module = parseModule(context, kOutOfSimdSimtCoverageModule);
+  ASSERT_TRUE(module);
+
+  llvm::SmallString<128> analysisPath;
+  int analysisFd = -1;
+  ASSERT_FALSE(llvm::sys::fs::createTemporaryFile(
+      "simd_simt_v1_analysis", "mlir", analysisFd, analysisPath));
+  {
+    llvm::raw_fd_ostream analysisFile(analysisFd, true);
+    analysisFile << R"mlir(
+module {
+  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32>
+      attributes {ta.auto_blockify_v1} {
+    %0 = arith.addf %arg0, %arg1 : tensor<4xf32>
+    return %0 : tensor<4xf32>
+  }
+}
+)mlir";
+  }
+
+  SelectSimdSimtCostModelPassOptions options;
+  options.mode = "report";
+  options.profilePath = TRITON_ASCEND_SIMD_SIMT_TEST_PROFILE_PATH;
+  options.actualTarget = "Ascend950PR_9579";
+  options.numWarps = 4;
+  options.compileOn91095 = true;
+  options.analysisModulePath = analysisPath.str().str();
+  const bool succeeded =
+      runPasses(*module, createSelectSimdSimtCostModelPass(options));
+  llvm::sys::fs::remove(analysisPath);
+  ASSERT_TRUE(succeeded);
+
+  auto reportAttr =
+      (*module)->getAttrOfType<StringAttr>("ascend.simt_costmodel.report_json");
+  ASSERT_TRUE(reportAttr);
+  auto report = llvm::json::parse(reportAttr.getValue());
+  ASSERT_TRUE(static_cast<bool>(report));
+  auto *object = report->getAsObject();
+  ASSERT_NE(object, nullptr);
+  auto analysisSource = object->getString("analysis_ir_source");
+  ASSERT_TRUE(analysisSource);
+  EXPECT_EQ(*analysisSource, "post_auto_blockify_v1_ttir");
+  auto *features = object->getObject("features");
+  ASSERT_NE(features, nullptr);
+  auto *postTransform = features->getObject("post_transform");
+  ASSERT_NE(postTransform, nullptr);
+  auto v1Applied = postTransform->getBoolean("auto_blockify_v1_applied");
+  ASSERT_TRUE(v1Applied);
+  EXPECT_TRUE(*v1Applied);
 }
 
 TEST(CostModelPassesTest, MaterializeSimtScopePreservesEscapingSSAResult) {
@@ -732,6 +701,64 @@ module attributes {
 
   EXPECT_FALSE(module->getOperation()->hasAttr(
       "ascend.simt_costmodel.scope_materialized"));
+}
+
+TEST(CostModelPassesTest, SameStageAnchorsMaterializeAsOneCompoundScope) {
+  mlir::MLIRContext context;
+  auto module = parseModule(context, R"mlir(
+module {
+  func.func @main(%arg0: i32, %arg1: i32) -> i32 {
+    %0 = arith.addi %arg0, %arg1 : i32
+    %1 = arith.muli %0, %arg1 : i32
+    %2 = arith.addi %1, %arg0 : i32
+    %3 = arith.addi %0, %2 : i32
+    return %3 : i32
+  }
+}
+)mlir");
+  ASSERT_TRUE(module);
+
+  Operation *first = findFirstOp(*module, "arith.muli")->getPrevNode();
+  Operation *middle = findFirstOp(*module, "arith.muli");
+  Operation *second = middle->getNextNode();
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(middle, nullptr);
+  ASSERT_NE(second, nullptr);
+
+  mlir::ascend::SimtAnchorPlan plan;
+  for (Operation *operation : {first, second}) {
+    mlir::ascend::SimtAnchorDescriptor anchor;
+    anchor.operation = operation;
+    anchor.scopeOperations.push_back(operation);
+    anchor.scopeInsertionPoint = operation;
+    anchor.kind = mlir::ascend::SimtAnchorKind::LoadedIndexDependentMemory;
+    anchor.materializable = true;
+    plan.anchors.push_back(std::move(anchor));
+  }
+
+  auto merged = mlir::ascend::mergeSimtStageAnchors(plan, {0, 1});
+  ASSERT_TRUE(merged);
+  ASSERT_EQ(merged->scopeOperations.size(), 3u);
+  EXPECT_EQ(merged->scopeOperations[0], first);
+  EXPECT_EQ(merged->scopeOperations[1], middle);
+  EXPECT_EQ(merged->scopeOperations[2], second);
+
+  mlir::ascend::SimtAnchorPlan selected;
+  selected.anchors.push_back(std::move(*merged));
+  ASSERT_TRUE(mlir::succeeded(materializeSimtAnchorPlan(*module, selected, 2)));
+  Operation *scope = findFirstOp(*module, "scope.scope");
+  ASSERT_NE(scope, nullptr);
+  EXPECT_EQ(
+      scope->getAttrOfType<mlir::IntegerAttr>("ascend.scope_superblock.factor")
+          .getInt(),
+      2);
+  EXPECT_EQ(middle->getParentOp(), scope);
+  int64_t scopeCount = 0;
+  module->walk([&](Operation *operation) {
+    scopeCount += operation->getName().getStringRef() == "scope.scope";
+  });
+  EXPECT_EQ(scopeCount, 1);
+  EXPECT_TRUE(mlir::succeeded(mlir::verify(*module)));
 }
 
 TEST(CostModelPassesTest, NativeWholeBodySimtScopeDetectionAndInlining) {
