@@ -5,6 +5,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
+#include "triton/Dialect/Triton/IR/Types.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
@@ -667,6 +668,8 @@ llvm::StringRef mlir::ascend::stringifySimtAnchorKind(SimtAnchorKind kind) {
     return "tensor_atomic";
   case SimtAnchorKind::TriangularSolveLoop:
     return "triangular_solve_loop";
+  case SimtAnchorKind::WholeStageSimt:
+    return "whole_stage_simt";
   }
   llvm_unreachable("unknown SIMT anchor kind");
 }
@@ -707,6 +710,45 @@ bool mlir::ascend::isLoadedIndexDependentMemoryOp(Operation *op) {
   llvm::StringRef name = op->getName().getStringRef();
   return (name == "tt.load" || name == "tt.store") &&
          hasTensorPointerOperand(op) && pointerDependsOnLoadedIndex(op);
+}
+
+bool mlir::ascend::isMemoryAllocatingOp(Operation *op) {
+  if (!op)
+    return false;
+  llvm::StringRef name = op->getName().getStringRef();
+
+  // Explicit allocation / bufferization ops.
+  if (name == "tt.alloc" || name == "memref.alloc" ||
+      name == "bufferization.alloc" || name == "tensor.empty")
+    return true;
+
+  // A tt.load produces a fresh tensor result from a pointer.  After lowering,
+  // that tensor materializes a new buffer on the memory side.  In mix mode the
+  // allocation must happen on the SIMD side so the SIMT scope only consumes it.
+  if (name == "tt.load")
+    return true;
+
+  return false;
+}
+
+bool mlir::ascend::producesScopeOpaqueValue(Operation *op) {
+  if (!op)
+    return false;
+  // Only WholeStageSimt synthetic scopes are affected: natural anchor scopes
+  // (LoadedIndexDependentMemory, etc.) are handled by dedicated lowering paths
+  // that already understand pointer results.
+  // A result is "scope-opaque" when it is a tensor of triton pointers — the
+  // downstream OffsetAnalysis pass cannot see through scope.scope to recover
+  // the pointer info, so leaving such a value as a scope result triggers
+  // `assert(data.getPtr() && "pointer type should be parsed")`.
+  for (Value result : op->getResults()) {
+    auto tensorType = dyn_cast<RankedTensorType>(result.getType());
+    if (!tensorType)
+      continue;
+    if (isa<triton::PointerType>(tensorType.getElementType()))
+      return true;
+  }
+  return false;
 }
 
 std::optional<SimtAnchorKind>

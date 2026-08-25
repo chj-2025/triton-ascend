@@ -2518,9 +2518,9 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
         report.allSimtOnlyCandidateLegal, report.mixedCandidateLegal);
     // FORCE_COSTMODEL_MIXROUTE: override decision to mixed_simd_simt.
     if (report.mixedCandidateLegal) {
-      llvm::Optional<std::string> envVal;
-      if (llvm::sys::Process::GetEnv("FORCE_COSTMODEL_MIXROUTE", envVal) &&
-          envVal.hasValue() && *envVal == "1") {
+      std::optional<std::string> envVal =
+          llvm::sys::Process::GetEnv("FORCE_COSTMODEL_MIXROUTE");
+      if (envVal && *envVal == "1") {
         llvm::errs() << "[COSTMODEL]   FORCE_COSTMODEL_MIXROUTE=1: forcing decision=mixed_simd_simt\n";
         report.decision = SimdSimtCandidateKind::MixedSIMDSIMT;
       }

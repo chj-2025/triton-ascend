@@ -86,6 +86,8 @@ buildSelectedMixedAnchorPlan(const StageCostModelSummary &stageModel,
       stageModel.mixed.implementations.size() != stageModel.stages.size())
     return selected;
 
+  llvm::errs() << "[COSTMODEL]   buildSelectedMixedAnchorPlan: processing "
+               << stageModel.stages.size() << " stages\n";
   llvm::DenseSet<unsigned> included;
   for (size_t stageIndex = 0; stageIndex < stageModel.stages.size();
        ++stageIndex) {
@@ -95,13 +97,78 @@ buildSelectedMixedAnchorPlan(const StageCostModelSummary &stageModel,
     if (implementation.mode != StageMode::SIMT)
       continue;
 
+    llvm::errs() << "[COSTMODEL]     stage[" << stageIndex << "] id='"
+                 << stage.id << "' mode=SIMT"
+                 << " simtAnchorIndices=" << stage.simtAnchorIndices.size()
+                 << " stageScopeOperations=" << stage.stageScopeOperations.size()
+                 << "\n";
+
+    // Collect natural SIMT anchors owned by this stage.
+    bool hasNaturalAnchor = false;
     for (unsigned index : stage.simtAnchorIndices) {
       if (index >= completePlan.anchors.size() ||
           !included.insert(index).second)
         continue;
       selected.anchors.push_back(completePlan.anchors[index]);
+      hasNaturalAnchor = true;
+    }
+    if (hasNaturalAnchor)
+      llvm::errs() << "[COSTMODEL]       → using natural anchor(s)\n";
+
+    // If the stage has no natural anchor but owns operations, synthesize one
+    // or more WholeStageSimt anchors so the materializer wraps the stage body
+    // in scope.scope { vector_mode="simt" } regions.
+    //
+    // Memory-allocating operations (e.g. tt.load producing a fresh tensor,
+    // explicit alloc/bufferization ops) must stay in SIMD and never enter a
+    // SIMT scope — in mix mode the allocation side is owned by SIMD.
+    //
+    // Because the materializer moves every op in ``scopeOperations`` into the
+    // scope body, mixing excluded (alloc) ops with in-scope ops in one anchor
+    // would break SSA dominance: an excluded tt.load sitting between two
+    // in-scope ops would be left in place while its neighbors are moved into
+    // the scope, leaving the load after the scope and breaking dominance of
+    // its result.  To keep every scope a contiguous block, we split the stage
+    // at every allocating op: each contiguous run of non-allocating ops
+    // becomes its own WholeStageSimt anchor.  Allocating ops remain in SIMD
+    // between the scopes, and their results dominate the following scope.
+    if (!hasNaturalAnchor && !stage.stageScopeOperations.empty()) {
+      SmallVector<Operation *> currentRun;
+      unsigned excludedCount = 0;
+      auto flushRun = [&]() {
+        if (currentRun.empty())
+          return;
+        SimtAnchorDescriptor stageScope;
+        stageScope.kind = SimtAnchorKind::WholeStageSimt;
+        stageScope.operation = currentRun.front();
+        llvm::append_range(stageScope.scopeOperations, currentRun);
+        stageScope.scopeInsertionPoint = currentRun.front();
+        stageScope.materializable = true;
+        selected.anchors.push_back(std::move(stageScope));
+        llvm::errs() << "[COSTMODEL]       → synthesized WholeStageSimt anchor"
+                     << " (scopeOps=" << currentRun.size() << ")\n";
+        currentRun.clear();
+      };
+      for (Operation *op : stage.stageScopeOperations) {
+        if (isMemoryAllocatingOp(op) || producesScopeOpaqueValue(op)) {
+          llvm::errs() << "[COSTMODEL]         exclude op (alloc or scope-opaque): ";
+          op->print(llvm::errs());
+          llvm::errs() << "\n";
+          flushRun();
+          ++excludedCount;
+          continue;
+        }
+        currentRun.push_back(op);
+      }
+      flushRun();
+      if (excludedCount > 0)
+        llvm::errs() << "[COSTMODEL]       excluded " << excludedCount
+                     << " memory-allocating op(s) from stage '" << stage.id
+                     << "'\n";
     }
   }
+  llvm::errs() << "[COSTMODEL]   buildSelectedMixedAnchorPlan: total selected="
+               << selected.anchors.size() << " anchors\n";
   return selected;
 }
 

@@ -606,9 +606,9 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
   // materialization is exercised even when DP could not construct a
   // realizable allSimtStagesLocal Mixed route.
   if (!result.mixed.legal) {
-    llvm::Optional<std::string> envVal;
-    if (llvm::sys::Process::GetEnv("FORCE_COSTMODEL_MIXROUTE", envVal) &&
-        envVal.hasValue() && *envVal == "1") {
+    std::optional<std::string> envVal =
+        llvm::sys::Process::GetEnv("FORCE_COSTMODEL_MIXROUTE");
+    if (envVal && *envVal == "1") {
       llvm::errs() << "[COSTMODEL]   FORCE_COSTMODEL_MIXROUTE=1: forcing Mixed route legal\n";
       result.mixed.legal = true;
       result.mixed.candidate = StageKernelRouteKind::Mixed;

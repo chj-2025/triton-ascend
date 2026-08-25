@@ -49,6 +49,10 @@ static bool isMaterializable(Operation *op) {
 /// captures.  Moving only the planned operation keeps SIMD producers and
 /// consumers outside the SIMT region.
 static LogicalResult wrapAnchorOperation(Operation *op) {
+  llvm::errs() << "[COSTMODEL]     wrapAnchorOperation: ";
+  op->print(llvm::errs());
+  llvm::errs() << "\n";
+
   OpBuilder builder(op);
   OperationState scopeState(op->getLoc(), "scope.scope");
   scopeState.addTypes(op->getResultTypes());
@@ -75,6 +79,8 @@ static LogicalResult wrapAnchorOperation(Operation *op) {
        llvm::zip_equal(originalResults, scopeOp->getResults())) {
     original.replaceAllUsesExcept(replacement, returnOp);
   }
+  llvm::errs() << "[COSTMODEL]       created scope.scope<simt> with "
+               << scopeOp->getNumResults() << " result(s)\n";
   return success();
 }
 
@@ -113,6 +119,14 @@ static LogicalResult wrapAnchorRange(ArrayRef<Operation *> ops,
           break;
         }
 
+  llvm::errs() << "[COSTMODEL]     wrapAnchorRange: ops=" << ops.size()
+               << " escaping=" << escaping.size() << "\n";
+  for (Operation *op : ops) {
+    llvm::errs() << "[COSTMODEL]       member: ";
+    op->print(llvm::errs());
+    llvm::errs() << "\n";
+  }
+
   OpBuilder builder(insertionPoint);
   OperationState scopeState(insertionPoint->getLoc(), "scope.scope");
   SmallVector<Type> escapingTypes;
@@ -143,6 +157,8 @@ static LogicalResult wrapAnchorRange(ArrayRef<Operation *> ops,
       if (use.getOwner() != returnOp && !isInsideRange(use.getOwner()))
         use.set(replacement);
   }
+  llvm::errs() << "[COSTMODEL]       created scope.scope<simt> with "
+               << scopeOp->getNumResults() << " result(s)\n";
   return success();
 }
 
@@ -162,10 +178,20 @@ LogicalResult materializeSimtAnchorPlan(ModuleOp module,
 
   for (const SimtAnchorDescriptor &anchor : plan.anchors) {
     Operation *op = anchor.operation;
-    if (!anchor.materializable || !op || coveredByRange.contains(op))
+    if (!anchor.materializable || !op || coveredByRange.contains(op)) {
+      llvm::errs() << "[COSTMODEL]   skip anchor: materializable="
+                   << (anchor.materializable ? "true" : "false")
+                   << " op=" << (op ? op->getName().getStringRef() : "<null>")
+                   << " covered=" << (op ? coveredByRange.contains(op) : false)
+                   << "\n";
       continue;
-    if (hasEnclosingVectorMode(op, "simt"))
+    }
+    if (hasEnclosingVectorMode(op, "simt")) {
+      llvm::errs() << "[COSTMODEL]   skip anchor: already enclosed in simt, op=";
+      op->print(llvm::errs());
+      llvm::errs() << "\n";
       continue;
+    }
 
     if (anchor.scopeOperations.size() > 1) {
       llvm::errs() << "[COSTMODEL]   Range anchor: ops=" << anchor.scopeOperations.size() << " op=";
@@ -208,6 +234,11 @@ LogicalResult materializeSimtAnchorPlan(ModuleOp module,
         "mixed_simd_simt has no materializable local SIMT scope");
   llvm::errs() << "[COSTMODEL]   Materialized " << materialized << " SIMT scope(s)\n";
   llvm::errs() << "[COSTMODEL] --- materializeSimtAnchorPlan END ---\n";
+  // Dump the post-materialization IR so that the scope.scope<simt> regions
+  // and the moved operations are visible for debugging.
+  llvm::errs() << "[COSTMODEL]   ----- IR after Materialization -----\n";
+  module->print(llvm::errs());
+  llvm::errs() << "\n[COSTMODEL]   ----- End of IR after Materialization -----\n";
   return success();
 }
 

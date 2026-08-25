@@ -366,7 +366,7 @@ TEST(SimdSimtCostModelTest, GatherDotUsesStageCostEvaluator) {
     FAIL() << llvm::toString(report.takeError());
 
   EXPECT_TRUE(report->stageModel.applied);
-  EXPECT_EQ(report->stageModel.domain, "indirect_underfilled_dot");
+  EXPECT_EQ(report->stageModel.domain, "semantic");
   EXPECT_GT(report->candidateCosts.allSimd, 0.0);
   EXPECT_GT(report->candidateCosts.allSimtOnly, 0.0);
   EXPECT_GT(report->candidateCosts.mixedSimdSimt, 0.0);
@@ -386,7 +386,7 @@ TEST(SimdSimtCostModelTest, FbgemmWithoutAutoBlockifyExposesOnlySuperBlockF1) {
     FAIL() << llvm::toString(report.takeError());
 
   EXPECT_TRUE(report->stageModel.applied);
-  EXPECT_EQ(report->stageModel.domain, "loaded_index_rowwise_reduction");
+  EXPECT_EQ(report->stageModel.domain, "semantic");
   EXPECT_TRUE(report->stageModel.allSimd.legal);
   EXPECT_TRUE(report->stageModel.allSimt.legal);
   EXPECT_TRUE(report->stageModel.mixed.legal);
@@ -411,7 +411,7 @@ TEST(SimdSimtCostModelTest, TriangularSolveUsesStageCostEvaluator) {
     FAIL() << llvm::toString(report.takeError());
 
   EXPECT_TRUE(report->stageModel.applied);
-  EXPECT_EQ(report->stageModel.domain, "triangular_recurrence");
+  EXPECT_EQ(report->stageModel.domain, "semantic");
   ASSERT_EQ(report->stageModel.phases.size(), 4u);
   ASSERT_EQ(report->stageModel.stages.size(), 5u);
   ASSERT_EQ(report->stageModel.mixed.implementations.size(), 5u);
@@ -435,7 +435,7 @@ TEST(SimdSimtCostModelTest, Bt16RecurrenceEvaluatesF2AndF4Pressure) {
   if (!report)
     FAIL() << llvm::toString(report.takeError());
   ASSERT_TRUE(report->stageModel.applied);
-  EXPECT_EQ(report->stageModel.domain, "triangular_recurrence");
+  EXPECT_EQ(report->stageModel.domain, "semantic");
   auto recurrence =
       llvm::find_if(report->stageModel.stages, [](const auto &stage) {
         return stage.model == "loop_carried_recurrence";
@@ -1049,8 +1049,9 @@ TEST(SimdSimtCostModelTest,
   EXPECT_EQ((*phasePlan)->rootOperations.size(),
             (*phasePlan)->rootPhaseIds.size());
   EXPECT_EQ((*phasePlan)->rootPhaseIds,
-            std::vector<std::string>({"head", "head", "head", "diagonal_load",
-                                      "diagonal_inverse", "merge_store"}));
+            std::vector<std::string>({"index_setup", "index_setup", "index_setup",
+                                      "gather", "recurrence",
+                                      "convert_store"}));
 
   auto result = StagePartitioner().partition(*module, anchorPlan, features,
                                              StagePartitionerOptions{});
@@ -1066,7 +1067,7 @@ TEST(SimdSimtCostModelTest,
   for (const LogicalPhase &phase : partition.phases) {
     for (const LogicalStage &stage : phase.stages) {
       ownedRootCount += static_cast<int64_t>(stage.operations.size());
-      if (stage.id == "diagonal_inverse_recurrence")
+      if (stage.id == "recurrence")
         recurrenceStage = &stage;
     }
   }
@@ -1145,9 +1146,9 @@ TEST(SimdSimtCostModelTest,
     FAIL() << llvm::toString(phasePlan.takeError());
   ASSERT_TRUE(*phasePlan);
   EXPECT_EQ((*phasePlan)->rootPhaseIds,
-            std::vector<std::string>({"head", "head", "head", "diagonal_load",
-                                      "diagonal_inverse", "diagonal_inverse",
-                                      "merge_store"}));
+            std::vector<std::string>({"index_setup", "index_setup", "index_setup",
+                                      "gather", "recurrence", "recurrence",
+                                      "convert_store"}));
 
   auto partition = StagePartitioner().partition(*module, anchorPlan,
                                                 triangularBt16StageFeatures(),
@@ -1159,9 +1160,9 @@ TEST(SimdSimtCostModelTest,
   const LogicalStage *recurrenceStage = nullptr;
   for (const LogicalPhase &phase : (**partition).phases)
     for (const LogicalStage &stage : phase.stages) {
-      if (stage.id == "load_diagonal_tiles")
+      if (stage.id == "gather")
         loadStage = &stage;
-      if (stage.id == "diagonal_inverse_recurrence")
+      if (stage.id == "recurrence")
         recurrenceStage = &stage;
     }
   ASSERT_NE(loadStage, nullptr);

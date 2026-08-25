@@ -868,6 +868,7 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
       logicalCost.simtAnchorIndices = stage.simtAnchorIndices;
       logicalCost.localSimtMaterializable = stage.localSimtMaterializable;
       logicalCost.localSimtFactors = stage.localSimtFactors;
+      logicalCost.stageScopeOperations = stage.operations;
 
       llvm::SmallVector<StageImplementation> implementations;
       if (stage.simdLegal)

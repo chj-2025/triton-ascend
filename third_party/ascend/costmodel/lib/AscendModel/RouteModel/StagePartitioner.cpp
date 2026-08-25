@@ -756,6 +756,329 @@ partitionIndirectDot(const SimdSimtFeatureSummary &features,
   return partition;
 }
 
+namespace {
+
+/// Semantic stage kinds used by the unified state machine.  These are derived
+/// purely from operation semantics (op names, loaded-index dependencies,
+/// loop-carried recurrence) and are intentionally independent of any
+/// business-scenario domain such as triangular/rowwise/indirect-dot.
+enum class SemanticStage {
+  AutoBlockifyDispatch,
+  IndexSetup,   // 准备索引: scalar/index/predicate generation
+  Gather,       // 取料: loaded-index-dependent or plain tile load
+  Recurrence,   // 递推加工: loop-carried triangular recurrence
+  Reduction,    // 归约加工: rowwise reduction
+  Dot,          // 矩阵加工: matrix product
+  Histogram,    // 直方图统计: tt.histogram
+  Atomic,       // 原子操作: tt.atomic_rmw / tt.atomic_cas
+  Scatter,      // 散列写回: indirect/scatter store
+  ConvertStore, // 出货: conversion + pack + regular store
+};
+
+static int semanticStagePriority(SemanticStage stage) {
+  switch (stage) {
+  case SemanticStage::AutoBlockifyDispatch:
+    return -1;
+  case SemanticStage::IndexSetup:
+    return 0;
+  case SemanticStage::Gather:
+    return 1;
+  case SemanticStage::Recurrence:
+    return 2;
+  case SemanticStage::Reduction:
+    return 3;
+  case SemanticStage::Dot:
+    return 4;
+  case SemanticStage::Histogram:
+    return 5;
+  case SemanticStage::Atomic:
+    return 6;
+  case SemanticStage::Scatter:
+    return 7;
+  case SemanticStage::ConvertStore:
+    return 8;
+  }
+  return 0;
+}
+
+/// Whether a stage is a storage/output stage.  Storage stages (scatter,
+/// convert_store) represent the kernel's output phase and must not regress
+/// back to a compute stage once entered.
+static bool isStorageStage(SemanticStage stage) {
+  return stage == SemanticStage::Scatter ||
+         stage == SemanticStage::ConvertStore;
+}
+
+/// Whether a stage is a computation stage.  Computation stages (gather,
+/// recurrence, reduction, dot, histogram, atomic) may appear in any order
+/// relative to each other — the order is determined by the IR, not by a
+/// hardcoded priority.
+static bool isComputeStage(SemanticStage stage) {
+  return stage == SemanticStage::Gather ||
+         stage == SemanticStage::Recurrence ||
+         stage == SemanticStage::Reduction ||
+         stage == SemanticStage::Dot ||
+         stage == SemanticStage::Histogram ||
+         stage == SemanticStage::Atomic;
+}
+
+/// Decide whether the state machine should advance from `current` to
+/// `classified`.  Unlike the old fixed-priority approach, this allows
+/// computation stages to appear in any order (e.g., histogram before atomic,
+/// or gather → histogram → gather).  Two hard constraints:
+///   1. storage stages must not regress back to computation;
+///   2. IndexSetup (preparation) cannot be re-entered once left — subsequent
+///      arith/type ops belong to the current stage, not a new preparation phase.
+static bool shouldAdvanceStage(SemanticStage current, SemanticStage classified) {
+  if (classified == current)
+    return false; // same semantic — stay in current stage
+  if (isStorageStage(current) && !isStorageStage(classified))
+    return false; // storage phase cannot regress to computation
+  // IndexSetup is a preparation phase (index/predicate generation).  Once
+  // the kernel enters a computation or storage stage, subsequent arith/type
+  // conversion ops are part of the current stage, not a new preparation
+  // phase.  Allowing re-entry would produce non-contiguous stage ownership.
+  if (current != SemanticStage::IndexSetup &&
+      classified == SemanticStage::IndexSetup)
+    return false; // cannot regress back to preparation after leaving it
+  return true; // semantic changed and no regression — advance
+}
+
+static llvm::StringRef semanticStageId(SemanticStage stage) {
+  switch (stage) {
+  case SemanticStage::AutoBlockifyDispatch:
+    return "auto_blockify_dispatch";
+  case SemanticStage::IndexSetup:
+    return "index_setup";
+  case SemanticStage::Gather:
+    return "gather";
+  case SemanticStage::Recurrence:
+    return "recurrence";
+  case SemanticStage::Reduction:
+    return "reduction";
+  case SemanticStage::Dot:
+    return "dot";
+  case SemanticStage::Histogram:
+    return "histogram";
+  case SemanticStage::Atomic:
+    return "atomic";
+  case SemanticStage::Scatter:
+    return "scatter";
+  case SemanticStage::ConvertStore:
+    return "convert_store";
+  }
+  return "index_setup";
+}
+
+static llvm::StringRef semanticStageDescription(llvm::StringRef stageId) {
+  return llvm::StringSwitch<llvm::StringRef>(stageId)
+      .Case("index_setup", "Scalar index and predicate generation")
+      .Case("gather", "Loaded-index-dependent or tile data gather")
+      .Case("recurrence", "Loop-carried blockwise recurrence")
+      .Case("reduction", "Row-local reduction tree")
+      .Case("dot", "Matrix product")
+      .Case("histogram", "Histogram bin counting")
+      .Case("atomic", "Atomic read-modify-write")
+      .Case("scatter", "Indirect or scatter store")
+      .Case("convert_store", "Conversion, pack and regular store")
+      .Default("Semantic stage");
+}
+
+static StageCostModelKind semanticStageCostModelKind(llvm::StringRef stageId) {
+  return llvm::StringSwitch<StageCostModelKind>(stageId)
+      .Case("index_setup", StageCostModelKind::IndexGeneration)
+      .Case("gather", StageCostModelKind::IndirectGatherMemory)
+      .Case("recurrence", StageCostModelKind::LoopCarriedRecurrence)
+      .Case("reduction", StageCostModelKind::RowwiseReduction)
+      .Case("dot", StageCostModelKind::CubeRoofline)
+      .Case("histogram", StageCostModelKind::IndirectGatherMemory)
+      .Case("atomic", StageCostModelKind::IndirectGatherMemory)
+      .Case("scatter", StageCostModelKind::ContinuousTileStore)
+      .Case("convert_store", StageCostModelKind::ContinuousTileStore)
+      .Default(StageCostModelKind::ScalarIssue);
+}
+
+static StageScheduleKind semanticStageSchedule(llvm::StringRef stageId) {
+  return llvm::StringSwitch<StageScheduleKind>(stageId)
+      .Case("gather", StageScheduleKind::PartiallyDependent)
+      .Case("recurrence", StageScheduleKind::LoopCarriedSerial)
+      .Case("dot", StageScheduleKind::IndependentPipelined)
+      .Case("reduction", StageScheduleKind::PartiallyDependent)
+      .Case("histogram", StageScheduleKind::PartiallyDependent)
+      .Case("atomic", StageScheduleKind::PartiallyDependent)
+      .Case("scatter", StageScheduleKind::PartiallyDependent)
+      .Case("convert_store", StageScheduleKind::IndependentPipelined)
+      .Default(StageScheduleKind::StraightLine);
+}
+
+} // namespace
+
+/// Unified semantic Stage partitioner.  Unlike the domain-specific templates
+/// above, this derives Stage boundaries purely from operation semantics via
+/// assignRootStageIdsBySemantics.  When an operation graph is available the
+/// Stage workload/costModelKind/scheduleKind are filled by downstream
+/// analyses (StageWorkloadAnalysis, StageKindClassifier) from exact owned
+/// operations.  The feature-summary fallback path synthesizes a best-effort
+/// Stage skeleton from aggregate feature counts so that unmatched kernels
+/// still receive a route decision instead of falling through to legacy.
+static StagePartition
+partitionBySemantics(const SimdSimtFeatureSummary &features,
+                     const PhaseBoundaryPlan *operationGraphPlan) {
+  StagePartition partition;
+  partition.domain = "semantic";
+  StageWorkload remaining = buildKernelStageWorkload(features);
+
+  const bool graphHasAutoBlockify =
+      operationGraphPlan && llvm::is_contained(operationGraphPlan->rootPhaseIds,
+                                               "auto_blockify_dispatch");
+  prependAutoBlockifyStages(partition, remaining, features,
+                            graphHasAutoBlockify);
+
+  if (operationGraphPlan && operationGraphPlan->hasOperationGraph()) {
+    // Operation-graph path: collect unique Stage ids in execution order and
+    // create one Phase per Stage.  Workload is intentionally empty here;
+    // StageWorkloadAnalysis accumulates it from exact owned operations.
+    std::vector<std::string> stageIds;
+    llvm::StringSet<> seen;
+    for (const std::string &phaseId : operationGraphPlan->rootPhaseIds) {
+      if (phaseId == "auto_blockify_dispatch")
+        continue;
+      if (seen.insert(phaseId).second)
+        stageIds.push_back(phaseId);
+    }
+
+    const int64_t iterationCount =
+        std::max<int64_t>(1, features.staticLoopTripCountMax);
+    bool firstRealStage = true;
+    for (const std::string &stageId : stageIds) {
+      LogicalStage stage;
+      stage.id = stageId;
+      stage.description = semanticStageDescription(stageId).str();
+      stage.costModelKind = semanticStageCostModelKind(stageId);
+      stage.scheduleKind = semanticStageSchedule(stageId);
+      stage.iterationCount = iterationCount;
+      if (firstRealStage) {
+        stage.workload.paysKernelSetup = true;
+        firstRealStage = false;
+      }
+      addPhase(partition, stageId, stage.description, std::move(stage));
+    }
+    return partition;
+  }
+
+  // Feature-summary fallback: synthesize a best-effort Stage skeleton from
+  // aggregate feature counts.  This keeps the costmodel applicable to kernels
+  // that have no operation graph without falling through to legacy.
+  const int64_t iterationCount =
+      std::max<int64_t>(1, features.staticLoopTripCountMax);
+  bool firstRealStage = true;
+
+  // Index/predicate/scalar setup is always present (kernel setup work).
+  StageWorkload index = takeScalarAndPredicate(remaining);
+  mergeWorkload(index, takeAllOperations(remaining));
+  index.paysKernelSetup = true;
+  LogicalStage indexStage = makeStage("index_setup",
+                                       semanticStageDescription("index_setup"),
+                                       StageCostModelKind::IndexGeneration,
+                                       StageScheduleKind::StraightLine, 1,
+                                       std::move(index));
+  indexStage.features.conditionalBranchCount =
+      features.conditionalBranchCount;
+  indexStage.features.divergentBranchCount = features.divergentBranchCount;
+  indexStage.features.activeLaneRatio = features.activeLaneRatio;
+  addPhase(partition, "index_setup", indexStage.description,
+           std::move(indexStage));
+  firstRealStage = false;
+
+  if (features.loadedIndexDependentMemoryOps > 0 || features.loadOps > 0) {
+    LogicalStage gather = asLocalSIMT(makeStage(
+        "gather", semanticStageDescription("gather"),
+        StageCostModelKind::IndirectGatherMemory,
+        StageScheduleKind::PartiallyDependent, 1, takeLoads(remaining)));
+    addPhase(partition, "gather", gather.description, std::move(gather));
+  }
+
+  if (!features.simtAnchors.triangularSolves.empty()) {
+    const TriangularSolveFacts &facts =
+        features.simtAnchors.triangularSolves.front();
+    StageWorkload anchor = buildWorkload(features.simtAnchors);
+    anchor = consumeExact(remaining, anchor);
+    const int64_t recurrenceIterations =
+        std::max<int64_t>(1, facts.recurrenceLoopCount);
+    LogicalStage recurrence = asLocalSIMT(withControl(
+        makeStage("recurrence", semanticStageDescription("recurrence"),
+                  StageCostModelKind::LoopCarriedRecurrence,
+                  StageScheduleKind::LoopCarriedSerial, recurrenceIterations,
+                  std::move(anchor)),
+        features.simtAnchors.conditionalBranchCount,
+        features.simtAnchors.divergentBranchCount,
+        features.simtAnchors.activeLaneRatio));
+    const int64_t iterationsPerGroup = std::max<int64_t>(
+        1, facts.blockRows - facts.recurrenceStartRow);
+    recurrence.features.parallelRecurrenceGroupCount = std::max<int64_t>(
+        1, (recurrenceIterations + iterationsPerGroup - 1) / iterationsPerGroup);
+    addPhase(partition, "recurrence", recurrence.description,
+             std::move(recurrence));
+  }
+
+  if (features.reduceOps > 0) {
+    StageWorkload reduction;
+    reduction.shuffleLaneSteps = std::exchange(remaining.shuffleLaneSteps, 0.0);
+    moveOperation(remaining, reduction, "f32.max");
+    recomputeIssueElements(reduction);
+    addPhase(partition, "reduction",
+             semanticStageDescription("reduction").str(),
+             makeStage("reduction", semanticStageDescription("reduction"),
+                       StageCostModelKind::RowwiseReduction,
+                       StageScheduleKind::PartiallyDependent, iterationCount,
+                       std::move(reduction)));
+  }
+
+  if (features.dotOps > 0) {
+    addPhase(partition, "dot", semanticStageDescription("dot").str(),
+             makeStage("dot", semanticStageDescription("dot"),
+                       StageCostModelKind::CubeRoofline,
+                       StageScheduleKind::IndependentPipelined, 1,
+                       takeDot(remaining)));
+  }
+
+  if (features.histogramOps > 0) {
+    LogicalStage histogram = asLocalSIMT(makeStage(
+        "histogram", semanticStageDescription("histogram"),
+        semanticStageCostModelKind("histogram"),
+        semanticStageSchedule("histogram"), 1, takeAllOperations(remaining)));
+    addPhase(partition, "histogram", histogram.description,
+             std::move(histogram));
+    llvm::errs() << "[COSTMODEL]   partitionBySemantics(fallback): added"
+                 << " 'histogram' stage (histogramOps=" << features.histogramOps
+                 << ")\n";
+  }
+
+  if (features.atomicOps > 0) {
+    LogicalStage atomic = asLocalSIMT(makeStage(
+        "atomic", semanticStageDescription("atomic"),
+        semanticStageCostModelKind("atomic"),
+        semanticStageSchedule("atomic"), 1, takeAllOperations(remaining)));
+    addPhase(partition, "atomic", atomic.description, std::move(atomic));
+    llvm::errs() << "[COSTMODEL]   partitionBySemantics(fallback): added"
+                 << " 'atomic' stage (atomicOps=" << features.atomicOps
+                 << ")\n";
+  }
+
+  StageWorkload convert = takeStores(remaining);
+  mergeWorkload(convert, takeAllOperations(remaining));
+  mergeWorkload(convert, std::move(remaining));
+  if (hasWork(convert)) {
+    addPhase(partition, "convert_store",
+             semanticStageDescription("convert_store").str(),
+             makeStage("convert_store", semanticStageDescription("convert_store"),
+                       StageCostModelKind::ContinuousTileStore,
+                       StageScheduleKind::IndependentPipelined, iterationCount,
+                       std::move(convert)));
+  }
+  return partition;
+}
+
 static bool anchorMatchesStage(const SimtAnchorDescriptor &anchor,
                                const LogicalStage &stage) {
   if (!anchor.materializable || !stage.localSimtMaterializable)
@@ -763,9 +1086,19 @@ static bool anchorMatchesStage(const SimtAnchorDescriptor &anchor,
   if (stage.costModelKind == StageCostModelKind::LoopCarriedRecurrence)
     return anchor.kind == SimtAnchorKind::TriangularSolveLoop;
   if (stage.costModelKind == StageCostModelKind::IndirectGatherMemory ||
-      stage.costModelKind == StageCostModelKind::IndirectScalarMemory)
+      stage.costModelKind == StageCostModelKind::IndirectScalarMemory) {
+    // Gather stage matches gather/loaded-index/histogram/atomic anchors.
+    // Histogram and atomic are irregular-memory SIMT mechanisms that share
+    // the indirect-gather cost model.
     return anchor.kind == SimtAnchorKind::DirectGather ||
-           anchor.kind == SimtAnchorKind::LoadedIndexDependentMemory;
+           anchor.kind == SimtAnchorKind::LoadedIndexDependentMemory ||
+           anchor.kind == SimtAnchorKind::Histogram ||
+           anchor.kind == SimtAnchorKind::TensorAtomic;
+  }
+  // Scatter and ConvertStore stages use ContinuousTileStore cost model.
+  // Atomic anchors can also match a scatter stage (scatter-store semantics).
+  if (stage.costModelKind == StageCostModelKind::ContinuousTileStore)
+    return anchor.kind == SimtAnchorKind::TensorAtomic;
   return false;
 }
 
@@ -824,19 +1157,133 @@ static void attachExactAnchorOwnership(StagePartition &partition,
                                        const SimtAnchorPlan &anchorPlan) {
   for (LogicalPhase &phase : partition.phases) {
     for (LogicalStage &stage : phase.stages) {
-      if (!stage.localSimtMaterializable)
-        continue;
+      // Try to match natural SIMT anchors to this stage.
       stage.simtAnchorIndices.clear();
-      for (auto indexedAnchor : llvm::enumerate(anchorPlan.anchors)) {
-        const SimtAnchorDescriptor &anchor = indexedAnchor.value();
-        if (anchor.materializable && stageOwnsAnchor(stage, anchor))
-          stage.simtAnchorIndices.push_back(
-              static_cast<unsigned>(indexedAnchor.index()));
+      if (stage.localSimtMaterializable) {
+        for (auto indexedAnchor : llvm::enumerate(anchorPlan.anchors)) {
+          const SimtAnchorDescriptor &anchor = indexedAnchor.value();
+          if (anchor.materializable && stageOwnsAnchor(stage, anchor))
+            stage.simtAnchorIndices.push_back(
+                static_cast<unsigned>(indexedAnchor.index()));
+        }
+        stage.localSimtMaterializable = !stage.simtAnchorIndices.empty();
+        llvm::errs() << "[COSTMODEL]   attachExactAnchorOwnership: stage='"
+                     << stage.id << "' naturalAnchors="
+                     << stage.simtAnchorIndices.size()
+                     << " localSimtMaterializable="
+                     << (stage.localSimtMaterializable ? "true" : "false")
+                     << "\n";
       }
-      stage.localSimtMaterializable = !stage.simtAnchorIndices.empty();
+      // A stage with operations but no natural SIMT anchor can still be
+      // materialized as a stage-level SIMT scope: the materializer wraps
+      // every owned operation in one scope.scope { vector_mode="simt" }.
+      if (!stage.localSimtMaterializable && !stage.operations.empty()) {
+        stage.localSimtMaterializable = true;
+        if (stage.localSimtFactors.empty())
+          stage.localSimtFactors = {1};
+        llvm::errs() << "[COSTMODEL]   attachExactAnchorOwnership: stage='"
+                     << stage.id << "' has no natural anchor but owns "
+                     << stage.operations.size()
+                     << " ops → marked materializable as WholeStageSimt\n";
+      }
       if (!stage.localSimtMaterializable)
         stage.localSimtFactors.clear();
     }
+  }
+}
+
+/// Split ``WholeStageSimt`` stages by materialization constraints.
+///
+/// A ``WholeStageSimt`` stage has no natural SIMT anchor and is marked
+/// materializable as a single scope.  However, the materializer must exclude
+/// memory-allocating ops (``tt.load``, ``tt.alloc``, …) and pointer-producing
+/// ops (``tt.addptr``, ``tt.splat`` of pointer, ``tt.bitcast`` of pointer)
+/// from the SIMT scope — they stay in SIMD.  If such an excluded op sits
+/// between two in-scope ops, the materializer would move the in-scope ops
+/// into a scope body, leaving the excluded op behind and breaking SSA
+/// dominance.
+///
+/// To keep the cost model's evaluation granularity aligned with the
+/// post-materialization structure, we split each ``WholeStageSimt`` stage
+/// at every excluded op into multiple sub-stages:
+///   - Sub-stages consisting solely of excluded ops become pure-SIMD stages.
+///   - Sub-stages consisting solely of in-scope ops remain SIMT-materializable.
+///
+/// After splitting, ``deriveStageLiveValues`` computes accurate live-in /
+/// live-out for each sub-stage, and ``deriveLocalSimtScopeTraffic`` charges
+/// only the real scope traffic because each SIMT sub-stage owns exactly the
+/// ops that will enter its scope.
+static void splitWholeStageSimtByMaterializationConstraints(
+    StagePartition &partition) {
+  for (LogicalPhase &phase : partition.phases) {
+    SmallVector<LogicalStage, 4> newStages;
+    for (LogicalStage &stage : phase.stages) {
+      const bool hasNaturalAnchor = !stage.simtAnchorIndices.empty();
+      if (hasNaturalAnchor || !stage.localSimtMaterializable ||
+          stage.operations.empty()) {
+        newStages.push_back(std::move(stage));
+        continue;
+      }
+      const std::string baseId = stage.id;
+      llvm::errs() << "[COSTMODEL]   splitWholeStageSimt: stage='"
+                   << baseId << "' ops=" << stage.operations.size() << "\n";
+
+      // Partition operations into contiguous runs of in-scope / excluded ops.
+      struct Run {
+        SmallVector<Operation *> ops;
+        bool inScope;
+      };
+      SmallVector<Run> runs;
+      for (Operation *op : stage.operations) {
+        const bool excluded =
+            isMemoryAllocatingOp(op) || producesScopeOpaqueValue(op);
+        const bool inScope = !excluded;
+        if (runs.empty() || runs.back().inScope != inScope)
+          runs.push_back({{}, inScope});
+        runs.back().ops.push_back(op);
+      }
+
+      if (runs.size() <= 1) {
+        newStages.push_back(std::move(stage));
+        continue;
+      }
+
+      int simtRunIndex = 0;
+      int simdRunIndex = 0;
+      for (const Run &run : runs) {
+        LogicalStage sub;
+        if (run.inScope) {
+          sub.id = baseId + "_simt" + Twine(simtRunIndex++).str();
+          sub.costModelKind = stage.costModelKind;
+          sub.scheduleKind = stage.scheduleKind;
+          sub.iterationCount = stage.iterationCount;
+          sub.features = stage.features;
+          sub.simdLegal = false;
+          sub.simtLegal = stage.simtLegal;
+          sub.localSimtMaterializable = true;
+          sub.legalSimtFactors = stage.legalSimtFactors;
+          sub.localSimtFactors = stage.localSimtFactors;
+          sub.description =
+              baseId + " (SIMT scope run #" + Twine(simtRunIndex).str() + ")";
+        } else {
+          sub.id = baseId + "_simd" + Twine(simdRunIndex++).str();
+          sub.costModelKind = StageCostModelKind::ScalarIssue;
+          sub.scheduleKind = StageScheduleKind::StraightLine;
+          sub.iterationCount = stage.iterationCount;
+          sub.simdLegal = true;
+          sub.simtLegal = false;
+          sub.localSimtMaterializable = false;
+          sub.description =
+              baseId + " (SIMD run #" + Twine(simdRunIndex).str() + ")";
+        }
+        llvm::append_range(sub.operations, run.ops);
+        llvm::errs() << "[COSTMODEL]     sub-stage '" << sub.id << "' mode="
+                     << (run.inScope ? "SIMT" : "SIMD")
+                     << " ops=" << run.ops.size() << "\n";
+        newStages.push_back(std::move(sub));
+      }
+    }
+    phase.stages.assign(newStages.begin(), newStages.end());
   }
 }
 
@@ -910,17 +1357,152 @@ static bool operationTreeContainsLoadedIndexMemory(Operation *root) {
   return found;
 }
 
+/// Count occurrences of each operation kind in the subtree of `root` and
+/// classify the root into the SemanticStage whose operation kind has the
+/// highest count.  This replaces the previous first-match if-else chain which
+/// could misclassify a root containing both tt.load and tt.store as
+/// ConvertStore just because tt.store was checked first.
+///
+/// The mapping from op name to SemanticStage is:
+///   tt.histogram           → Histogram
+///   tt.atomic_rmw/cas      → Atomic
+///   tt.dot                  → Dot
+///   tt.reduce              → Reduction
+///   tt.load (loaded-index) → Gather  (weighted higher than plain load)
+///   tt.load (plain)        → Gather
+///   tt.store (scatter)     → Scatter  (indirect store, detected via
+///                                     loaded-index-dependent pointer)
+///   tt.store (regular)     → ConvertStore
+///   everything else        → IndexSetup (weight 0, fallback)
+struct SemanticOpCounters {
+  int64_t histogram = 0;
+  int64_t atomic = 0;
+  int64_t dot = 0;
+  int64_t reduce = 0;
+  int64_t gather = 0;
+  int64_t scatter = 0;
+  int64_t convertStore = 0;
+  int64_t indexSetup = 0;
+};
+
+static void countSemanticOps(Operation *root, SemanticOpCounters &counts) {
+  if (!root)
+    return;
+  auto classify = [](Operation *op) {
+    const llvm::StringRef name = op->getName().getStringRef();
+    if (name == "tt.histogram")
+      return &SemanticOpCounters::histogram;
+    if (name == "tt.atomic_rmw" || name == "tt.atomic_cas")
+      return &SemanticOpCounters::atomic;
+    if (name == "tt.dot")
+      return &SemanticOpCounters::dot;
+    if (name == "tt.reduce" || name == "tt.scan")
+      return &SemanticOpCounters::reduce;
+    if (name == "tt.load")
+      return isLoadedIndexDependentMemoryOp(op) ? &SemanticOpCounters::gather
+                                                : &SemanticOpCounters::gather;
+    if (name == "tt.store")
+      return isLoadedIndexDependentMemoryOp(op) ? &SemanticOpCounters::scatter
+                                                : &SemanticOpCounters::convertStore;
+    if (name == "tt.gather")
+      return &SemanticOpCounters::gather;
+    if (name == "tt.scatter")
+      return &SemanticOpCounters::scatter;
+    return &SemanticOpCounters::indexSetup;
+  };
+
+  // Count the root operation itself.  For high-level semantic ops with
+  // regions (tt.scan/tt.reduce/tt.dot), the root's own classification is
+  // the authoritative one — their region body is an implementation detail
+  // (overflow checks, combinator lambda) and is skipped below.
+  int64_t SemanticOpCounters::*bucket = classify(root);
+  ++(counts.*bucket);
+
+  // If the root itself is a high-level semantic op with a region, its
+  // region body is an implementation detail (the reduction/scan combinator
+  // lambda).  Don't walk into it — those inner arith ops (overflow checks,
+  // etc.) would inflate indexSetup and distort the classification.
+  const llvm::StringRef rootName = root->getName().getStringRef();
+  if (rootName == "tt.scan" || rootName == "tt.reduce" ||
+      rootName == "tt.dot")
+    return;
+
+  // Walk descendants but skip region bodies of high-level semantic ops.
+  // Their regions are implementation details (e.g., reduce/scan lambda with
+  // arith ops for overflow checking), not separate semantic stages.
+  root->walk([&](Operation *nested) -> mlir::WalkResult {
+    int64_t SemanticOpCounters::*b = classify(nested);
+    ++(counts.*b);
+
+    // Don't descend into region bodies of semantic ops with lambdas.
+    const llvm::StringRef name = nested->getName().getStringRef();
+    if (name == "tt.scan" || name == "tt.reduce" || name == "tt.dot")
+      return mlir::WalkResult::skip();
+    return mlir::WalkResult::advance();
+  });
+}
+
+static SemanticStage classifyRootSemantic(Operation *root) {
+  SemanticOpCounters counts;
+  countSemanticOps(root, counts);
+
+  llvm::errs() << "[COSTMODEL]   classifyRootSemantic: ";
+  if (root)
+    root->print(llvm::errs());
+  else
+    llvm::errs() << "<null>";
+  llvm::errs() << "\n";
+  llvm::errs() << "[COSTMODEL]     op counts: indexSetup=" << counts.indexSetup
+               << " gather=" << counts.gather
+               << " dot=" << counts.dot
+               << " reduce=" << counts.reduce
+               << " histogram=" << counts.histogram
+               << " atomic=" << counts.atomic
+               << " scatter=" << counts.scatter
+               << " convertStore=" << counts.convertStore << "\n";
+
+  // Select the stage with the highest count.  Ties are broken by priority
+  // order (later stages win) to keep the monotone state machine moving
+  // forward.
+  struct Candidate {
+    int64_t count;
+    SemanticStage stage;
+  };
+  const Candidate candidates[] = {
+      {counts.indexSetup,    SemanticStage::IndexSetup},
+      {counts.gather,        SemanticStage::Gather},
+      {counts.dot,           SemanticStage::Dot},
+      {counts.reduce,        SemanticStage::Reduction},
+      {counts.histogram,     SemanticStage::Histogram},
+      {counts.atomic,        SemanticStage::Atomic},
+      {counts.scatter,       SemanticStage::Scatter},
+      {counts.convertStore,  SemanticStage::ConvertStore},
+  };
+  SemanticStage best = SemanticStage::IndexSetup;
+  int64_t bestCount = 0;
+  for (const Candidate &c : candidates) {
+    if (c.count > bestCount ||
+        (c.count > 0 && c.count == bestCount &&
+         semanticStagePriority(c.stage) > semanticStagePriority(best))) {
+      best = c.stage;
+      bestCount = c.count;
+    }
+  }
+  llvm::errs() << "[COSTMODEL]     → classified as: " << semanticStageId(best)
+               << " (count=" << bestCount << ")\n";
+  return best;
+}
+
 /// PhaseBoundaryAnalysis owns the algorithm-level serial cut.  Each root is
-/// assigned exactly one Phase id in execution order.  The state machines are
-/// monotone: after a boundary is crossed, a later root cannot move back to an
-/// earlier Phase.  Cost and candidate mode are intentionally absent here.
-static llvm::Error assignRootPhaseIds(PhaseBoundaryPlan &plan) {
-  enum class TriangularPhase { Head, Load, Recurrence, MergeStore };
-  enum class RowwisePhase { Index, Gather, Reduction, ConvertStore };
-  enum class IndirectDotPhase { Index, Gather, Dot, OutputStore };
-  TriangularPhase triangular = TriangularPhase::Head;
-  RowwisePhase rowwise = RowwisePhase::Index;
-  IndirectDotPhase indirectDot = IndirectDotPhase::Index;
+/// assigned exactly one semantic Stage id in execution order via a unified
+/// monotone state machine.  The machine is driven purely by operation
+/// semantics (op names, loaded-index dependencies, recurrence loops) and is
+/// independent of any business-scenario domain.  After a boundary is crossed,
+/// a later root cannot move back to an earlier Stage (monotone progress).
+static llvm::Error assignRootStageIdsBySemantics(PhaseBoundaryPlan &plan) {
+  plan.rootPhaseIds.clear();
+  plan.rootPhaseIds.reserve(plan.rootOperations.size());
+
   llvm::DenseSet<Operation *> anchorRoots(plan.localSimtAnchorRoots.begin(),
                                           plan.localSimtAnchorRoots.end());
   std::optional<size_t> firstAnchorIndex;
@@ -932,23 +1514,22 @@ static llvm::Error assignRootPhaseIds(PhaseBoundaryPlan &plan) {
       firstAnchorIndex = indexedRoot.index();
     lastAnchorIndex = indexedRoot.index();
   }
-  if (plan.domain == PhaseBoundaryDomain::TriangularRecurrence &&
-      !firstAnchorIndex)
-    return llvm::createStringError(
-        std::errc::invalid_argument,
-        "triangular PhaseBoundaryAnalysis requires an exact anchor region");
-  if (plan.domain == PhaseBoundaryDomain::TriangularRecurrence &&
-      firstAnchorIndex && lastAnchorIndex) {
-    for (size_t index = *firstAnchorIndex; index <= *lastAnchorIndex; ++index)
-      if (!anchorRoots.contains(plan.rootOperations[index]))
-        return llvm::createStringError(
-            std::errc::invalid_argument,
-            "triangular PhaseBoundaryAnalysis requires a contiguous planned "
-            "scope region");
+
+  // Determine whether the anchor range is a recurrence region (contains a
+  // loop) or a gather region.  This mirrors the original triangular
+  // (recurrence) vs rowwise/indirect-dot (gather) distinction without
+  // referencing any domain enum.
+  bool anchorRangeIsRecurrence = false;
+  if (firstAnchorIndex && lastAnchorIndex) {
+    for (size_t index = *firstAnchorIndex; index <= *lastAnchorIndex; ++index) {
+      if (operationTreeContainsName(plan.rootOperations[index], "scf.for")) {
+        anchorRangeIsRecurrence = true;
+        break;
+      }
+    }
   }
 
-  plan.rootPhaseIds.clear();
-  plan.rootPhaseIds.reserve(plan.rootOperations.size());
+  SemanticStage current = SemanticStage::IndexSetup;
   for (auto indexedRoot : llvm::enumerate(plan.rootOperations)) {
     Operation *root = indexedRoot.value();
     if (!root)
@@ -961,99 +1542,84 @@ static llvm::Error assignRootPhaseIds(PhaseBoundaryPlan &plan) {
       continue;
     }
 
-    switch (plan.domain) {
-    case PhaseBoundaryDomain::TriangularRecurrence:
-      if (firstAnchorIndex && indexedRoot.index() >= *firstAnchorIndex &&
-          indexedRoot.index() <= *lastAnchorIndex)
-        triangular = TriangularPhase::Recurrence;
-      else if (lastAnchorIndex && indexedRoot.index() > *lastAnchorIndex)
-        triangular = TriangularPhase::MergeStore;
-      else if (operationTreeContainsName(root, "tt.dot") ||
-               operationTreeContainsName(root, "tt.store"))
-        triangular = TriangularPhase::MergeStore;
-      else if (triangular == TriangularPhase::Head &&
-               operationTreeContainsName(root, "tt.load"))
-        triangular = TriangularPhase::Load;
-      switch (triangular) {
-      case TriangularPhase::Head:
-        plan.rootPhaseIds.push_back("head");
-        break;
-      case TriangularPhase::Load:
-        plan.rootPhaseIds.push_back("diagonal_load");
-        break;
-      case TriangularPhase::Recurrence:
-        plan.rootPhaseIds.push_back("diagonal_inverse");
-        break;
-      case TriangularPhase::MergeStore:
-        plan.rootPhaseIds.push_back("merge_store");
-        break;
-      }
-      break;
-    case PhaseBoundaryDomain::LoadedIndexRowwiseReduction:
-      if (operationTreeContainsName(root, "tt.reduce"))
-        rowwise = RowwisePhase::Reduction;
-      else if (rowwise == RowwisePhase::Reduction ||
-               operationTreeContainsName(root, "tt.store"))
-        rowwise = RowwisePhase::ConvertStore;
-      else if (rowwise == RowwisePhase::Index &&
-               operationTreeContainsLoadedIndexMemory(root))
-        rowwise = RowwisePhase::Gather;
-      switch (rowwise) {
-      case RowwisePhase::Index:
-        plan.rootPhaseIds.push_back("row_dispatch");
-        break;
-      case RowwisePhase::Gather:
-        plan.rootPhaseIds.push_back("row_load");
-        break;
-      case RowwisePhase::Reduction:
-        plan.rootPhaseIds.push_back("row_reduction");
-        break;
-      case RowwisePhase::ConvertStore:
-        plan.rootPhaseIds.push_back("convert_store");
-        break;
-      }
-      break;
-    case PhaseBoundaryDomain::IndirectUnderfilledDot:
-      if (operationTreeContainsName(root, "tt.dot"))
-        indirectDot = IndirectDotPhase::Dot;
-      else if (indirectDot == IndirectDotPhase::Dot ||
-               operationTreeContainsName(root, "tt.store"))
-        indirectDot = IndirectDotPhase::OutputStore;
-      else if (indirectDot == IndirectDotPhase::Index &&
-               operationTreeContainsLoadedIndexMemory(root))
-        indirectDot = IndirectDotPhase::Gather;
-      switch (indirectDot) {
-      case IndirectDotPhase::Index:
-        plan.rootPhaseIds.push_back("index_setup");
-        break;
-      case IndirectDotPhase::Gather:
-        plan.rootPhaseIds.push_back("gather_tiles");
-        break;
-      case IndirectDotPhase::Dot:
-        plan.rootPhaseIds.push_back("dot");
-        break;
-      case IndirectDotPhase::OutputStore:
-        plan.rootPhaseIds.push_back("output_store");
-        break;
-      }
-      break;
+    const bool inAnchorRange =
+        firstAnchorIndex && lastAnchorIndex &&
+        indexedRoot.index() >= *firstAnchorIndex &&
+        indexedRoot.index() <= *lastAnchorIndex;
+
+    SemanticStage classified = SemanticStage::IndexSetup;
+    if (inAnchorRange) {
+      classified = anchorRangeIsRecurrence ? SemanticStage::Recurrence
+                                          : SemanticStage::Gather;
+    } else {
+      classified = classifyRootSemantic(root);
     }
+
+    if (shouldAdvanceStage(current, classified)) {
+      llvm::errs() << "[COSTMODEL]     stage advance: "
+                   << semanticStageId(current) << " → "
+                   << semanticStageId(classified)
+                   << " (semantic change";
+      if (isStorageStage(current))
+        llvm::errs() << ", storage→storage";
+      llvm::errs() << ")\n";
+      current = classified;
+    } else if (classified != current) {
+      llvm::errs() << "[COSTMODEL]     stage hold: stayed at "
+                   << semanticStageId(current)
+                   << " (classified=" << semanticStageId(classified)
+                   << ", ";
+      if (isStorageStage(current) && !isStorageStage(classified))
+        llvm::errs() << "storage regression blocked";
+      else if (classified == SemanticStage::IndexSetup)
+        llvm::errs() << "index_setup re-entry blocked";
+      else
+        llvm::errs() << "regression blocked";
+      llvm::errs() << ")\n";
+    }
+    const std::string stageId = semanticStageId(current).str();
+    llvm::errs() << "[COSTMODEL]   assignRootStageIdsBySemantics: root["
+                 << indexedRoot.index() << "] → stage='" << stageId << "'";
+    if (inAnchorRange)
+      llvm::errs() << " (inAnchorRange)";
+    llvm::errs() << "\n";
+    plan.rootPhaseIds.push_back(stageId);
   }
+
   if (plan.rootPhaseIds.size() != plan.rootOperations.size())
     return llvm::createStringError(
         std::errc::invalid_argument,
         "PhaseBoundaryAnalysis did not own every semantic root");
-  llvm::StringSet<> closedPhases;
+
+  // Contiguity check: computation stages may alternate freely (e.g.
+  // gather → histogram → gather is legal — the IR defines the order, not
+  // a hardcoded priority).  Two hard constraints enforced by
+  // shouldAdvanceStage above (this check is a safety net):
+  //   1. storage stages must not regress to computation;
+  //   2. index_setup (preparation) must not reappear once left.
   llvm::StringRef currentPhase;
+  bool enteredStoragePhase = false;
+  bool leftIndexSetup = false;
   for (const std::string &phaseId : plan.rootPhaseIds) {
     if (phaseId == currentPhase)
       continue;
-    if (!currentPhase.empty())
-      closedPhases.insert(currentPhase);
-    if (closedPhases.contains(phaseId))
+    if (phaseId == "index_setup") {
+      if (leftIndexSetup)
+        return llvm::createStringError(
+            std::errc::invalid_argument,
+            "PhaseBoundaryAnalysis regressed back to index_setup after "
+            "leaving the preparation phase");
+    } else if (phaseId != "auto_blockify_dispatch") {
+      leftIndexSetup = true;
+    }
+    const bool isStorage = phaseId == "scatter" || phaseId == "convert_store";
+    if (isStorage)
+      enteredStoragePhase = true;
+    if (enteredStoragePhase && !isStorage)
       return llvm::createStringError(
           std::errc::invalid_argument,
-          "PhaseBoundaryAnalysis produced a non-contiguous Phase '%s'",
+          "PhaseBoundaryAnalysis regressed from storage to computation: "
+          "'%s' after a storage stage",
           phaseId.c_str());
     currentPhase = phaseId;
   }
@@ -1104,7 +1670,6 @@ attachCompleteOperationOwnership(StagePartition &partition,
         "StageBoundaryAnalysis requires complete Phase root ownership");
   llvm::DenseSet<Operation *> owned;
   int64_t lastStageOrdinal = -1;
-  bool mergeStoreReached = findStage(partition, "dense_dot_tail") == nullptr;
 
   for (auto indexedRoot : llvm::enumerate(plan.rootOperations)) {
     Operation *root = indexedRoot.value();
@@ -1123,45 +1688,10 @@ attachCompleteOperationOwnership(StagePartition &partition,
                            parent && parent->hasAttr("ta.auto_blockify_v1.loop")
                                ? "logical_program_loop"
                                : "physical_program_dispatch");
-    }
-
-    if (!target) {
-      switch (plan.domain) {
-      case PhaseBoundaryDomain::TriangularRecurrence:
-        if (phaseId == "head")
-          target = findStage(partition, "head_index_mask");
-        else if (phaseId == "diagonal_load")
-          target = findStage(partition, "load_diagonal_tiles");
-        else if (phaseId == "diagonal_inverse")
-          target = findStage(partition, "diagonal_inverse_recurrence");
-        else if (phaseId == "merge_store") {
-          if (operationTreeContainsName(root, "tt.store"))
-            mergeStoreReached = true;
-          target = findStage(partition, mergeStoreReached ? "store_inverse_tile"
-                                                          : "dense_dot_tail");
-        }
-        break;
-      case PhaseBoundaryDomain::LoadedIndexRowwiseReduction:
-        if (phaseId == "row_dispatch")
-          target = findStage(partition, "row_index_generation");
-        else if (phaseId == "row_load")
-          target = findStage(partition, "indirect_row_gather");
-        else if (phaseId == "row_reduction")
-          target = findStage(partition, "rowwise_reduction");
-        else if (phaseId == "convert_store")
-          target = findStage(partition, "conversion_pack_store");
-        break;
-      case PhaseBoundaryDomain::IndirectUnderfilledDot:
-        if (phaseId == "index_setup")
-          target = findStage(partition, "index_generation");
-        else if (phaseId == "gather_tiles")
-          target = findStage(partition, "indirect_tile_gather");
-        else if (phaseId == "dot")
-          target = findStage(partition, "tiny_cube_dot");
-        else if (phaseId == "output_store")
-          target = findStage(partition, "store_dot_result");
-        break;
-      }
+    } else {
+      // Semantic Stage id directly names the Stage; no domain-specific
+      // phaseId→stageId translation is needed.
+      target = findStage(partition, phaseId);
     }
     const int64_t ordinal = getStageOrdinal(partition, target);
     if (ordinal < 0)
@@ -1243,6 +1773,33 @@ static int64_t staticTensorBytes(llvm::ArrayRef<Value> values) {
   return total;
 }
 
+/// Pretty-print a Value for debugging: result number + type + bytes (if known).
+static std::string valueDebugString(Value value) {
+  std::string buf;
+  llvm::raw_string_ostream os(buf);
+  if (auto result = dyn_cast<OpResult>(value))
+    os << "%" << result.getResultNumber();
+  else if (auto arg = dyn_cast<BlockArgument>(value))
+    os << "%arg" << arg.getArgNumber();
+  else
+    os << "<unknown>";
+  os << " : " << value.getType();
+  const int64_t bytes = staticTensorBytes(value);
+  if (bytes > 0)
+    os << " (" << bytes << "B)";
+  os.flush();
+  return buf;
+}
+
+/// Print a list of values with their types and bytes, one per line, indented.
+static void dumpValueList(llvm::raw_ostream &os, llvm::ArrayRef<Value> values,
+                          llvm::StringRef label, int64_t totalBytes) {
+  os << "[COSTMODEL]       " << label << " (count=" << values.size()
+     << ", bytes=" << totalBytes << "):\n";
+  for (Value value : values)
+    os << "[COSTMODEL]         " << valueDebugString(value) << "\n";
+}
+
 /// Derive the exact SSA contract of every Stage from operation ownership.
 /// Values defined outside and consumed inside are live-ins; values defined
 /// inside and consumed by any operation outside are live-outs.
@@ -1269,6 +1826,18 @@ static void deriveStageLiveValues(StagePartition &partition) {
       stage.liveOuts.assign(liveOuts.begin(), liveOuts.end());
       stage.liveInBytes = staticTensorBytes(stage.liveIns);
       stage.liveOutBytes = staticTensorBytes(stage.liveOuts);
+
+      llvm::errs() << "[COSTMODEL]   deriveStageLiveValues: stage='"
+                   << stage.id << "' ops=" << stage.operations.size()
+                   << " owned=" << owned.size()
+                   << " liveIn=" << stage.liveIns.size()
+                   << " liveOut=" << stage.liveOuts.size()
+                   << " liveInBytes=" << stage.liveInBytes
+                   << " liveOutBytes=" << stage.liveOutBytes << "\n";
+      dumpValueList(llvm::errs(), stage.liveIns, "live-in",
+                    stage.liveInBytes);
+      dumpValueList(llvm::errs(), stage.liveOuts, "live-out",
+                    stage.liveOutBytes);
     }
   }
 }
@@ -1334,10 +1903,44 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
         }
 
         ++stage.localSimtScopeCount;
-        stage.scopeInputTensorBytes +=
-            staticTensorBytes(captured.getArrayRef());
-        stage.scopeOutputTensorBytes +=
-            staticTensorBytes(returned.getArrayRef());
+        const int64_t inputBytes = staticTensorBytes(captured.getArrayRef());
+        const int64_t outputBytes = staticTensorBytes(returned.getArrayRef());
+        stage.scopeInputTensorBytes += inputBytes;
+        stage.scopeOutputTensorBytes += outputBytes;
+
+        llvm::errs() << "[COSTMODEL]   deriveLocalSimtScopeTraffic: stage='"
+                     << stage.id << "' naturalAnchor #" << anchorIndex
+                     << " isRange=" << (isRange ? "true" : "false")
+                     << " inside=" << inside.size()
+                     << " captured=" << captured.size()
+                     << " returned=" << returned.size()
+                     << " inputBytes=" << inputBytes
+                     << " outputBytes=" << outputBytes << "\n";
+        dumpValueList(llvm::errs(), captured.getArrayRef(),
+                      "scope-captured (live-in)", inputBytes);
+        dumpValueList(llvm::errs(), returned.getArrayRef(),
+                      "scope-returned (live-out)", outputBytes);
+      }
+
+      // A stage with no natural anchors but with operations is materialized
+      // as one stage-level SIMT scope.  Its traffic is the stage's full
+      // live-in/live-out, already computed by deriveStageLiveValues.
+      if (stage.simtAnchorIndices.empty() &&
+          stage.localSimtMaterializable && !stage.operations.empty()) {
+        stage.localSimtScopeCount = 1;
+        stage.scopeInputTensorBytes = stage.liveInBytes;
+        stage.scopeOutputTensorBytes = stage.liveOutBytes;
+        llvm::errs() << "[COSTMODEL]   deriveLocalSimtScopeTraffic: stage='"
+                     << stage.id
+                     << "' WholeStageSimt scopeCount=1"
+                     << " scopeInputBytes=" << stage.scopeInputTensorBytes
+                     << " scopeOutputBytes=" << stage.scopeOutputTensorBytes
+                     << " (liveInBytes=" << stage.liveInBytes
+                     << " liveOutBytes=" << stage.liveOutBytes << ")\n";
+        dumpValueList(llvm::errs(), stage.liveIns,
+                      "scope-captured (live-in)", stage.liveInBytes);
+        dumpValueList(llvm::errs(), stage.liveOuts,
+                      "scope-returned (live-out)", stage.liveOutBytes);
       }
     }
   }
@@ -1477,43 +2080,23 @@ ProgramStructureAnalysis::analyze(ModuleOp module,
 llvm::Expected<std::optional<PhaseBoundaryPlan>>
 PhaseBoundaryAnalysis::analyze(const SimdSimtFeatureSummary &features,
                                const StagePartitionerOptions &options) const {
+  (void)options;
   llvm::errs() << "[COSTMODEL] --- PhaseBoundaryAnalysis::analyze START ---\n";
-  if (features.simtAnchors.triangularSolves.size() == 1 &&
-      features.simtAnchors.count > 0) {
-    PhaseBoundaryPlan plan{PhaseBoundaryDomain::TriangularRecurrence,
-                           "triangular_recurrence",
-                           features.simtAnchors.triangularSolves.front()};
-    llvm::errs() << "[COSTMODEL]   Domain=TriangularRecurrence (triangularSolves.size=1, anchors.count="
-                 << features.simtAnchors.count << ")\n";
-    return std::optional<PhaseBoundaryPlan>{std::move(plan)};
-  }
-  if (features.dotOps == 0 && features.reduceOps > 0 &&
-      features.loadedIndexDependentMemoryOps > 0 && features.loadOps > 0 &&
-      features.storeOps > 0) {
-    PhaseBoundaryPlan plan{PhaseBoundaryDomain::LoadedIndexRowwiseReduction,
-                           "loaded_index_rowwise_reduction", std::nullopt};
-    llvm::errs() << "[COSTMODEL]   Domain=LoadedIndexRowwiseReduction (dotOps=0, reduceOps="
-                 << features.reduceOps << ", loadedIndexDepMem=" << features.loadedIndexDependentMemoryOps << ")\n";
-    return std::optional<PhaseBoundaryPlan>{std::move(plan)};
-  }
-  if (features.dotOps > 0 && features.reduceOps == 0 &&
-      features.loadedIndexDependentMemoryOps > 0 &&
-      features.dotFlops <= options.tinyDotFlopsMax && features.loadOps > 0 &&
-      features.storeOps > 0) {
-    PhaseBoundaryPlan plan{PhaseBoundaryDomain::IndirectUnderfilledDot,
-                           "indirect_underfilled_dot", std::nullopt};
-    llvm::errs() << "[COSTMODEL]   Domain=IndirectUnderfilledDot (dotOps=" << features.dotOps
-                 << ", dotFlops=" << features.dotFlops
-                 << " <= tinyDotFlopsMax=" << options.tinyDotFlopsMax
-                 << ", loadedIndexDepMem=" << features.loadedIndexDependentMemoryOps << ")\n";
-    return std::optional<PhaseBoundaryPlan>{std::move(plan)};
-  }
-  llvm::errs() << "[COSTMODEL]   No matching domain (dotOps=" << features.dotOps
-               << " reduceOps=" << features.reduceOps
+  // Semantic-driven: no domain matching.  Every kernel receives a semantic
+  // Stage plan so that the costmodel is applicable without per-scenario
+  // domain templates.  The feature-summary overload has no operation graph,
+  // so Stage boundaries are synthesized from aggregate feature counts by
+  // partitionBySemantics.
+  PhaseBoundaryPlan plan;
+  plan.domainName = "semantic";
+  llvm::errs() << "[COSTMODEL]   Semantic plan (no domain matching): dotOps="
+               << features.dotOps << " reduceOps=" << features.reduceOps
                << " loadedIndexDepMem=" << features.loadedIndexDependentMemoryOps
-               << " dotFlops=" << features.dotFlops << ")\n";
-  llvm::errs() << "[COSTMODEL] --- PhaseBoundaryAnalysis::analyze END (no match) ---\n";
-  return std::optional<PhaseBoundaryPlan>{};
+               << " loadOps=" << features.loadOps
+               << " storeOps=" << features.storeOps
+               << " dotFlops=" << features.dotFlops << "\n";
+  llvm::errs() << "[COSTMODEL] --- PhaseBoundaryAnalysis::analyze END ---\n";
+  return std::optional<PhaseBoundaryPlan>{std::move(plan)};
 }
 
 llvm::Expected<std::optional<PhaseBoundaryPlan>>
@@ -1531,7 +2114,7 @@ PhaseBoundaryAnalysis::analyze(ModuleOp module,
     return structure.takeError();
   (*plan)->rootOperations = std::move(structure->rootOperations);
   (*plan)->localSimtAnchorRoots = std::move(structure->localSimtAnchorRoots);
-  if (llvm::Error error = assignRootPhaseIds(**plan))
+  if (llvm::Error error = assignRootStageIdsBySemantics(**plan))
     return std::move(error);
   return plan;
 }
@@ -1540,26 +2123,8 @@ llvm::Expected<StagePartition>
 StageBoundaryAnalysis::analyze(const PhaseBoundaryPlan &phasePlan,
                                const SimdSimtFeatureSummary &features,
                                const SimtAnchorPlan *anchorPlan) const {
-  StagePartition partition;
-  switch (phasePlan.domain) {
-  case PhaseBoundaryDomain::TriangularRecurrence:
-    if (!phasePlan.triangularSolve)
-      return llvm::createStringError(
-          std::errc::invalid_argument,
-          "triangular PhaseBoundaryPlan has no recurrence facts");
-    partition = partitionTriangular(features, *phasePlan.triangularSolve,
-                                    phasePlan.hasOperationGraph() ? &phasePlan
-                                                                  : nullptr);
-    break;
-  case PhaseBoundaryDomain::LoadedIndexRowwiseReduction:
-    partition = partitionRowwise(
-        features, phasePlan.hasOperationGraph() ? &phasePlan : nullptr);
-    break;
-  case PhaseBoundaryDomain::IndirectUnderfilledDot:
-    partition = partitionIndirectDot(
-        features, phasePlan.hasOperationGraph() ? &phasePlan : nullptr);
-    break;
-  }
+  StagePartition partition = partitionBySemantics(
+      features, phasePlan.hasOperationGraph() ? &phasePlan : nullptr);
   partition.domain = phasePlan.domainName;
   if (phasePlan.hasOperationGraph()) {
     if (llvm::Error error =
@@ -1567,6 +2132,7 @@ StageBoundaryAnalysis::analyze(const PhaseBoundaryPlan &phasePlan,
       return std::move(error);
     if (anchorPlan)
       attachExactAnchorOwnership(partition, *anchorPlan);
+    splitWholeStageSimtByMaterializationConstraints(partition);
     deriveStageLiveValues(partition);
     if (anchorPlan)
       deriveLocalSimtScopeTraffic(partition, *anchorPlan);
@@ -1958,7 +2524,8 @@ StagePartitionVerifier::verify(const StagePartition &partition,
             stage.id.c_str());
       if (stage.localSimtMaterializable &&
           partition.operationOwnershipComplete &&
-          stage.simtAnchorIndices.empty())
+          stage.simtAnchorIndices.empty() &&
+          stage.operations.empty())
         return llvm::createStringError(
             std::errc::invalid_argument,
             "materializable Stage '%s' has no exact SIMT anchor ownership",

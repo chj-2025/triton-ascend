@@ -18,6 +18,10 @@
 #include <string>
 #include <vector>
 
+namespace mlir {
+class Operation;
+} // namespace mlir
+
 namespace mlir::ascend {
 
 enum class StageMode { SIMD, SIMT };
@@ -154,6 +158,11 @@ struct LogicalStageCost {
   std::vector<unsigned> simtAnchorIndices;
   bool localSimtMaterializable = false;
   std::vector<int64_t> localSimtFactors;
+  /// Root operations owned by this Stage.  Populated from
+  /// ``LogicalStage::operations`` during cost evaluation so that the
+  /// materializer can wrap the entire stage in a SIMT scope when the route
+  /// solver selects SIMT for a stage that has no natural SIMT anchor.
+  std::vector<mlir::Operation *> stageScopeOperations;
   std::vector<StageImplementationCost> implementations;
 
   llvm::json::Object toJSON() const;

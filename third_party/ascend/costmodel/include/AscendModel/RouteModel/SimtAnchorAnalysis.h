@@ -32,6 +32,12 @@ enum class SimtAnchorKind {
   PlainOneDimensionalCumsum,
   TensorAtomic,
   TriangularSolveLoop,
+  /// Synthetic anchor that wraps the entire body of a stage in one SIMT scope.
+  /// Used when a stage has no natural SIMT anchor op but the route solver
+  /// selects SIMT for it (e.g., a scalar-only stage that benefits from SIMT
+  /// execution).  The materializer wraps every operation in
+  /// ``scopeOperations`` inside one ``scope.scope { vector_mode="simt" }``.
+  WholeStageSimt,
 };
 
 llvm::StringRef stringifySimtAnchorKind(SimtAnchorKind kind);
@@ -150,6 +156,28 @@ std::optional<SimtAnchorKind> classifyMixedSimtAnchor(Operation *op);
 /// loaded/gathered index.  This is a real data-dependence test and must not be
 /// confused with the legacy rank-based laneDependentPointerOps proxy.
 bool isLoadedIndexDependentMemoryOp(Operation *op);
+
+/// True when `op` would trigger a memory-allocation/allocation-like side
+/// effect if placed inside a SIMT scope.
+///
+/// In mix mode, memory allocation is centralized on the SIMD side; SIMT scopes
+/// must only consume memory already allocated by SIMD.  Operations that
+/// produce fresh tensor values (e.g. ``tt.load`` yielding a new tensor, or
+/// explicit allocation ops) must therefore stay outside any SIMT scope.
+///
+/// This predicate is consulted by the ``WholeStageSimt`` synthetic anchor
+/// builder so that the materializer never wraps an allocating operation.
+bool isMemoryAllocatingOp(Operation *op);
+
+/// True when `op` produces a result that downstream passes cannot see through
+/// when it becomes a ``scope.scope`` return value.
+///
+/// ``scope.scope`` results are not understood by ``OffsetAnalysis`` — if a
+/// result is a tensor of triton pointers, the analysis cannot recover the
+/// pointer offset info and trips an assertion.  To keep costmodel
+/// self-contained, we exclude such ops from ``WholeStageSimt`` synthetic
+/// scopes: they stay in SIMD and their results dominate the following scope.
+bool producesScopeOpaqueValue(Operation *op);
 
 /// Build the non-overlapping shared plan in pre-order.
 SimtAnchorPlan buildMixedSimtAnchorPlan(ModuleOp module, bool compileOn91095);

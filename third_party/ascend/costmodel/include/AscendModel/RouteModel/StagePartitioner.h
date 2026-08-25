@@ -21,18 +21,11 @@ struct StagePartitionerOptions {
   bool scopeSuperblockMaterializable = false;
 };
 
-enum class PhaseBoundaryDomain {
-  TriangularRecurrence,
-  LoadedIndexRowwiseReduction,
-  IndirectUnderfilledDot,
-};
-
 /// Result of PhaseBoundaryAnalysis.  This is structural boundary evidence,
-/// not a route or a cost-model decision.
+/// not a route or a cost-model decision.  Stage boundaries are derived purely
+/// from operation semantics, independent of any business-scenario domain.
 struct PhaseBoundaryPlan {
-  PhaseBoundaryDomain domain;
-  std::string domainName;
-  std::optional<TriangularSolveFacts> triangularSolve;
+  std::string domainName = "semantic";
   /// Top-level semantic TTIR operations in execution order.  Nested region
   /// operations are owned transitively by their top-level root.
   std::vector<Operation *> rootOperations;
