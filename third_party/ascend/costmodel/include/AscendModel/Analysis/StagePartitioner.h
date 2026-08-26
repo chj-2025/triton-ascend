@@ -1,7 +1,7 @@
 //===- StagePartitioner.h - Build semantic Phase/Stage IR ----*- C++ -*-===//
 
-#ifndef ASCENDMODEL_ROUTEMODEL_STAGEPARTITIONER_H
-#define ASCENDMODEL_ROUTEMODEL_STAGEPARTITIONER_H
+#ifndef ASCENDMODEL_ANALYSIS_STAGEPARTITIONER_H
+#define ASCENDMODEL_ANALYSIS_STAGEPARTITIONER_H
 
 #include "AscendModel/RouteModel/SimdSimtCostModel.h"
 #include "AscendModel/RouteModel/StageCostModels.h"
@@ -69,10 +69,6 @@ public:
 class PhaseBoundaryAnalysis {
 public:
   llvm::Expected<std::optional<PhaseBoundaryPlan>>
-  analyze(const SimdSimtFeatureSummary &features,
-          const StagePartitionerOptions &options) const;
-
-  llvm::Expected<std::optional<PhaseBoundaryPlan>>
   analyze(ModuleOp module, const SimtAnchorPlan &anchorPlan,
           const SimdSimtFeatureSummary &features,
           const StagePartitionerOptions &options) const;
@@ -111,8 +107,6 @@ public:
 class StageWorkloadAnalysis {
 public:
   llvm::Error analyze(StagePartition &partition) const;
-  llvm::Error verify(const StagePartition &partition,
-                     const StageWorkload &kernelWorkload) const;
 };
 
 /// Derives legal SIMD/SIMT implementations from structural Stage facts.
@@ -125,8 +119,7 @@ public:
 
 class StagePartitionVerifier {
 public:
-  llvm::Error verify(const StagePartition &partition,
-                     const StageWorkload &kernelWorkload) const;
+  llvm::Error verify(const StagePartition &partition) const;
 };
 
 /// Partitions post-layout/post-AutoBlockify-V1 TTIR facts into serial Phases
@@ -135,24 +128,11 @@ public:
 class StagePartitioner {
 public:
   llvm::Expected<std::optional<StagePartition>>
-  partition(const SimdSimtFeatureSummary &features,
-            const StagePartitionerOptions &options) const;
-
-  llvm::Expected<std::optional<StagePartition>>
-  partition(const SimdSimtFeatureSummary &features,
-            const StagePartitionerOptions &options,
-            const SimtAnchorPlan &anchorPlan) const;
-
-  llvm::Expected<std::optional<StagePartition>>
   partition(ModuleOp module, const SimtAnchorPlan &anchorPlan,
             const SimdSimtFeatureSummary &features,
             const StagePartitionerOptions &options) const;
 };
 
-/// Builds the mode-independent kernel workload used only for ownership
-/// conservation checks.  It contains logical elements/bytes, never cycles.
-StageWorkload buildKernelStageWorkload(const SimdSimtFeatureSummary &features);
-
 } // namespace mlir::ascend
 
-#endif // ASCENDMODEL_ROUTEMODEL_STAGEPARTITIONER_H
+#endif // ASCENDMODEL_ANALYSIS_STAGEPARTITIONER_H

@@ -17,8 +17,6 @@
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
-#include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -48,7 +46,6 @@ enum class StageCostModelKind {
 };
 
 llvm::StringRef stringifyStageCostModel(StageCostModelKind kind);
-std::optional<StageCostModelKind> parseStageCostModel(llvm::StringRef name);
 
 struct StageControlFlowRates {
   double loopBackedgeCycles = 0.0;
@@ -61,7 +58,6 @@ struct StageControlFlowRates {
 
 struct LogicalStage {
   std::string id;
-  std::string description;
   StageCostModelKind costModelKind = StageCostModelKind::ScalarIssue;
   StageScheduleKind scheduleKind = StageScheduleKind::StraightLine;
   int64_t iterationCount = 1;
@@ -99,15 +95,11 @@ struct LogicalStage {
 
 struct LogicalPhase {
   std::string id;
-  std::string description;
   std::vector<LogicalStage> stages;
 };
 
 struct StagePartition {
   std::string domain;
-  /// "operation_graph" for exact post-transform TTIR ownership, otherwise
-  /// "feature_summary_fallback" for the temporary aggregate implementation.
-  std::string boundarySource = "feature_summary_fallback";
   bool operationOwnershipComplete = false;
   int64_t modeledOperationCount = 0;
   std::vector<LogicalPhase> phases;
@@ -170,67 +162,10 @@ struct HardwareProfile {
   bool isValid() const;
 };
 
-class ProfileProvider {
-public:
-  explicit ProfileProvider(HardwareProfile profile);
-
-  llvm::Expected<const HardwareProfile *>
-  getSnapshot(llvm::StringRef target, llvm::StringRef profileVersion) const;
-
-private:
-  HardwareProfile profile;
-};
-
-struct StageCostModelContext {
-  const LogicalStage &stage;
-  const HardwareProfile &profile;
-};
-
-class StageCostModel {
-public:
-  virtual ~StageCostModel() = default;
-  virtual StageMode getMode() const = 0;
-  virtual llvm::StringRef getName() const = 0;
-  virtual bool supports(StageCostModelKind kind) const = 0;
-  virtual double estimate(const StageCostModelContext &context,
-                          const StageImplementation &implementation,
-                          const StageResourceCycles &resources) const = 0;
-};
-
-class SIMDStageCostModel : public StageCostModel {
-public:
-  StageMode getMode() const final { return StageMode::SIMD; }
-};
-
-class SIMTStageCostModel : public StageCostModel {
-public:
-  StageMode getMode() const final { return StageMode::SIMT; }
-};
-
-class StageCostModelRegistry {
-public:
-  static const StageCostModelRegistry &get();
-
-  llvm::Expected<const StageCostModel *> lookup(StageMode mode,
-                                                StageCostModelKind kind) const;
-  llvm::Error verifyComplete() const;
-
-private:
-  StageCostModelRegistry();
-  std::vector<std::unique_ptr<StageCostModel>> models;
-};
-
 class StageCostEvaluator {
 public:
-  explicit StageCostEvaluator(
-      const StageCostModelRegistry &registry = StageCostModelRegistry::get())
-      : registry(registry) {}
-
   llvm::Expected<StageCostTable> evaluate(const StagePartition &partition,
                                           const HardwareProfile &profile) const;
-
-private:
-  const StageCostModelRegistry &registry;
 };
 
 } // namespace mlir::ascend

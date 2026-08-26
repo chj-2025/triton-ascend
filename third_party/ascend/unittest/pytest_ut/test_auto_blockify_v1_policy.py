@@ -23,10 +23,18 @@ from unittest.mock import patch
 
 import pytest
 
-from triton.backends.ascend.compiler import _resolve_auto_blockify_v1_policy
+from triton.backends.ascend.compiler import (
+    _build_costmodel_analysis_ttir,
+    _can_materialize_scope_superblock,
+    _publish_route_transform_capability,
+    _resolve_auto_blockify_v1_policy,
+    _selected_npuir_superblock_factor,
+)
 
 SAFE_TTIR = "module { tt.func public @safe() { tt.return } }"
 ATOMIC_TTIR = "module { tt.func public @atomic() { %0 = tt.atomic_rmw add } }"
+CACHE_MODIFIER_TTIR = (
+    'module { tt.func public @cached() { tt.store %ptr, %value {cacheModifier = 1 : i32} : tensor<8x!tt.ptr<f16>> } }')
 
 
 @pytest.mark.parametrize(
@@ -62,3 +70,89 @@ def test_auto_blockify_v1_explicit_blacklist_override_is_preserved():
     opt = SimpleNamespace(enable_auto_blockify=True)
     with patch("triton.backends.ascend.compiler._is_auto_map_parallel_blocks_enabled", return_value=False):
         assert _resolve_auto_blockify_v1_policy(ATOMIC_TTIR, metadata, opt)
+
+
+def test_cache_modifier_does_not_disable_auto_blockify_v1():
+    metadata = {}
+    opt = SimpleNamespace(enable_auto_blockify=True)
+    with patch("triton.backends.ascend.compiler._is_auto_map_parallel_blocks_enabled", return_value=False):
+        assert _resolve_auto_blockify_v1_policy(CACHE_MODIFIER_TTIR, metadata, opt)
+    assert not metadata["has_auto_blockify_blacklist_op"]
+
+
+def test_route_transform_capability_is_single_resolved_fact():
+    metadata = {
+        "ttir_layout_merge_applied": True,
+        "ttir_layout_coalesce_factor": 8,
+        "ttir_layout_coalesce_axis": 0,
+        "auto_blockify_v1_requested": True,
+        "auto_blockify_v1_enabled": True,
+        "auto_blockify_v1_disable_reasons": [],
+    }
+    opt = SimpleNamespace(compile_on_910_95=True, num_warps=4, logical_program_count_hint=9)
+    capability = __import__("json").loads(_publish_route_transform_capability(metadata, opt))
+    assert capability["row_coalescing_applied"]
+    assert capability["row_coalescing_factor"] == 8
+    assert capability["auto_blockify_v1_materializable"]
+    assert capability["whole_kernel_superblock_factors"] == [1, 2, 4]
+    assert capability["scope_superblock_factors"] == [1, 2, 4]
+    assert capability["logical_program_count_hint"] == 9
+    assert capability["superblock_runtime_groups"]["4"] == {
+        "full_group_count": 2,
+        "tail_count": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "compile_on_910_95,num_warps,v1_materializable,expected",
+    [
+        (True, 1, True, True),
+        (True, 4, True, True),
+        (True, 4, False, False),
+        (False, 4, True, False),
+        (True, 0, True, False),
+    ],
+)
+def test_scope_superblock_uses_npuir_abi_v2(compile_on_910_95, num_warps, v1_materializable, expected):
+    opt = SimpleNamespace(compile_on_910_95=compile_on_910_95, num_warps=num_warps)
+    assert _can_materialize_scope_superblock({}, opt, v1_materializable) is expected
+
+
+@pytest.mark.parametrize(
+    "metadata,option_factor,expected",
+    [
+        ({}, 2, 2),
+        ({"auto_simt_scope_superblock_factor": 1}, 4, 4),
+        ({
+            "auto_simt_effective_kind": "mixed_simd_simt",
+            "auto_simt_scope_superblock_factor": 2,
+        }, 4, 1),
+        ({
+            "compile_mode": "simd_simt",
+            "auto_simt_scope_superblock_factor": 4,
+        }, 4, 1),
+        ({
+            "auto_simt_effective_kind": "all_simt_only",
+            "auto_simt_superblock_factor": 4,
+        }, 2, 4),
+    ],
+)
+def test_selected_npuir_superblock_factor_respects_route_owner(metadata, option_factor, expected):
+    opt = SimpleNamespace(superblock_factor=option_factor)
+    assert _selected_npuir_superblock_factor(metadata, opt) == expected
+
+
+def test_costmodel_analysis_view_materializes_v1_only_on_clone():
+    metadata = {"auto_blockify_v1_enabled": True}
+    original = SimpleNamespace(context=object())
+    analysis = SimpleNamespace()
+    with patch("triton.backends.ascend.compiler._parse_ttir_text", return_value=analysis) as parse, \
+         patch("triton.backends.ascend.compiler._run_ta_simt_auto_blockify_v1", return_value=True) as run_v1:
+        result = _build_costmodel_analysis_ttir(original, metadata, SimpleNamespace())
+    parse.assert_called_once()
+    run_v1.assert_called_once()
+    assert run_v1.call_args.args[0] is analysis
+    assert run_v1.call_args.kwargs["super_block_factor"] == 1
+    assert metadata["auto_simt_costmodel_analysis_v1_materialized"]
+    assert metadata["auto_simt_costmodel_analysis_ir"] == "post_auto_blockify_v1_f1_ttir"
+    assert result == str(analysis)

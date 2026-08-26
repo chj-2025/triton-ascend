@@ -12,10 +12,8 @@ add_triton_library(TritonToLinalg
         StridedLoadStoreRewrite.cpp
         StridedAxisCoalescing.cpp
         TileChunkCoalescing.cpp
-        RowCoalescing.cpp
         DescriptorConverter.cpp
         MarkTensorKindPass.cpp
-        TTIRLayoutMergePass.cpp
         DevicePrintOffsetRewrite.cpp
 
   DEPENDS

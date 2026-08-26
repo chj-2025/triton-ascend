@@ -20,8 +20,8 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_ASCEND_ROW_COALESCING_H
-#define TRITON_ASCEND_ROW_COALESCING_H
+#ifndef TRITON_ASCEND_TTIR_LAYOUT_MERGE_ROW_COALESCING_H
+#define TRITON_ASCEND_TTIR_LAYOUT_MERGE_ROW_COALESCING_H
 
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -52,4 +52,4 @@ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createRowCoalescingPass();
 
 } // namespace RowCoalescing
 
-#endif // TRITON_ASCEND_ROW_COALESCING_H
+#endif // TRITON_ASCEND_TTIR_LAYOUT_MERGE_ROW_COALESCING_H

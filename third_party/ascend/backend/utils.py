@@ -50,16 +50,15 @@ def is_compile_on_910_95():
     return _is_compile_on_910_95
 
 
+# Cache/eviction modifiers are deliberately not blacklist reasons.  V1 only
+# changes logical-program scheduling and both the TTIR row lift and V1 cloning
+# preserve those attributes on the rebuilt load/store operations.
 AUTO_BLOCKIFY_BLACKLIST_RULES = (
     (re.compile(r"\btt\.atomic_(?:rmw|cas)\b"), "atomic operations"),
     (re.compile(r"\btt\.elementwise_inline_asm\b"), "inline elementwise assembly"),
     (
         re.compile(r"\btt\.load\b[^\n]*\bisVolatile\s*=\s*true\b"),
         "loads with volatile",
-    ),
-    (
-        re.compile(r"\btt\.(?:load|store)\b[^\n]*\bcacheModifier\s*="),
-        "loads or stores with cache modifiers",
     ),
 )
 
