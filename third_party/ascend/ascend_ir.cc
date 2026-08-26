@@ -29,7 +29,7 @@
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
-#include "AscendModel/RouteModel/SimtSelection.h"
+#include "AscendModel/Transforms/SimtSelection.h"
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
@@ -624,6 +624,26 @@ void init_ascend_ir(py::module &&m) {
         });
   m.def("remove_attr",
         [](OpState &op, std::string &name) -> void { op->removeAttr(name); });
+
+  m.def("set_simt_scope_superblock_factor",
+        [](OpState &root, int64_t factor) -> int64_t {
+          if (factor != 1 && factor != 2 && factor != 4)
+            throw std::invalid_argument(
+                "SIMT scope SuperBlock factor must be 1, 2 or 4");
+          int64_t updated = 0;
+          root->walk([&](Operation *op) {
+            if (op->getName().getStringRef() != "scope.scope")
+              return;
+            auto mode = op->getAttrOfType<StringAttr>("vector_mode");
+            if (!mode || mode.getValue() != "simt")
+              return;
+            OpBuilder builder(op->getContext());
+            op->setAttr("ascend.scope_superblock.factor",
+                        builder.getI64IntegerAttr(factor));
+            ++updated;
+          });
+          return updated;
+        });
 
   m.def("clear_simd_simt_costmodel_attrs", [](OpState &op) {
     for (llvm::StringRef name : {

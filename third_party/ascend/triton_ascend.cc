@@ -13,6 +13,7 @@
 #include "ascend/include/AutoBlockifyV1/Passes.h"
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
+#include "ascend/include/TTIRLayoutMerge/Passes.h"
 #include "ascend/include/TritonControlFlowOpt/Passes.h"
 #include "ascend/include/TritonToAnnotation/Passes.h"
 #include "ascend/include/TritonToHFusion/Passes.h"
@@ -100,7 +101,10 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
          const std::string &profilePath, const std::string &actualTarget,
          int64_t numWarps, bool compileOn91095,
          bool wholeKernelSuperblockMaterializable,
-         bool scopeSuperblockMaterializable, const std::string &reportFile) {
+         bool scopeSuperblockMaterializable, int64_t logicalProgramCountHint,
+         const std::string &analysisModulePath,
+         const std::string &routeTransformCapabilityJSON,
+         const std::string &reportFile) {
         mlir::ascend::SelectSimdSimtCostModelPassOptions opts;
         opts.mode = mode;
         opts.profilePath = profilePath;
@@ -110,6 +114,9 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
         opts.wholeKernelSuperblockMaterializable =
             wholeKernelSuperblockMaterializable;
         opts.scopeSuperblockMaterializable = scopeSuperblockMaterializable;
+        opts.logicalProgramCountHint = logicalProgramCountHint;
+        opts.analysisModulePath = analysisModulePath;
+        opts.routeTransformCapabilityJSON = routeTransformCapabilityJSON;
         opts.reportFile = reportFile;
         pm.addPass(mlir::ascend::createSelectSimdSimtCostModelPass(opts));
       },
@@ -118,6 +125,9 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("compile_on_910_95"),
       py::arg("whole_kernel_superblock_materializable") = false,
       py::arg("scope_superblock_materializable") = false,
+      py::arg("logical_program_count_hint") = 0,
+      py::arg("analysis_module_path") = "",
+      py::arg("route_transform_capability_json") = "{}",
       py::arg("report_file") = "");
 
   m.def("add_materialize_simt_scopes", [](mlir::PassManager &pm) {
@@ -453,27 +463,16 @@ runAscendCostModelInProcess(const std::string &mlirText,
   return os.str();
 }
 
-static std::string runHIVMCostModelInProcess(
-    const std::string &mlirText, const std::string &hardwareConfigPath,
-    const std::string &scheduler, const std::string &argBindings = "",
-    bool feedbackJSON = false) {
+static std::string
+runHIVMCostModelInProcess(const std::string &mlirText,
+                          const std::string &hardwareConfigPath,
+                          const std::string &argBindings = "") {
   std::string loadError;
   auto config = mlir::ascend::loadHardwareConfigForAnalysis(hardwareConfigPath,
                                                             loadError);
   if (!config)
     throw std::runtime_error("failed to load HIVM hardware config: " +
                              loadError);
-
-  mlir::ascend::HIVMSchedulerMode mode;
-  if (scheduler.empty() || scheduler == "static")
-    mode = mlir::ascend::HIVMSchedulerMode::Static;
-  else if (scheduler == "des")
-    mode = mlir::ascend::HIVMSchedulerMode::DES;
-  else
-    throw std::runtime_error(
-        "invalid HIVM scheduler; expected 'static' or 'des'");
-  if (feedbackJSON && mode != mlir::ascend::HIVMSchedulerMode::DES)
-    throw std::runtime_error("HIVM feedback JSON requires the 'des' scheduler");
 
   int fd = -1;
   llvm::SmallString<128> path;
@@ -486,22 +485,16 @@ static std::string runHIVMCostModelInProcess(
     os << mlirText;
   }
 
-  mlir::ascend::HIVMAnalyzer analyzer(*config, argBindings, mode);
+  mlir::ascend::HIVMAnalyzer analyzer(*config, argBindings);
   mlir::ascend::HIVMAnalysisReport report;
   std::string error;
   bool ok = analyzer.analyzeFile(path, report, error);
   llvm::sys::fs::remove(path);
   if (!ok)
     throw std::runtime_error("in-process HIVM analysis failed: " + error);
-  if (feedbackJSON)
-    report.sourcePath = "<in-memory-module>";
-
   std::string result;
   llvm::raw_string_ostream os(result);
-  if (feedbackJSON)
-    report.emitFeedbackJSON(os, *config);
-  else
-    report.print(os, *config);
+  report.print(os, *config);
   return os.str();
 }
 #endif
@@ -537,23 +530,13 @@ void init_triton_ascend(py::module &&m) {
   m.def(
       "run_hivm_costmodel_inproc",
       [](const std::string &mlirText, const std::string &hardwareConfigPath,
-         const std::string &scheduler) {
+         const std::string &argBindings) {
         py::gil_scoped_release release;
         return runHIVMCostModelInProcess(mlirText, hardwareConfigPath,
-                                         scheduler);
+                                         argBindings);
       },
       py::arg("mlir_text"), py::arg("hardware_config"),
-      py::arg("scheduler") = "des");
-  m.def(
-      "run_hivm_costmodel_feedback_inproc",
-      [](const std::string &mlirText, const std::string &hardwareConfigPath,
-         const std::string &scheduler, const std::string &argBindings) {
-        py::gil_scoped_release release;
-        return runHIVMCostModelInProcess(mlirText, hardwareConfigPath,
-                                         scheduler, argBindings, true);
-      },
-      py::arg("mlir_text"), py::arg("hardware_config"),
-      py::arg("scheduler") = "des", py::arg("arg_bindings") = "");
+      py::arg("arg_bindings") = "");
 #else
   m.def(
       "run_costmodel_inproc",
@@ -571,17 +554,7 @@ void init_triton_ascend(py::module &&m) {
         return std::string();
       },
       py::arg("mlir_text"), py::arg("hardware_config"),
-      py::arg("scheduler") = "des");
-  m.def(
-      "run_hivm_costmodel_feedback_inproc",
-      [](const std::string &, const std::string &, const std::string &,
-         const std::string &) {
-        throw std::runtime_error(
-            "in-process costmodel bridge is not enabled in this build");
-        return std::string();
-      },
-      py::arg("mlir_text"), py::arg("hardware_config"),
-      py::arg("scheduler") = "des", py::arg("arg_bindings") = "");
+      py::arg("arg_bindings") = "");
 #endif
 
   // Initialize ascend IR bindings (ascendnpu_ir_builder, scope/hivm dialects)

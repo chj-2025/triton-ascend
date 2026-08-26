@@ -4,7 +4,7 @@ This directory is the canonical source for target-specific Cost Model data.
 
 - `microbench/` contains model-neutral hardware measurements shared by the
   absolute/autotune model and the SIMD/SIMT Route Model.
-- `simd_simt/` contains Route Model policy, calibration, schema, and DES
+- `simd_simt/` contains Route Model policy, calibration, and schema
   feedback data.
 
 Python packaging copies these files to

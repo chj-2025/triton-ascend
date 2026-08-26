@@ -1,6 +1,6 @@
 //===- SimtAnchorAnalysis.cpp - Materializable SIMT anchors --------------===//
 
-#include "AscendModel/RouteModel/SimtAnchorAnalysis.h"
+#include "AscendModel/Analysis/SimtAnchorAnalysis.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -42,7 +42,12 @@ static std::string getScalarTypeName(Type type) {
   return "unknown";
 }
 
-static std::optional<PlainCumsumFacts>
+struct PlainCumsumLegality {
+  int64_t axisExtent;
+  std::string elementType;
+};
+
+static std::optional<PlainCumsumLegality>
 analyzePlainOneDimensionalCumsum(Operation *op) {
   if (!op || op->getName().getStringRef() != "tt.scan" ||
       op->getNumOperands() != 1 || op->getNumResults() != 1)
@@ -80,12 +85,8 @@ analyzePlainOneDimensionalCumsum(Operation *op) {
       terminator->getName().getStringRef() != "tt.scan.return")
     return std::nullopt;
 
-  PlainCumsumFacts facts;
-  facts.axisExtent = sourceType.getShape()[axisValue];
-  facts.elementType = getScalarTypeName(sourceType.getElementType());
-  if (auto reverse = op->getAttrOfType<BoolAttr>("reverse"))
-    facts.reverse = reverse.getValue();
-  return facts;
+  return PlainCumsumLegality{sourceType.getShape()[axisValue],
+                             getScalarTypeName(sourceType.getElementType())};
 }
 
 static bool hasTensorPointerOperand(Operation *op) {
@@ -146,31 +147,6 @@ static Value findPointerOffset(Value pointer) {
     llvm::append_range(worklist, producer->getOperands());
   }
   return {};
-}
-
-static std::optional<double> getStaticMaskActiveFraction(Value mask) {
-  if (!mask)
-    return std::nullopt;
-  Operation *producer = mask.getDefiningOp();
-  if (!producer)
-    return std::nullopt;
-  if (producer->getName().getStringRef() == "arith.constant") {
-    Attribute value = producer->getAttr("value");
-    if (auto dense = dyn_cast_or_null<DenseElementsAttr>(value)) {
-      if (!dense.getElementType().isInteger(1) || dense.getNumElements() == 0)
-        return std::nullopt;
-      int64_t active = 0;
-      for (bool item : dense.getValues<bool>())
-        active += item;
-      return static_cast<double>(active) / dense.getNumElements();
-    }
-    if (auto integer = dyn_cast_or_null<IntegerAttr>(value))
-      return integer.getValue().isZero() ? 0.0 : 1.0;
-  }
-  if (producer->getName().getStringRef() == "tt.splat" &&
-      producer->getNumOperands() == 1)
-    return getStaticMaskActiveFraction(producer->getOperand(0));
-  return std::nullopt;
 }
 
 static std::string getAtomicOperation(Operation *op) {
@@ -488,14 +464,6 @@ collectTriangularSolveScopeOperations(Operation *anchor,
   return result;
 }
 
-static CandidateLowerability
-simpleMixedLowerability(llvm::StringRef allSimtReason) {
-  CandidateLowerability result;
-  result.allSimtOnly = CandidateLoweringStatus::BackendConditional;
-  result.allSimtOnlyReasons.push_back(allSimtReason.str());
-  return result;
-}
-
 static std::optional<SimtAnchorDescriptor> analyzeAnchor(Operation *op,
                                                          bool compileOn91095) {
   if (!op)
@@ -506,149 +474,75 @@ static std::optional<SimtAnchorDescriptor> analyzeAnchor(Operation *op,
 
   if (name == "tt.gather") {
     descriptor.kind = SimtAnchorKind::DirectGather;
-    descriptor.lowerability = simpleMixedLowerability(
-        "whole_module_pure_simt_requires_backend_check");
   } else if (name == "tt.histogram") {
     descriptor.kind = SimtAnchorKind::Histogram;
-    HistogramFacts facts;
     auto input = op->getNumOperands() > 0
                      ? dyn_cast<RankedTensorType>(op->getOperand(0).getType())
                      : RankedTensorType();
     auto result = op->getNumResults() > 0
                       ? dyn_cast<RankedTensorType>(op->getResult(0).getType())
                       : RankedTensorType();
-    facts.inputElements = getStaticNumElements(input);
-    facts.numBins = result && result.hasStaticShape() && result.getRank() == 1
-                        ? result.getShape()[0]
-                        : 0;
-    facts.inputType = input ? getScalarTypeName(input) : "unknown";
-    facts.resultType = result ? getScalarTypeName(result) : "unknown";
-    descriptor.facts = facts;
-    descriptor.lowerability.allSimd = CandidateLoweringStatus::Unsupported;
-    descriptor.lowerability.allSimdReasons.push_back(
-        "ascend950_plain_histogram_aliases_backend_mixed_template");
-    descriptor.lowerability.allSimtOnly = CandidateLoweringStatus::Unsupported;
-    descriptor.lowerability.allSimtOnlyReasons.push_back(
-        "tt.histogram_not_legalized_by_pure_simt_pipeline");
+    const int64_t inputElements = getStaticNumElements(input);
+    const int64_t numBins =
+        result && result.hasStaticShape() && result.getRank() == 1
+            ? result.getShape()[0]
+            : 0;
+    const std::string inputType = input ? getScalarTypeName(input) : "unknown";
+    const std::string resultType =
+        result ? getScalarTypeName(result) : "unknown";
+    descriptor.lowerability.allSimd = false;
+    descriptor.lowerability.allSimtOnly = false;
     bool supported = input && result && input.hasStaticShape() &&
                      result.hasStaticShape() && input.getRank() == 1 &&
                      result.getRank() == 1 &&
-                     (facts.inputType == "i8" || facts.inputType == "i16" ||
-                      facts.inputType == "i32" || facts.inputType == "i64") &&
-                     facts.resultType == "i32" && facts.inputElements > 0 &&
-                     facts.numBins > 0;
-    if (!supported) {
-      descriptor.lowerability.mixed = CandidateLoweringStatus::Unsupported;
-      descriptor.lowerability.mixedReasons.push_back(
-          "histogram_requires_static_rank1_integer_input_and_rank1_i32_bins");
-    }
+                     (inputType == "i8" || inputType == "i16" ||
+                      inputType == "i32" || inputType == "i64") &&
+                     resultType == "i32" && inputElements > 0 && numBins > 0;
+    if (!supported)
+      descriptor.lowerability.mixed = false;
   } else if (name == "tt.scan") {
     auto facts = analyzePlainOneDimensionalCumsum(op);
     if (!facts)
       return std::nullopt;
     descriptor.kind = SimtAnchorKind::PlainOneDimensionalCumsum;
-    descriptor.facts = *facts;
-    descriptor.lowerability.allSimd = CandidateLoweringStatus::AliasesMixed;
-    descriptor.lowerability.allSimdReasons.push_back(
-        "ascend950_plain_1d_cumsum_symbol_is_simt_template");
-    descriptor.lowerability.allSimtOnly =
-        CandidateLoweringStatus::BackendConditional;
-    descriptor.lowerability.allSimtOnlyReasons.push_back(
-        "pure_simt_cumsum_requires_whole_module_backend_check");
-    if (facts->axisExtent <= 0 || !isSupportedCumsumType(facts->elementType)) {
-      descriptor.lowerability.mixed = CandidateLoweringStatus::Unsupported;
-      descriptor.lowerability.mixedReasons.push_back(
-          "plain_1d_cumsum_dtype_or_axis_extent_not_supported");
-    } else if (facts->axisExtent <= 64) {
-      descriptor.lowerability.mixedReasons.push_back(
-          "template_uses_small_register_path_without_simt_async_invoke");
-    }
+    descriptor.lowerability.allSimd = false;
+    if (facts->axisExtent <= 0 || !isSupportedCumsumType(facts->elementType))
+      descriptor.lowerability.mixed = false;
   } else if (name == "tt.atomic_rmw" || name == "tt.atomic_cas") {
     descriptor.kind = SimtAnchorKind::TensorAtomic;
-    TensorAtomicFacts facts;
     auto result = op->getNumResults() > 0
                       ? dyn_cast<RankedTensorType>(op->getResult(0).getType())
                       : RankedTensorType();
-    facts.updateElements = getStaticNumElements(result);
-    facts.valueType = result ? getScalarTypeName(result) : "unknown";
-    facts.operation = getAtomicOperation(op);
+    const int64_t updateElements = getStaticNumElements(result);
+    const std::string valueType =
+        result ? getScalarTypeName(result) : "unknown";
+    const std::string operation = getAtomicOperation(op);
+    std::string offsetType = "unknown";
     if (op->getNumOperands() > 0) {
-      if (auto pointer =
-              dyn_cast<RankedTensorType>(op->getOperand(0).getType())) {
-        facts.addressRank = pointer.getRank();
-        facts.addressIsLaneVarying = getStaticNumElements(pointer) > 1;
-      }
       Value offset = findPointerOffset(op->getOperand(0));
-      if (offset) {
-        facts.offsetType = getScalarTypeName(offset.getType());
-        if (auto offsetTensor = dyn_cast<RankedTensorType>(offset.getType()))
-          facts.addressIsLaneVarying |= getStaticNumElements(offsetTensor) > 1;
-      }
-      facts.addressDependsOnLoadedIndex = pointerDependsOnLoadedIndex(op);
+      if (offset)
+        offsetType = getScalarTypeName(offset.getType());
     }
-    facts.hasMask = name == "tt.atomic_rmw" && op->getNumOperands() >= 3;
-    if (facts.hasMask)
-      facts.staticMaskActiveFraction =
-          getStaticMaskActiveFraction(op->getOperand(2));
-    facts.resultUsed = op->getNumResults() > 0 && !op->getResult(0).use_empty();
-    facts.contention = "unknown";
-    descriptor.facts = facts;
-    descriptor.lowerability =
-        simpleMixedLowerability("pure_simt_atomic_requires_backend_check");
-
-    bool supported = result && result.hasStaticShape() &&
-                     facts.updateElements > 0 &&
-                     isSupportedAtomicType(facts.valueType, facts.operation) &&
-                     (facts.offsetType == "i32" || facts.offsetType == "i64");
-    if (facts.resultUsed &&
-        (facts.valueType == "f16" || facts.valueType == "bf16")) {
+    bool supported = result && result.hasStaticShape() && updateElements > 0 &&
+                     isSupportedAtomicType(valueType, operation) &&
+                     (offsetType == "i32" || offsetType == "i64");
+    const bool resultUsed =
+        op->getNumResults() > 0 && !op->getResult(0).use_empty();
+    if (resultUsed && (valueType == "f16" || valueType == "bf16"))
       supported = false;
-      descriptor.lowerability.mixedReasons.push_back(
-          "f16_bf16_atomic_old_value_semantics_require_validation");
-    }
-    if (!supported) {
-      descriptor.lowerability.mixed = CandidateLoweringStatus::Unsupported;
-      descriptor.lowerability.mixedReasons.push_back(
-          "atomic_shape_dtype_operation_or_offset_not_supported");
-    }
+    if (!supported)
+      descriptor.lowerability.mixed = false;
   } else if (isTriangularSolveLoop(op)) {
     descriptor.kind = SimtAnchorKind::TriangularSolveLoop;
-    descriptor.facts = analyzeTriangularSolveFacts(op);
-    descriptor.lowerability = simpleMixedLowerability(
-        "pure_simt_triangular_solve_requires_cube_tail_partition");
-    descriptor.lowerability.mixedReasons.push_back(
-        "manual_scope_shape_vector16_masked_reduce_loop");
+    descriptor.triangularSolve = analyzeTriangularSolveFacts(op);
   } else if (isLoadedIndexDependentMemoryOp(op)) {
     descriptor.kind = SimtAnchorKind::LoadedIndexDependentMemory;
-    descriptor.lowerability = simpleMixedLowerability(
-        "whole_module_pure_simt_requires_backend_check");
   } else {
     return std::nullopt;
   }
 
-  descriptor.materializable =
-      compileOn91095 &&
-      descriptor.lowerability.mixed == CandidateLoweringStatus::Native;
+  descriptor.materializable = compileOn91095 && descriptor.lowerability.mixed;
   return descriptor;
-}
-
-static CandidateLoweringStatus
-combineWholeKernelStatus(CandidateLoweringStatus lhs,
-                         CandidateLoweringStatus rhs) {
-  auto rank = [](CandidateLoweringStatus status) {
-    switch (status) {
-    case CandidateLoweringStatus::Native:
-      return 0;
-    case CandidateLoweringStatus::BackendConditional:
-      return 1;
-    case CandidateLoweringStatus::AliasesMixed:
-      return 2;
-    case CandidateLoweringStatus::Unsupported:
-      return 3;
-    }
-    llvm_unreachable("unknown lowering status");
-  };
-  return rank(lhs) >= rank(rhs) ? lhs : rhs;
 }
 
 } // namespace
@@ -671,21 +565,6 @@ llvm::StringRef mlir::ascend::stringifySimtAnchorKind(SimtAnchorKind kind) {
   llvm_unreachable("unknown SIMT anchor kind");
 }
 
-llvm::StringRef
-mlir::ascend::stringifyCandidateLoweringStatus(CandidateLoweringStatus status) {
-  switch (status) {
-  case CandidateLoweringStatus::Unsupported:
-    return "unsupported";
-  case CandidateLoweringStatus::Native:
-    return "native";
-  case CandidateLoweringStatus::BackendConditional:
-    return "backend_conditional";
-  case CandidateLoweringStatus::AliasesMixed:
-    return "aliases_mixed";
-  }
-  llvm_unreachable("unknown candidate lowering status");
-}
-
 llvm::SmallVector<Operation *> SimtAnchorPlan::materializableRoots() const {
   llvm::SmallVector<Operation *> result;
   result.reserve(anchors.size());
@@ -695,10 +574,72 @@ llvm::SmallVector<Operation *> SimtAnchorPlan::materializableRoots() const {
   return result;
 }
 
-int64_t SimtAnchorPlan::materializableCount() const {
-  return llvm::count_if(anchors, [](const SimtAnchorDescriptor &anchor) {
-    return anchor.materializable;
-  });
+std::optional<SimtAnchorDescriptor>
+mlir::ascend::mergeSimtStageAnchors(const SimtAnchorPlan &plan,
+                                    llvm::ArrayRef<unsigned> anchorIndices) {
+  llvm::SmallVector<const SimtAnchorDescriptor *> anchors;
+  llvm::DenseSet<unsigned> seen;
+  for (unsigned index : anchorIndices) {
+    if (index >= plan.anchors.size() || !seen.insert(index).second)
+      continue;
+    const SimtAnchorDescriptor &anchor = plan.anchors[index];
+    if (!anchor.materializable || !anchor.operation)
+      return std::nullopt;
+    anchors.push_back(&anchor);
+  }
+  if (anchors.empty())
+    return std::nullopt;
+  if (anchors.size() == 1)
+    return *anchors.front();
+
+  Block *block = nullptr;
+  llvm::DenseSet<Operation *> selected;
+  for (const SimtAnchorDescriptor *anchor : anchors) {
+    llvm::ArrayRef<Operation *> operations = anchor->scopeOperations;
+    if (operations.empty())
+      operations = llvm::ArrayRef(anchor->operation);
+    for (Operation *operation : operations) {
+      if (!operation || !operation->getBlock() ||
+          (block && block != operation->getBlock()))
+        return std::nullopt;
+      block = operation->getBlock();
+      selected.insert(operation);
+    }
+  }
+  if (!block)
+    return std::nullopt;
+
+  Operation *first = nullptr;
+  Operation *last = nullptr;
+  for (Operation &operation : *block) {
+    if (!selected.contains(&operation))
+      continue;
+    if (!first)
+      first = &operation;
+    last = &operation;
+  }
+  if (!first || !last)
+    return std::nullopt;
+
+  SimtAnchorDescriptor merged = *anchors.front();
+  merged.scopeOperations.clear();
+  bool inRange = false;
+  for (Operation &operation : *block) {
+    if (&operation == first)
+      inRange = true;
+    if (inRange) {
+      if (operation.hasTrait<OpTrait::IsTerminator>() ||
+          operation.hasTrait<OpTrait::IsIsolatedFromAbove>() ||
+          operation.getName().getStringRef() == "scope.scope" ||
+          operation.getName().getStringRef() == "scope.return")
+        return std::nullopt;
+      merged.scopeOperations.push_back(&operation);
+    }
+    if (&operation == last)
+      break;
+  }
+  merged.scopeInsertionPoint = first;
+  return merged;
 }
 
 bool mlir::ascend::isLoadedIndexDependentMemoryOp(Operation *op) {
@@ -707,13 +648,6 @@ bool mlir::ascend::isLoadedIndexDependentMemoryOp(Operation *op) {
   llvm::StringRef name = op->getName().getStringRef();
   return (name == "tt.load" || name == "tt.store") &&
          hasTensorPointerOperand(op) && pointerDependsOnLoadedIndex(op);
-}
-
-std::optional<SimtAnchorKind>
-mlir::ascend::classifyMixedSimtAnchor(Operation *op) {
-  auto descriptor = analyzeAnchor(op, /*compileOn91095=*/true);
-  return descriptor ? std::optional<SimtAnchorKind>(descriptor->kind)
-                    : std::nullopt;
 }
 
 SimtAnchorPlan mlir::ascend::buildMixedSimtAnchorPlan(ModuleOp module,
@@ -733,9 +667,7 @@ SimtAnchorPlan mlir::ascend::buildMixedSimtAnchorPlan(ModuleOp module,
           op, descriptor->scopeInsertionPoint);
       if (descriptor->scopeOperations.empty()) {
         descriptor->materializable = false;
-        descriptor->lowerability.mixed = CandidateLoweringStatus::Unsupported;
-        descriptor->lowerability.mixedReasons.push_back(
-            "triangular_solve_has_no_materializable_scope_operations");
+        descriptor->lowerability.mixed = false;
       }
     } else {
       descriptor->scopeOperations.push_back(op);
@@ -747,43 +679,14 @@ SimtAnchorPlan mlir::ascend::buildMixedSimtAnchorPlan(ModuleOp module,
     return WalkResult::skip();
   });
 
-  bool anyMixedNative = false;
+  bool anyMixed = false;
   bool mixedBlocked = false;
   for (const SimtAnchorDescriptor &anchor : plan.anchors) {
-    plan.kernelLowerability.allSimd = combineWholeKernelStatus(
-        plan.kernelLowerability.allSimd, anchor.lowerability.allSimd);
-    plan.kernelLowerability.allSimtOnly = combineWholeKernelStatus(
-        plan.kernelLowerability.allSimtOnly, anchor.lowerability.allSimtOnly);
-    llvm::append_range(plan.kernelLowerability.allSimdReasons,
-                       anchor.lowerability.allSimdReasons);
-    llvm::append_range(plan.kernelLowerability.allSimtOnlyReasons,
-                       anchor.lowerability.allSimtOnlyReasons);
-    if (anchor.lowerability.mixed == CandidateLoweringStatus::Native)
-      anyMixedNative = true;
-    else if (anchor.lowerability.allSimd != CandidateLoweringStatus::Native)
-      mixedBlocked = true;
-    llvm::append_range(plan.kernelLowerability.mixedReasons,
-                       anchor.lowerability.mixedReasons);
+    plan.kernelLowerability.allSimd &= anchor.lowerability.allSimd;
+    plan.kernelLowerability.allSimtOnly &= anchor.lowerability.allSimtOnly;
+    anyMixed |= anchor.lowerability.mixed;
+    mixedBlocked |= !anchor.lowerability.mixed && !anchor.lowerability.allSimd;
   }
-  if (plan.anchors.empty()) {
-    plan.kernelLowerability.mixed = CandidateLoweringStatus::Unsupported;
-    plan.kernelLowerability.mixedReasons.push_back("no_recognized_simt_anchor");
-  } else if (anyMixedNative && !mixedBlocked) {
-    plan.kernelLowerability.mixed = CandidateLoweringStatus::Native;
-  } else {
-    plan.kernelLowerability.mixed =
-        mixedBlocked ? CandidateLoweringStatus::Unsupported
-                     : CandidateLoweringStatus::BackendConditional;
-  }
+  plan.kernelLowerability.mixed = anyMixed && !mixedBlocked;
   return plan;
-}
-
-bool mlir::ascend::isMixedSimtAnchor(Operation *op, bool compileOn91095) {
-  auto descriptor = analyzeAnchor(op, compileOn91095);
-  return descriptor && descriptor->materializable;
-}
-
-llvm::SmallVector<Operation *>
-mlir::ascend::collectMixedSimtAnchors(ModuleOp module, bool compileOn91095) {
-  return buildMixedSimtAnchorPlan(module, compileOn91095).materializableRoots();
 }

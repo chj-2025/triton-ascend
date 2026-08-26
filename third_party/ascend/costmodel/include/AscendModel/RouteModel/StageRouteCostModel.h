@@ -30,13 +30,16 @@ enum class StageScheduleKind {
 };
 
 llvm::StringRef stringifyStageMode(StageMode mode);
-llvm::StringRef stringifyStageKernelRoute(StageKernelRouteKind kind);
-llvm::StringRef stringifyStageSchedule(StageScheduleKind kind);
 
 struct StageImplementation {
   StageMode mode = StageMode::SIMD;
-  /// SIMD always uses factor=1.  SIMT may use F1/F2/F4 when legal.
+  /// SIMD always uses factor=1.  For a whole-kernel SIMT implementation this
+  /// is the AutoBlockify V1 factor.  A local SIMT implementation identifies a
+  /// mixed-kernel candidate whose selected Stage is materialized as a scope.
+  /// The current backend still applies factor>1 through the surrounding V1
+  /// kernel schedule; it is not an independently widened scope VF.
   int64_t superblockFactor = 1;
+  bool localScope = false;
 
   bool isValid() const;
   llvm::json::Object toJSON() const;
@@ -64,7 +67,6 @@ struct StageModelFeatures {
   /// a single recurrence use one group.
   int64_t parallelRecurrenceGroupCount = 1;
   double activeLaneRatio = 1.0;
-  std::string source;
 
   bool isValid() const;
   bool permitsSimdRoofline() const;
@@ -92,8 +94,8 @@ struct StageWorkload {
 };
 
 /// Resource costs for one iteration after raw Stage workload has been mapped
-/// through the selected immutable hardware profile.  setup/epilogue are paid
-/// once; all other fields are per iteration.
+/// through the selected immutable hardware profile. Setup is paid once; all
+/// other fields are per iteration.
 struct StageResourceCycles {
   double setup = 0.0;
   double scalar = 0.0;
@@ -103,7 +105,6 @@ struct StageResourceCycles {
   double predicate = 0.0;
   double shuffle = 0.0;
   double dot = 0.0;
-  double control = 0.0;
   double loopControl = 0.0;
   double branchControl = 0.0;
   double divergence = 0.0;
@@ -111,7 +112,6 @@ struct StageResourceCycles {
   double spill = 0.0;
   double issue = 0.0;
   double criticalPath = 0.0;
-  double epilogue = 0.0;
 
   bool isFiniteAndNonNegative() const;
   llvm::json::Object toJSON() const;
@@ -121,9 +121,6 @@ struct StageImplementationCost {
   StageImplementation implementation;
   double totalCycles = 0.0;
   StageResourceCycles resources;
-  std::string modelName;
-  std::string profileVersion;
-  std::string source;
 
   bool isValid() const;
   llvm::json::Object toJSON() const;
@@ -131,7 +128,6 @@ struct StageImplementationCost {
 
 struct LogicalStageCost {
   std::string id;
-  std::string description;
   std::string model;
   StageScheduleKind schedule = StageScheduleKind::StraightLine;
   int64_t iterationCount = 1;
@@ -153,6 +149,9 @@ struct LogicalStageCost {
   int64_t scopeOutputTensorBytes = 0;
   std::vector<unsigned> simtAnchorIndices;
   bool localSimtMaterializable = false;
+  /// Factors legal for a whole-kernel pure-SIMT schedule.
+  std::vector<int64_t> legalSimtFactors;
+  /// Factors legal when this Stage alone is materialized as a local scope.
   std::vector<int64_t> localSimtFactors;
   std::vector<StageImplementationCost> implementations;
 
@@ -161,7 +160,6 @@ struct LogicalStageCost {
 
 struct LogicalPhaseCost {
   std::string id;
-  std::string description;
   std::vector<LogicalStageCost> stages;
 
   llvm::json::Object toJSON() const;
@@ -169,14 +167,13 @@ struct LogicalPhaseCost {
 
 struct StageCostTable {
   std::string domain;
-  std::string boundarySource;
   bool operationOwnershipComplete = false;
   int64_t modeledOperationCount = 0;
   std::string profileVersion;
+  int64_t logicalProgramCountHint = 0;
+  int64_t physicalCoreCountHint = 0;
   std::vector<LogicalPhaseCost> phases;
   std::vector<LogicalStageCost> stages;
-
-  llvm::json::Object toJSON() const;
 };
 
 struct StageTransitionCost {
@@ -190,7 +187,6 @@ struct StageTransitionCost {
   double simtUbLoadBytesPerThreadPerCycle = 1.0;
   double simtUbStoreBytesPerThreadPerCycle = 1.0;
   int64_t simtWarpSize = 1;
-  std::string source;
 
   bool isValid() const;
   double get(StageMode from, StageMode to) const;
@@ -205,8 +201,9 @@ struct StageRoutePlan {
   std::vector<double> logicalStageCycles;
   std::vector<double> logicalPhaseCycles;
   int64_t routeSuperblockFactor = 1;
+  int64_t runtimePhysicalProgramCount = 0;
+  int64_t runtimeWaveCount = 1;
   double totalCycles = 0.0;
-  std::string source;
 
   llvm::json::Object toJSON() const;
 };
@@ -214,7 +211,6 @@ struct StageRoutePlan {
 struct StageCostModelSummary {
   bool applied = false;
   std::string domain;
-  std::string boundarySource;
   bool operationOwnershipComplete = false;
   int64_t modeledOperationCount = 0;
   std::string profileVersion;

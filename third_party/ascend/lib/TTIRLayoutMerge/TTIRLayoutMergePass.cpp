@@ -6,10 +6,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "ascend/include/TritonToLinalg/TTIRLayoutMergePass.h"
+#include "ascend/include/TTIRLayoutMerge/TTIRLayoutMergePass.h"
 
+#include "ascend/include/TTIRLayoutMerge/RowCoalescing.h"
 #include "ascend/include/TritonToLinalg/ImplicitPermute.h"
-#include "ascend/include/TritonToLinalg/RowCoalescing.h"
 #include "ascend/include/TritonToLinalg/StridedAxisCoalescing.h"
 #include "ascend/include/TritonToLinalg/TileChunkCoalescing.h"
 
