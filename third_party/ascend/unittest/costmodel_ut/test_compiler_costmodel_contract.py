@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import sys
 import tempfile
 import types
@@ -222,6 +223,12 @@ class CompilerCostmodelContractTest(unittest.TestCase):
         self.assertNotIn("auto_simt_scope_num_warps", metadata)
         self.assertNotIn("num_warps", metadata)
         self.assertNotIn("scope_superblock_backend_abi_version", metadata)
+
+    def test_mixed_compile_keeps_delayed_cross_core_gss_enabled(self):
+        cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
+
+        source = inspect.getsource(cmplr.linalg_to_bin_enable_npu_compile_910_95)
+        self.assertNotIn("--enable-hivm-delayed-cross-core-gss=false", source)
 
 
 if __name__ == "__main__":

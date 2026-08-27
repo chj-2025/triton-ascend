@@ -1253,14 +1253,6 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 _compile_option_list += [f"--num-warps={num_warps}"]
                 warp_size = metadata.get("warp_size") or opt.warp_size
                 _compile_option_list += [f"--threads-per-warp={warp_size}"]
-                # A result-bearing local SIMT scope creates explicit AIV -> AIC
-                # values at the scope boundary.  The delayed solver currently
-                # cannot represent that edge and aborts while walking between
-                # anchors; the regular cross-core solver handles the same IR.
-                # Key this off the lowered IR contract so explicit and
-                # cost-model-materialized scopes follow the same path.
-                _compile_option_list += ["--enable-hivm-delayed-cross-core-gss=false"]
-
             partition_mode = _validate_partition_and_bind_sub_block(
                 metadata.get(
                     "enable_partition_and_bind_sub_block",
