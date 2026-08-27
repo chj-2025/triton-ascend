@@ -323,6 +323,10 @@ def test_costmodel_solve_tril(tmp_path):
     torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)
     report = _load_route_report(report_path, "mixed_simd_simt")
     assert report["materialized_simt_anchor_count"] > 0
+    assert report["selected_superblock_factor"] == 4
+    assert report["effective_runtime_factor"] == 4
+    assert report["full_group_count"] == logical_programs // 4
+    assert report["tail_count"] == 0
     _assert_performance("solve_tril", launch, tmp_path / "solve_profile", 197.198)
 
 
