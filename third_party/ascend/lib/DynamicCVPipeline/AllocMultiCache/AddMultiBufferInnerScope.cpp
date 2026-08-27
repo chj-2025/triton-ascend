@@ -1906,7 +1906,9 @@ static void buildBeforeRegion(scf::WhileOp oldWhile, OpBuilder &bb, Location bl,
   bb.create<scf::ConditionOp>(bl, condValue, carriedValues);
 }
 
-// Build the after-region of the new whileOp
+// Build the after-region of the new whileOp. The counter add-1 is not
+// created here; it is inserted later by insertWhileCounterOps at the right
+// position. counterIterArgOut is yielded as a placeholder and gets replaced.
 static void buildAfterRegion(scf::WhileOp oldWhile, OpBuilder &ab, Location al,
                              ValueRange iterArgs, Value &counterIterArgOut) {
   Block *oldAfter = oldWhile.getAfterBody();
