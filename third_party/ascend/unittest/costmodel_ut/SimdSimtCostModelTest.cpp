@@ -927,8 +927,9 @@ TEST(SimdSimtCostModelTest,
   EXPECT_EQ((*phasePlan)->rootOperations.size(),
             (*phasePlan)->rootPhaseIds.size());
   EXPECT_EQ((*phasePlan)->rootPhaseIds,
-            std::vector<std::string>({"head", "head", "head", "diagonal_load",
-                                      "diagonal_inverse", "merge_store"}));
+            std::vector<std::string>({"generic_setup", "generic_setup",
+                                      "generic_setup", "generic_load",
+                                      "generic_anchor", "generic_tail_store"}));
 
   auto result = StagePartitioner().partition(*module, anchorPlan, features,
                                              StagePartitionerOptions{});
@@ -943,7 +944,7 @@ TEST(SimdSimtCostModelTest,
   for (const LogicalPhase &phase : partition.phases) {
     for (const LogicalStage &stage : phase.stages) {
       ownedRootCount += static_cast<int64_t>(stage.operations.size());
-      if (stage.id == "diagonal_inverse_recurrence")
+      if (stage.id == "local_simt_anchor")
         recurrenceStage = &stage;
     }
   }
@@ -1022,9 +1023,10 @@ TEST(SimdSimtCostModelTest,
     FAIL() << llvm::toString(phasePlan.takeError());
   ASSERT_TRUE(*phasePlan);
   EXPECT_EQ((*phasePlan)->rootPhaseIds,
-            std::vector<std::string>({"head", "head", "head", "diagonal_load",
-                                      "diagonal_inverse", "diagonal_inverse",
-                                      "merge_store"}));
+            std::vector<std::string>({"generic_setup", "generic_setup",
+                                      "generic_setup", "generic_load",
+                                      "generic_anchor", "generic_anchor",
+                                      "generic_tail_store"}));
 
   auto partition = StagePartitioner().partition(*module, anchorPlan,
                                                 triangularBt16StageFeatures(),
@@ -1036,9 +1038,9 @@ TEST(SimdSimtCostModelTest,
   const LogicalStage *recurrenceStage = nullptr;
   for (const LogicalPhase &phase : (**partition).phases)
     for (const LogicalStage &stage : phase.stages) {
-      if (stage.id == "load_diagonal_tiles")
+      if (stage.id == "input_load")
         loadStage = &stage;
-      if (stage.id == "diagonal_inverse_recurrence")
+      if (stage.id == "local_simt_anchor")
         recurrenceStage = &stage;
     }
   ASSERT_NE(loadStage, nullptr);
@@ -1089,12 +1091,14 @@ TEST(SimdSimtCostModelTest,
   mlir::ascend::SimtAnchorPlan anchorPlan;
   anchorPlan.anchors.push_back(std::move(anchor));
 
-  mlir::ascend::PhaseBoundaryPlan phasePlan{
-      mlir::ascend::PhaseBoundaryDomain::LoadedIndexRowwiseReduction,
-      "loaded_index_rowwise_reduction", std::nullopt};
+  // Unified dataflow machine: the addptr root is the anchor interval,
+  // so the machine assigns it the single generic_anchor phase; the load /
+  // reduce / store roots behind it restart under generic_tail_* prefixes.
+  mlir::ascend::PhaseBoundaryPlan phasePlan;
   phasePlan.rootOperations.assign(roots.begin(), roots.end());
-  phasePlan.rootPhaseIds = {"row_dispatch", "row_load", "row_load",
-                            "row_reduction", "convert_store"};
+  phasePlan.rootPhaseIds = {"generic_setup", "generic_anchor",
+                            "generic_tail_load", "generic_tail_reduce",
+                            "generic_tail_store"};
   auto result = mlir::ascend::StageBoundaryAnalysis().analyze(
       phasePlan, SimdSimtFeatureSummary{}, &anchorPlan);
   if (!result)
@@ -1103,7 +1107,7 @@ TEST(SimdSimtCostModelTest,
   const LogicalStage *gather = nullptr;
   for (const LogicalPhase &phase : result->phases)
     for (const LogicalStage &stage : phase.stages)
-      if (stage.id == "indirect_row_gather")
+      if (stage.id == "local_simt_anchor")
         gather = &stage;
   ASSERT_NE(gather, nullptr);
   EXPECT_FALSE(gather->localSimtMaterializable);

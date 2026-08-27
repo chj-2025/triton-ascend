@@ -1,6 +1,7 @@
 //===- SimtAnchorAnalysis.cpp - Materializable SIMT anchors --------------===//
 
 #include "AscendModel/Analysis/SimtAnchorAnalysis.h"
+#include "AscendModel/CostModelTrace.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -545,6 +546,209 @@ static std::optional<SimtAnchorDescriptor> analyzeAnchor(Operation *op,
   return descriptor;
 }
 
+static bool operationTreeContains(Operation *root, llvm::StringRef name) {
+  if (!root)
+    return false;
+  if (root->getName().getStringRef() == name)
+    return true;
+  bool found = false;
+  root->walk([&](Operation *nested) {
+    found |= nested->getName().getStringRef() == name;
+  });
+  return found;
+}
+
+static bool isPointerLikeType(Type type) {
+  if (auto tensor = dyn_cast<RankedTensorType>(type))
+    type = tensor.getElementType();
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  stream << type;
+  stream.flush();
+  return llvm::StringRef(text).contains("!tt.ptr");
+}
+
+/// Pure shape/constant/index/pointer construction carries no compute
+/// substance; a generic SIMT scope around it would only pay switching cost.
+/// The list mirrors isMovableTriangularTensorSetup's notion of tensor setup
+/// plus the pointer-advance ops from isAddressOnlyLoopValue.
+static bool isPureTensorSetupOp(Operation *op) {
+  const llvm::StringRef name = op->getName().getStringRef();
+  return name == "arith.constant" || name == "tt.make_range" ||
+         name == "tt.expand_dims" || name == "tt.broadcast" ||
+         name == "tt.splat" || name == "tt.addptr" ||
+         name == "tt.advance" || name == "arith.cmpi" ||
+         name == "arith.cmpf" || name == "arith.andi" ||
+         name == "arith.ori" || name == "arith.xori" ||
+         name == "arith.addi" || name == "arith.subi" ||
+         name == "arith.muli" || name == "arith.index_cast";
+}
+
+/// A run of roots only anchors a generic compute region when it contains at
+/// least one tensor-valued op that is real compute (not pure setup).  This
+/// keeps e.g. scalar induction loops and constant/mask construction from
+/// fabricating pointless scope evidence.
+static bool runHasTensorComputeSubstance(llvm::ArrayRef<Operation *> runRoots) {
+  for (Operation *root : runRoots) {
+    if (!root)
+      continue;
+    bool substance = false;
+    root->walk([&](Operation *nested) {
+      if (substance || isPureTensorSetupOp(nested))
+        return;
+      for (Value result : nested->getResults())
+        if (isa<RankedTensorType>(result.getType())) {
+          substance = true;
+          return;
+        }
+    });
+    if (substance)
+      return true;
+  }
+  return false;
+}
+
+/// Mirror the exact SSA contract that wrapAnchorRange (materializer) and
+/// deriveLocalSimtScopeTraffic (stage analysis) enforce on a planned scope:
+/// all roots in one block, no terminator/isolated-from-above/scope ops, and
+/// no pointer-like value returned by the span.  A single-root span returns
+/// every result; a multi-root span returns only values with an outside user.
+static bool spanRootsCanBeLocalScope(llvm::ArrayRef<Operation *> spanRoots) {
+  if (spanRoots.empty())
+    return false;
+  Block *block = spanRoots.front()->getBlock();
+  if (!block)
+    return false;
+  for (Operation *root : spanRoots) {
+    if (!root || root->getBlock() != block ||
+        root->hasTrait<OpTrait::IsTerminator>() ||
+        root->hasTrait<OpTrait::IsIsolatedFromAbove>())
+      return false;
+    const llvm::StringRef name = root->getName().getStringRef();
+    if (name == "scope.scope" || name == "scope.return")
+      return false;
+  }
+
+  llvm::DenseSet<Operation *> inside;
+  for (Operation *root : spanRoots) {
+    inside.insert(root);
+    root->walk([&](Operation *nested) { inside.insert(nested); });
+  }
+  const bool isRange = spanRoots.size() > 1;
+  for (Operation *root : spanRoots) {
+    for (Value result : root->getResults()) {
+      const bool escapes = llvm::any_of(result.getUsers(), [&](Operation *user) {
+        return !inside.contains(user);
+      });
+      if (!isRange || escapes)
+        if (isPointerLikeType(result.getType()))
+          return false;
+    }
+  }
+  return true;
+}
+
+/// Synthesize one GenericComputeRegion anchor per function for kernels with
+/// no materializable specialized anchor.  The anchor is the maximal span of
+/// the entry block between the first and the last "transform run": maximal
+/// contiguous runs of top-level roots whose operation trees contain no
+/// tt.load/tt.store and no specialized anchor op, and that carry tensor
+/// compute substance.  Roots between two anchored runs (loads, stores,
+/// pointer setup) join the span because the phase machinery and
+/// mergeSimtStageAnchors turn all anchor roots of one stage into a single
+/// lexical scope interval.  The span is validated up front so the
+/// materialized scope is exactly the validated one.
+static void synthesizeGenericComputeRegionAnchors(ModuleOp module,
+                                                  SimtAnchorPlan &plan) {
+  COSTMODEL_TRACE_DEBUG("synthesizeGenericComputeRegionAnchors");
+  llvm::DenseSet<Operation *> specializedOps;
+  for (const SimtAnchorDescriptor &anchor : plan.anchors) {
+    if (anchor.operation)
+      specializedOps.insert(anchor.operation);
+    for (Operation *op : anchor.scopeOperations)
+      if (op)
+        specializedOps.insert(op);
+  }
+
+  for (Operation &function : module.getBody()->getOperations()) {
+    const llvm::StringRef functionName = function.getName().getStringRef();
+    if (functionName != "tt.func" && functionName != "func.func")
+      continue;
+    if (function.getNumRegions() == 0 || function.getRegion(0).empty())
+      continue;
+    Block &entry = function.getRegion(0).front();
+
+    llvm::SmallVector<Operation *> roots;
+    llvm::SmallVector<bool> isTransformRoot;
+    for (Operation &op : entry.getOperations()) {
+      if (op.hasTrait<OpTrait::IsTerminator>() ||
+          op.hasAttr("ta.auto_blockify_v1.schedule"))
+        continue;
+      roots.push_back(&op);
+      isTransformRoot.push_back(
+          !specializedOps.contains(&op) &&
+          !operationTreeContains(&op, "tt.load") &&
+          !operationTreeContains(&op, "tt.store"));
+    }
+    costModelDebug() << "generic compute-region synthesis: function "
+                     << "(function-like op) roots=" << roots.size()
+                     << " transformRoots="
+                     << llvm::count(isTransformRoot, true) << "\n";
+
+    // Maximal contiguous transform-root runs; only runs with tensor compute
+    // substance anchor the span.
+    std::optional<size_t> spanBegin;
+    std::optional<size_t> spanEnd;
+    size_t runBegin = 0;
+    bool inRun = false;
+    for (size_t index = 0; index <= roots.size(); ++index) {
+      const bool transform =
+          index < roots.size() && isTransformRoot[index];
+      if (transform && !inRun) {
+        inRun = true;
+        runBegin = index;
+      } else if (!transform && inRun) {
+        inRun = false;
+        llvm::ArrayRef<Operation *> run(roots.data() + runBegin,
+                                        index - runBegin);
+        if (runHasTensorComputeSubstance(run)) {
+          if (!spanBegin)
+            spanBegin = runBegin;
+          spanEnd = index - 1;
+          costModelDebug() << "substance run roots=[" << runBegin << ","
+                           << (index - 1) << "] ops=" << run.size() << "\n";
+        }
+      }
+    }
+    if (!spanBegin || !spanEnd)
+      continue;
+
+    llvm::SmallVector<Operation *, 16> spanRoots(roots.begin() + *spanBegin,
+                                                 roots.begin() + *spanEnd + 1);
+    costModelDebug() << "candidate span roots=[" << *spanBegin << ","
+                     << *spanEnd << "] ops=" << spanRoots.size() << "\n";
+    if (!spanRootsCanBeLocalScope(spanRoots)) {
+      costModelDebug() << "rejected: span cannot be wrapped as a local scope "
+                          "(pointer escape or illegal op)\n";
+      continue;
+    }
+
+    SimtAnchorDescriptor descriptor;
+    descriptor.operation = spanRoots.front();
+    descriptor.kind = SimtAnchorKind::GenericComputeRegion;
+    descriptor.scopeOperations =
+        llvm::SmallVector<Operation *, 0>(spanRoots.begin(), spanRoots.end());
+    descriptor.scopeInsertionPoint = spanRoots.front();
+    descriptor.lowerability.allSimd = true;
+    descriptor.lowerability.allSimtOnly = true;
+    descriptor.lowerability.mixed = true;
+    descriptor.materializable = true;
+    plan.anchors.push_back(std::move(descriptor));
+    costModelDebug() << "synthesized GenericComputeRegion anchor: ops="
+                     << spanRoots.size() << "\n";
+  }
+}
+
 } // namespace
 
 llvm::StringRef mlir::ascend::stringifySimtAnchorKind(SimtAnchorKind kind) {
@@ -561,6 +765,8 @@ llvm::StringRef mlir::ascend::stringifySimtAnchorKind(SimtAnchorKind kind) {
     return "tensor_atomic";
   case SimtAnchorKind::TriangularSolveLoop:
     return "triangular_solve_loop";
+  case SimtAnchorKind::GenericComputeRegion:
+    return "generic_compute_region";
   }
   llvm_unreachable("unknown SIMT anchor kind");
 }
@@ -652,6 +858,7 @@ bool mlir::ascend::isLoadedIndexDependentMemoryOp(Operation *op) {
 
 SimtAnchorPlan mlir::ascend::buildMixedSimtAnchorPlan(ModuleOp module,
                                                       bool compileOn91095) {
+  COSTMODEL_TRACE("buildMixedSimtAnchorPlan");
   SimtAnchorPlan plan;
   llvm::DenseSet<Operation *> operationsInPlannedScope;
   module.walk<WalkOrder::PreOrder>([&](Operation *op) {
@@ -687,6 +894,48 @@ SimtAnchorPlan mlir::ascend::buildMixedSimtAnchorPlan(ModuleOp module,
     anyMixed |= anchor.lowerability.mixed;
     mixedBlocked |= !anchor.lowerability.mixed && !anchor.lowerability.allSimd;
   }
+
+  // Mixed-route blind-spot coverage: when no specialized materializable
+  // anchor exists (and no specialized anchor blocks the mixed route), any
+  // kernel with an ordinary compute region would previously fall to
+  // backend_default for the mixed candidate -- even when that region is
+  // faster on the scalar units.  Synthesize one GenericComputeRegion anchor
+  // per function from validated transform-root spans so the route model can
+  // score a local SIMT scope and pay its switching cost.
+  const bool hasMaterializableSpecialized = llvm::any_of(
+      plan.anchors,
+      [](const SimtAnchorDescriptor &anchor) { return anchor.materializable; });
+  if (compileOn91095 && !hasMaterializableSpecialized && !mixedBlocked) {
+    costModelLog() << "no materializable specialized anchor; trying "
+                      "GenericComputeRegion synthesis\n";
+    synthesizeGenericComputeRegionAnchors(module, plan);
+    for (const SimtAnchorDescriptor &anchor : plan.anchors) {
+      if (anchor.kind != SimtAnchorKind::GenericComputeRegion)
+        continue;
+      // Generic regions are ordinary compute: they lower on both paths and
+      // keep the mixed route legal.
+      anyMixed |= anchor.lowerability.mixed;
+    }
+  }
   plan.kernelLowerability.mixed = anyMixed && !mixedBlocked;
+  // Print every matched anchor operation so the anchor <-> op correspondence
+  // is directly visible (IR-dump style after the "op:" marker).
+  for (size_t i = 0; i < plan.anchors.size(); ++i) {
+    const SimtAnchorDescriptor &anchor = plan.anchors[i];
+    costModelLog() << "anchor[" << i << "] kind="
+                   << stringifySimtAnchorKind(anchor.kind)
+                   << " materializable="
+                   << (anchor.materializable ? "true" : "false") << "\n";
+    costModelLog() << "  op: ";
+    anchor.operation->print(llvm::errs());
+    llvm::errs() << "\n";
+  }
+  costModelLog() << "output: anchors=" << plan.anchors.size()
+                 << " kernelLowerability allSimd="
+                 << (plan.kernelLowerability.allSimd ? "true" : "false")
+                 << " allSimtOnly="
+                 << (plan.kernelLowerability.allSimtOnly ? "true" : "false")
+                 << " mixed="
+                 << (plan.kernelLowerability.mixed ? "true" : "false") << "\n";
   return plan;
 }

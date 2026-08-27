@@ -1,6 +1,7 @@
 //===- StagePartitioner.cpp - Build semantic Phase/Stage IR -------------===//
 
 #include "AscendModel/Analysis/StagePartitioner.h"
+#include "AscendModel/CostModelTrace.h"
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/DenseSet.h"
@@ -384,6 +385,8 @@ static void addPhase(StagePartition &partition, llvm::StringRef id,
 }
 
 static bool operationTreeContainsName(Operation *root, llvm::StringRef name);
+static bool operationTreeContainsLoadedIndexMemory(Operation *root);
+static Operation *getTopLevelSemanticRoot(Operation *operation);
 
 static bool hasPhase(const PhaseBoundaryPlan *plan, llvm::StringRef id) {
   return plan && llvm::is_contained(plan->rootPhaseIds, id);
@@ -409,115 +412,242 @@ static void prependAutoBlockifyStages(StagePartition &partition,
   partition.phases.push_back(std::move(phase));
 }
 
-static StagePartition
-partitionTriangular(const SimdSimtFeatureSummary &features,
-                    const TriangularSolveFacts &facts,
-                    const PhaseBoundaryPlan *plan) {
-  StagePartition partition;
-  partition.domain = "triangular_recurrence";
-  prependAutoBlockifyStages(partition, features, plan);
-
-  LogicalStage head = withControl(
-      makeStage("head_index_mask", StageCostModelKind::PredicateMask,
-                StageScheduleKind::StraightLine, 1, {}),
-      features.conditionalBranchCount -
-          features.simtAnchors.conditionalBranchCount,
-      features.divergentBranchCount - features.simtAnchors.divergentBranchCount,
-      features.activeLaneRatio);
-  head.workload.paysKernelSetup = true;
-  addPhase(partition, "head", std::move(head));
-
-  if (hasPhase(plan, "diagonal_load"))
-    addPhase(partition, "diagonal_load",
-             makeStage("load_diagonal_tiles",
-                       StageCostModelKind::ContinuousTileMemory,
-                       StageScheduleKind::IndependentPipelined, 1, {}));
-
-  const int64_t iterations = std::max<int64_t>(1, facts.recurrenceLoopCount);
-  LogicalStage recurrence = asLocalSIMT(withControl(
-      makeStage("diagonal_inverse_recurrence",
-                StageCostModelKind::LoopCarriedRecurrence,
-                StageScheduleKind::LoopCarriedSerial, iterations, {}),
-      features.simtAnchors.conditionalBranchCount,
-      features.simtAnchors.divergentBranchCount,
-      features.simtAnchors.activeLaneRatio));
-  const int64_t rows =
-      std::max<int64_t>(1, facts.blockRows - facts.recurrenceStartRow);
-  recurrence.features.parallelRecurrenceGroupCount =
-      std::max<int64_t>(1, (iterations + rows - 1) / rows);
-  addPhase(partition, "diagonal_inverse", std::move(recurrence));
-
-  if (hasPhase(plan, "merge_store")) {
-    bool hasDot = false;
-    bool hasStore = false;
-    for (auto root : llvm::enumerate(plan->rootOperations)) {
-      if (plan->rootPhaseIds[root.index()] != "merge_store")
-        continue;
-      hasDot |= operationTreeContainsName(root.value(), "tt.dot");
-      hasStore |= operationTreeContainsName(root.value(), "tt.store");
-    }
-    LogicalPhase phase;
-    phase.id = "merge_store";
-    if (hasDot)
-      phase.stages.push_back(
-          makeStage("dense_dot_tail", StageCostModelKind::CubeRoofline,
-                    StageScheduleKind::IndependentPipelined,
-                    std::max<int64_t>(1, facts.denseDotTailOps), {}));
-    if (hasStore)
-      phase.stages.push_back(makeStage("store_inverse_tile",
-                                       StageCostModelKind::ContinuousTileStore,
-                                       StageScheduleKind::StraightLine, 1, {}));
-    if (!phase.stages.empty())
-      partition.phases.push_back(std::move(phase));
+/// Predicts the dominant-structure kind for a generic compute-style Phase by
+/// inspecting the owned root operation trees.  The prediction only needs to
+/// be directionally right: StageKindClassifier re-derives the kind from real
+/// StageModelFeatures afterwards and refines mismatches.
+static StageCostModelKind predictGenericStageKind(const PhaseBoundaryPlan *plan,
+                                                  llvm::StringRef phaseId) {
+  bool hasDot = false;
+  bool hasReduce = false;
+  bool hasConversion = false;
+  bool hasLoop = false;
+  bool hasIndirect = false;
+  bool hasLoad = false;
+  bool hasStore = false;
+  for (auto indexedRoot : llvm::enumerate(plan->rootOperations)) {
+    if (plan->rootPhaseIds[indexedRoot.index()] != phaseId)
+      continue;
+    Operation *root = indexedRoot.value();
+    hasDot |= operationTreeContainsName(root, "tt.dot");
+    hasReduce |= operationTreeContainsName(root, "tt.reduce") ||
+                 operationTreeContainsName(root, "tt.scan");
+    hasConversion |= operationTreeContainsName(root, "arith.extf") ||
+                     operationTreeContainsName(root, "arith.truncf");
+    hasLoop |= operationTreeContainsName(root, "scf.for") ||
+               operationTreeContainsName(root, "scf.while");
+    hasIndirect |= operationTreeContainsLoadedIndexMemory(root);
+    hasLoad |= operationTreeContainsName(root, "tt.load");
+    hasStore |= operationTreeContainsName(root, "tt.store");
   }
-  return partition;
+  if (hasDot)
+    return StageCostModelKind::CubeRoofline;
+  if (hasReduce)
+    return StageCostModelKind::RowwiseReduction;
+  if (hasConversion)
+    return StageCostModelKind::ConversionPack;
+  if (hasLoop)
+    return StageCostModelKind::IndependentPipelinedLoop;
+  if (hasIndirect)
+    return StageCostModelKind::IndirectGatherMemory;
+  if (hasStore && !hasLoad)
+    return StageCostModelKind::ContinuousTileStore;
+  if (hasLoad || hasStore)
+    return StageCostModelKind::ContinuousTileMemory;
+  return StageCostModelKind::ScalarIssue;
 }
 
-static StagePartition partitionRowwise(const SimdSimtFeatureSummary &features,
-                                       const PhaseBoundaryPlan *plan) {
+static StageScheduleKind
+scheduleForGenericKind(StageCostModelKind kind) {
+  switch (kind) {
+  case StageCostModelKind::CubeRoofline:
+  case StageCostModelKind::TinyCubeRoofline:
+  case StageCostModelKind::IndependentPipelinedLoop:
+  case StageCostModelKind::ConversionPack:
+  case StageCostModelKind::ContinuousTileMemory:
+    return StageScheduleKind::IndependentPipelined;
+  case StageCostModelKind::RowwiseReduction:
+  case StageCostModelKind::IndirectGatherMemory:
+    return StageScheduleKind::PartiallyDependent;
+  default:
+    return StageScheduleKind::StraightLine;
+  }
+}
+
+/// Unified Stage template for the GenericDataflow domain: one template for
+/// every kernel.  Phases come from the fine-grained monotonic dataflow-role
+/// machine in assignRootPhaseIds; each role maps to exactly one Stage
+/// kind/schedule through the table below, so the structures the retired
+/// specialized templates used to hard-code (index dispatch / indirect
+/// gather / reduction / conversion-store, diagonal load / recurrence /
+/// dense-dot tail, index setup / tile gather / tiny dot / store) emerge
+/// from the same machine instead of per-scenario dispatch.
+struct GenericRoleSpec {
+  llvm::StringRef role;
+  llvm::StringRef headStage;
+  llvm::StringRef tailStage;
+  StageCostModelKind kind;
+  /// Compute-flavored roles iterate with the kernel's static trip count;
+  /// setup and memory roles are single-shot.
+  bool perIteration;
+};
+
+static const GenericRoleSpec kGenericRoles[] = {
+    {"setup", "prologue_setup", "epilogue_setup",
+     StageCostModelKind::ScalarIssue, false},
+    {"load", "input_load", "tail_load",
+     StageCostModelKind::ContinuousTileMemory, false},
+    {"gather", "indirect_gather", "tail_indirect_gather",
+     StageCostModelKind::IndirectGatherMemory, false},
+    {"dot", "cube_dot", "tail_cube_dot", StageCostModelKind::CubeRoofline,
+     true},
+    {"reduce", "rowwise_reduce", "tail_rowwise_reduce",
+     StageCostModelKind::RowwiseReduction, true},
+    {"loop", "pipelined_loop", "tail_pipelined_loop",
+     StageCostModelKind::IndependentPipelinedLoop, true},
+    {"convert", "conversion_pack", "tail_conversion_pack",
+     StageCostModelKind::ConversionPack, true},
+    {"store", "main_store", "epilogue_store",
+     StageCostModelKind::ContinuousTileStore, false},
+};
+
+static llvm::Expected<StagePartition>
+partitionGeneric(const SimdSimtFeatureSummary &features,
+                 const PhaseBoundaryPlan *plan,
+                 const SimtAnchorPlan *anchorPlan) {
+  COSTMODEL_TRACE_DEBUG("partitionGeneric");
   StagePartition partition;
-  partition.domain = "loaded_index_rowwise_reduction";
+  partition.domain = "generic_dataflow";
   prependAutoBlockifyStages(partition, features, plan);
-  addPhase(partition, "row_dispatch",
-           makeStage("row_index_generation",
-                     StageCostModelKind::IndexGeneration,
-                     StageScheduleKind::StraightLine, 1, {}));
-  addPhase(partition, "row_load",
-           asLocalSIMT(makeStage(
-               "indirect_row_gather", StageCostModelKind::IndirectGatherMemory,
-               StageScheduleKind::PartiallyDependent, 1, {})));
+
   const int64_t iterations =
       std::max<int64_t>(1, features.staticLoopTripCountMax);
-  addPhase(partition, "row_reduction",
-           makeStage("rowwise_reduction", StageCostModelKind::RowwiseReduction,
-                     StageScheduleKind::PartiallyDependent, iterations, {}));
-  addPhase(partition, "convert_store",
-           makeStage("conversion_pack_store",
-                     StageCostModelKind::ConversionPack,
-                     StageScheduleKind::IndependentPipelined, iterations, {}));
-  return partition;
-}
+  auto addRolePhase = [&](llvm::StringRef role, llvm::StringRef phaseId,
+                          llvm::StringRef stageId, StageCostModelKind kind,
+                          int64_t stageIterations) {
+    LogicalStage stage =
+        makeStage(stageId, kind, scheduleForGenericKind(kind),
+                  stageIterations, {});
+    if (phaseId == "generic_setup" || phaseId == "generic_tail_setup")
+      stage = withControl(
+          std::move(stage),
+          features.conditionalBranchCount -
+              features.simtAnchors.conditionalBranchCount,
+          features.divergentBranchCount -
+              features.simtAnchors.divergentBranchCount,
+          features.activeLaneRatio);
+    addPhase(partition, phaseId, std::move(stage));
+    costModelLog() << "phase \"" << phaseId << "\" -> stage \"" << stageId
+                   << "\" [rule: kGenericRoles[\"" << role
+                   << "\"] => " << stageId << "/"
+                   << stringifyStageCostModel(kind) << "] iterations="
+                   << stageIterations << "\n";
+  };
 
-static StagePartition
-partitionIndirectDot(const SimdSimtFeatureSummary &features,
-                     const PhaseBoundaryPlan *plan) {
-  StagePartition partition;
-  partition.domain = "indirect_underfilled_dot";
-  prependAutoBlockifyStages(partition, features, plan);
-  addPhase(partition, "index_setup",
-           makeStage("index_generation", StageCostModelKind::IndexGeneration,
-                     StageScheduleKind::StraightLine, 1, {}));
-  addPhase(partition, "gather_tiles",
-           asLocalSIMT(makeStage(
-               "indirect_tile_gather", StageCostModelKind::IndirectGatherMemory,
-               StageScheduleKind::PartiallyDependent, 1, {})));
-  addPhase(partition, "dot",
-           makeStage("tiny_cube_dot", StageCostModelKind::TinyCubeRoofline,
-                     StageScheduleKind::IndependentPipelined, 1, {}));
-  addPhase(partition, "output_store",
-           makeStage("store_dot_result",
-                     StageCostModelKind::ContinuousTileStore,
-                     StageScheduleKind::StraightLine, 1, {}));
+  // Head phases precede the anchor interval, tail phases follow it; the
+  // table order matches the machine's monotonic role rank, so Phase/Stage
+  // order mirrors root order by construction.
+  for (const GenericRoleSpec &spec : kGenericRoles) {
+    const std::string phaseId = ("generic_" + spec.role).str();
+    if (hasPhase(plan, phaseId))
+      addRolePhase(spec.role, phaseId, spec.headStage, spec.kind,
+                   spec.perIteration ? iterations : 1);
+  }
+
+  if (hasPhase(plan, "generic_anchor")) {
+    // Anchor Stage semantics follow the first materializable anchor owned
+    // by this plan.  TriangularSolveLoop anchors carry loop-carried
+    // recurrence semantics (iterations and parallel recurrence groups from
+    // the solve facts); synthesized GenericComputeRegion anchors carry the
+    // ordinary compute semantics of their span; gather-style anchors carry
+    // indirect-memory semantics.
+    const SimtAnchorDescriptor *typedAnchor = nullptr;
+    if (anchorPlan) {
+      for (const SimtAnchorDescriptor &anchor : anchorPlan->anchors) {
+        if (!anchor.materializable)
+          continue;
+        Operation *root = getTopLevelSemanticRoot(anchor.operation);
+        if (!root || !llvm::is_contained(plan->localSimtAnchorRoots, root))
+          continue;
+        typedAnchor = &anchor;
+        costModelLog() << "anchor stage semantics from anchor kind="
+                       << stringifySimtAnchorKind(anchor.kind)
+                       << " (anchor root: "
+                       << root->getName().getStringRef() << ")\n";
+        break;
+      }
+    }
+    if (!typedAnchor)
+      costModelDebug() << "WARNING: generic_anchor phase has no typed "
+                          "materializable anchor; defaulting to gather semantics\n";
+    StageCostModelKind anchorKind = StageCostModelKind::IndirectGatherMemory;
+    StageScheduleKind anchorSchedule = StageScheduleKind::PartiallyDependent;
+    int64_t anchorIterations = 1;
+    // Rule chain: triangular anchors carry loop-carried recurrence
+    // semantics; synthesized generic compute regions predict their kind from
+    // the phase's root trees; gather-style anchors (DirectGather /
+    // LoadedIndexDependentMemory) keep the default indirect-memory model.
+    llvm::StringRef anchorKindRule =
+        "gather-style anchor => default indirect_gather_memory";
+    if (typedAnchor &&
+        typedAnchor->kind == SimtAnchorKind::TriangularSolveLoop) {
+      anchorKind = StageCostModelKind::LoopCarriedRecurrence;
+      anchorSchedule = StageScheduleKind::LoopCarriedSerial;
+      anchorKindRule = "triangular solve anchor => loop_carried_recurrence";
+      if (typedAnchor->triangularSolve)
+        anchorIterations = std::max<int64_t>(
+            1, typedAnchor->triangularSolve->recurrenceLoopCount);
+    } else if (typedAnchor &&
+               typedAnchor->kind == SimtAnchorKind::GenericComputeRegion) {
+      anchorKind = predictGenericStageKind(plan, "generic_anchor");
+      anchorSchedule = scheduleForGenericKind(anchorKind);
+      anchorIterations = iterations;
+      anchorKindRule = "generic compute region => predicted from phase roots";
+    }
+    LogicalStage anchorStage = asLocalSIMT(withControl(
+        makeStage("local_simt_anchor", anchorKind, anchorSchedule,
+                  anchorIterations, {}),
+        features.simtAnchors.conditionalBranchCount,
+        features.simtAnchors.divergentBranchCount,
+        features.simtAnchors.activeLaneRatio));
+    if (typedAnchor &&
+        typedAnchor->kind == SimtAnchorKind::TriangularSolveLoop &&
+        typedAnchor->triangularSolve) {
+      const TriangularSolveFacts &facts = *typedAnchor->triangularSolve;
+      const int64_t rows =
+          std::max<int64_t>(1, facts.blockRows - facts.recurrenceStartRow);
+      anchorStage.features.parallelRecurrenceGroupCount =
+          std::max<int64_t>(1, (anchorIterations + rows - 1) / rows);
+    }
+    addPhase(partition, "generic_anchor", std::move(anchorStage));
+    costModelLog() << "phase \"generic_anchor\" -> stage "
+                      "\"local_simt_anchor\" [rule: "
+                   << anchorKindRule << "] kind="
+                   << stringifyStageCostModel(anchorKind)
+                   << " localSimtMaterializable=true\n";
+  }
+
+  for (const GenericRoleSpec &spec : kGenericRoles) {
+    const std::string phaseId = ("generic_tail_" + spec.role).str();
+    if (hasPhase(plan, phaseId))
+      addRolePhase(spec.role, phaseId, spec.tailStage, spec.kind,
+                   spec.perIteration ? iterations : 1);
+  }
+
+  // The prologue normally pays the kernel setup; when the kernel starts
+  // directly with load/anchor work the first semantic Stage takes it so the
+  // cost model never loses the fixed setup term.
+  bool setupPaid = hasPhase(plan, "generic_setup");
+  for (LogicalPhase &phase : partition.phases) {
+    if (phase.id == "auto_blockify_dispatch" || phase.stages.empty())
+      continue;
+    phase.stages.front().workload.paysKernelSetup = true;
+    if (!setupPaid)
+      costModelDebug()
+          << "no generic_setup phase; kernel setup paid by stage \""
+          << phase.stages.front().id << "\"\n";
+    break;
+  }
   return partition;
 }
 
@@ -525,6 +655,13 @@ static bool anchorMatchesStage(const SimtAnchorDescriptor &anchor,
                                const LogicalStage &stage) {
   if (!anchor.materializable || !stage.localSimtMaterializable)
     return false;
+  if (anchor.kind == SimtAnchorKind::GenericComputeRegion)
+    // A synthesized generic compute region is validated SSA scope evidence
+    // for ordinary compute stages of any non-recurrence kind.  Only the
+    // loop-carried-recurrence contract stays reserved for triangular
+    // anchors, because its serial semantics are not guaranteed by a
+    // generic span.
+    return stage.costModelKind != StageCostModelKind::LoopCarriedRecurrence;
   if (stage.costModelKind == StageCostModelKind::LoopCarriedRecurrence)
     return anchor.kind == SimtAnchorKind::TriangularSolveLoop;
   if (stage.costModelKind == StageCostModelKind::IndirectGatherMemory ||
@@ -555,6 +692,7 @@ static bool stageOwnsAnchor(const LogicalStage &stage,
 /// second source of Stage boundaries.
 static void attachExactAnchorOwnership(StagePartition &partition,
                                        const SimtAnchorPlan &anchorPlan) {
+  COSTMODEL_TRACE_DEBUG("attachExactAnchorOwnership");
   for (LogicalPhase &phase : partition.phases) {
     for (LogicalStage &stage : phase.stages) {
       if (!stage.localSimtMaterializable)
@@ -562,13 +700,25 @@ static void attachExactAnchorOwnership(StagePartition &partition,
       stage.simtAnchorIndices.clear();
       for (auto indexedAnchor : llvm::enumerate(anchorPlan.anchors)) {
         const SimtAnchorDescriptor &anchor = indexedAnchor.value();
-        if (anchor.materializable && stageOwnsAnchor(stage, anchor))
+        if (anchor.materializable && stageOwnsAnchor(stage, anchor)) {
           stage.simtAnchorIndices.push_back(
               static_cast<unsigned>(indexedAnchor.index()));
+          costModelLog() << "stage \"" << stage.id << "\" owns anchor["
+                         << indexedAnchor.index() << "] ("
+                         << stringifySimtAnchorKind(anchor.kind) << ") op: ";
+          anchor.operation->print(llvm::errs());
+          llvm::errs() << "\n";
+        }
       }
       stage.localSimtMaterializable = !stage.simtAnchorIndices.empty();
       if (!stage.localSimtMaterializable)
         stage.localSimtFactors.clear();
+      costModelDebug() << "stage \"" << stage.id
+                       << "\" simtAnchorIndices.size()="
+                       << stage.simtAnchorIndices.size()
+                       << " localSimtMaterializable="
+                       << (stage.localSimtMaterializable ? "true" : "false")
+                       << "\n";
     }
   }
 }
@@ -648,6 +798,11 @@ static bool operationTreeContainsLoadedIndexMemory(Operation *root) {
 /// monotone: after a boundary is crossed, a later root cannot move back to an
 /// earlier Phase.  Cost and candidate mode are intentionally absent here.
 static llvm::Error assignRootPhaseIds(PhaseBoundaryPlan &plan) {
+  COSTMODEL_TRACE_DEBUG("assignRootPhaseIds");
+  costModelDebug() << "rootOperations.size()=" << plan.rootOperations.size()
+                   << "\n";
+  costModelDebug() << "localSimtAnchorRoots.size()="
+                   << plan.localSimtAnchorRoots.size() << "\n";
   llvm::DenseSet<Operation *> anchorRoots(plan.localSimtAnchorRoots.begin(),
                                           plan.localSimtAnchorRoots.end());
   std::optional<size_t> firstAnchorIndex;
@@ -659,24 +814,48 @@ static llvm::Error assignRootPhaseIds(PhaseBoundaryPlan &plan) {
       firstAnchorIndex = indexedRoot.index();
     lastAnchorIndex = indexedRoot.index();
   }
-  if (plan.domain == PhaseBoundaryDomain::TriangularRecurrence &&
-      !firstAnchorIndex)
-    return llvm::createStringError(
-        std::errc::invalid_argument,
-        "triangular PhaseBoundaryAnalysis requires an exact anchor region");
-  if (plan.domain == PhaseBoundaryDomain::TriangularRecurrence &&
-      firstAnchorIndex && lastAnchorIndex) {
-    for (size_t index = *firstAnchorIndex; index <= *lastAnchorIndex; ++index)
-      if (!anchorRoots.contains(plan.rootOperations[index]))
-        return llvm::createStringError(
-            std::errc::invalid_argument,
-            "triangular PhaseBoundaryAnalysis requires a contiguous planned "
-            "scope region");
-  }
-
   plan.rootPhaseIds.clear();
   plan.rootPhaseIds.reserve(plan.rootOperations.size());
-  llvm::StringRef current;
+  // Fine-grained monotonic dataflow-role machine: setup < load < gather <
+  // dot < reduce < loop < convert < store.  Roles only ever advance, so each
+  // Phase id forms one contiguous run.  The materializable anchor interval
+  // is mapped to a single generic_anchor phase; the machine restarts behind
+  // it under generic_tail_* prefixes so head and tail roles never share a
+  // Phase id.
+  struct RoleDefinition {
+    int rank;
+    llvm::StringRef phase;
+    llvm::StringRef matchedBy;
+  };
+  auto roleOf = [&](Operation *root) -> RoleDefinition {
+    // Each role reports the op-tree evidence that matched it, so the
+    // root -> role -> Phase decision chain is auditable in the log.
+    if (operationTreeContainsName(root, "tt.store"))
+      return {7, "store", "contains tt.store"};
+    if (operationTreeContainsName(root, "tt.dot"))
+      return {3, "dot", "contains tt.dot"};
+    if (operationTreeContainsName(root, "tt.reduce") ||
+        operationTreeContainsName(root, "tt.scan"))
+      return {4, "reduce", "contains tt.reduce/tt.scan"};
+    if (operationTreeContainsLoadedIndexMemory(root))
+      return {2, "gather", "contains loaded-index dependent memory op"};
+    if (operationTreeContainsName(root, "tt.load"))
+      return {1, "load", "contains tt.load"};
+    if (operationTreeContainsName(root, "scf.for") ||
+        operationTreeContainsName(root, "scf.while") ||
+        operationTreeContainsName(root, "scf.if"))
+      return {5, "loop", "contains scf.for/scf.while/scf.if"};
+    if (operationTreeContainsName(root, "arith.extf") ||
+        operationTreeContainsName(root, "arith.truncf") ||
+        operationTreeContainsName(root, "arith.sitofp") ||
+        operationTreeContainsName(root, "arith.uitofp") ||
+        operationTreeContainsName(root, "arith.fpext") ||
+        operationTreeContainsName(root, "arith.fptrunc"))
+      return {6, "convert", "contains cast op"};
+    return {0, "setup", "no memory/dot/reduce/cast op"};
+  };
+  std::string current;
+  int currentRank = -1;
   for (auto indexedRoot : llvm::enumerate(plan.rootOperations)) {
     Operation *root = indexedRoot.value();
     if (!root)
@@ -689,47 +868,39 @@ static llvm::Error assignRootPhaseIds(PhaseBoundaryPlan &plan) {
       continue;
     }
 
-    switch (plan.domain) {
-    case PhaseBoundaryDomain::TriangularRecurrence:
-      if (firstAnchorIndex && indexedRoot.index() >= *firstAnchorIndex &&
-          indexedRoot.index() <= *lastAnchorIndex)
-        current = "diagonal_inverse";
-      else if (lastAnchorIndex && indexedRoot.index() > *lastAnchorIndex)
-        current = "merge_store";
-      else if (operationTreeContainsName(root, "tt.dot") ||
-               operationTreeContainsName(root, "tt.store"))
-        current = "merge_store";
-      else if ((current.empty() || current == "head") &&
-               operationTreeContainsName(root, "tt.load"))
-        current = "diagonal_load";
-      else if (current.empty())
-        current = "head";
-      break;
-    case PhaseBoundaryDomain::LoadedIndexRowwiseReduction:
-      if (operationTreeContainsName(root, "tt.reduce"))
-        current = "row_reduction";
-      else if (current == "row_reduction" ||
-               operationTreeContainsName(root, "tt.store"))
-        current = "convert_store";
-      else if ((current.empty() || current == "row_dispatch") &&
-               operationTreeContainsLoadedIndexMemory(root))
-        current = "row_load";
-      else if (current.empty())
-        current = "row_dispatch";
-      break;
-    case PhaseBoundaryDomain::IndirectUnderfilledDot:
-      if (operationTreeContainsName(root, "tt.dot"))
-        current = "dot";
-      else if (current == "dot" || operationTreeContainsName(root, "tt.store"))
-        current = "output_store";
-      else if ((current.empty() || current == "index_setup") &&
-               operationTreeContainsLoadedIndexMemory(root))
-        current = "gather_tiles";
-      else if (current.empty())
-        current = "index_setup";
-      break;
+    // One fine-grained monotonic dataflow-role machine for every kernel.
+    // The whole materializable anchor interval is one generic_anchor
+    // phase; the machine restarts behind it so head and tail roles never
+    // share a Phase id.  Role ranks only ever advance, so each Phase id
+    // forms one contiguous run by construction.
+    const bool insideAnchor =
+        firstAnchorIndex.has_value() && lastAnchorIndex.has_value() &&
+        indexedRoot.index() >= *firstAnchorIndex &&
+        indexedRoot.index() <= *lastAnchorIndex;
+    const bool afterAnchor = lastAnchorIndex.has_value() &&
+                             indexedRoot.index() > *lastAnchorIndex;
+    if (insideAnchor) {
+      current = "generic_anchor";
+      currentRank = 8;
+    } else {
+      if (afterAnchor && currentRank >= 0 &&
+          !llvm::StringRef(current).starts_with("generic_tail_")) {
+        current.clear(); // restart the machine for the tail
+        currentRank = -1;
+      }
+      const RoleDefinition role = roleOf(root);
+      if (role.rank > currentRank) {
+        currentRank = role.rank;
+        current = (llvm::Twine(afterAnchor ? "generic_tail_" : "generic_") +
+                   role.phase)
+                      .str();
+        costModelDebug() << "role advance: root[" << indexedRoot.index() << "] "
+                         << root->getName().getStringRef()
+                         << " role=" << role.phase << " (matched: "
+                         << role.matchedBy << ") phase=" << current << "\n";
+      }
     }
-    plan.rootPhaseIds.push_back(current.str());
+    plan.rootPhaseIds.push_back(current);
   }
   if (plan.rootPhaseIds.size() != plan.rootOperations.size())
     return llvm::createStringError(
@@ -749,6 +920,52 @@ static llvm::Error assignRootPhaseIds(PhaseBoundaryPlan &plan) {
           phaseId.c_str());
     currentPhase = phaseId;
   }
+  // Compact root -> Phase correspondence: the role machine is monotonic, so
+  // each Phase id forms one contiguous run of roots.  One line per run keeps
+  // the op <-> Phase mapping readable, and every root's IR is dumped right
+  // below its run header (IR-dump style, no per-line prefix, directly
+  // copy-pasteable) so the mapping can be inspected directly.
+  struct PhaseRun {
+    size_t begin;
+    size_t end;
+    llvm::StringRef phaseId;
+  };
+  llvm::SmallVector<PhaseRun, 8> phaseRuns;
+  for (size_t i = 0; i < plan.rootPhaseIds.size(); ++i) {
+    if (!phaseRuns.empty() && phaseRuns.back().phaseId == plan.rootPhaseIds[i])
+      ++phaseRuns.back().end;
+    else
+      phaseRuns.push_back({i, i, plan.rootPhaseIds[i]});
+  }
+  costModelLog() << "rootPhaseMap: " << plan.rootPhaseIds.size() << " roots -> "
+                 << phaseRuns.size() << " phases\n";
+  for (const PhaseRun &run : phaseRuns) {
+    std::string line;
+    llvm::raw_string_ostream os(line);
+    os << "[" << run.begin << ".." << run.end << "] " << run.phaseId << " ("
+       << (run.end - run.begin + 1) << " ops: "
+       << plan.rootOperations[run.begin]->getName().getStringRef();
+    if (run.end > run.begin)
+      os << " .. " << plan.rootOperations[run.end]->getName().getStringRef();
+    os << ")";
+    costModelLog() << os.str() << "\n";
+    for (size_t i = run.begin; i <= run.end; ++i) {
+      Operation *root = plan.rootOperations[i];
+      costModelLog() << "root[" << i << "] ";
+      if (root->hasAttr("ta.auto_blockify_v1.loop")) {
+        // The AutoBlockify scf.for is a scheduling shell: it owns loop
+        // control only and its direct body operations are the roots that
+        // follow, so the region is elided here to avoid printing the same
+        // ops twice.
+        root->print(llvm::errs(), mlir::OpPrintingFlags().skipRegions());
+        llvm::errs()
+            << " {scheduling shell: body ops follow as separate roots}\n";
+      } else {
+        root->print(llvm::errs());
+        llvm::errs() << "\n";
+      }
+    }
+  }
   return llvm::Error::success();
 }
 
@@ -760,26 +977,29 @@ static LogicalStage *findStage(StagePartition &partition, llvm::StringRef id) {
   return nullptr;
 }
 
-static llvm::StringRef stageIdForPhase(PhaseBoundaryDomain domain,
-                                       llvm::StringRef phaseId) {
-  if (domain == PhaseBoundaryDomain::TriangularRecurrence)
-    return llvm::StringSwitch<llvm::StringRef>(phaseId)
-        .Case("head", "head_index_mask")
-        .Case("diagonal_load", "load_diagonal_tiles")
-        .Case("diagonal_inverse", "diagonal_inverse_recurrence")
-        .Default({});
-  if (domain == PhaseBoundaryDomain::LoadedIndexRowwiseReduction)
-    return llvm::StringSwitch<llvm::StringRef>(phaseId)
-        .Case("row_dispatch", "row_index_generation")
-        .Case("row_load", "indirect_row_gather")
-        .Case("row_reduction", "rowwise_reduction")
-        .Case("convert_store", "conversion_pack_store")
-        .Default({});
+static llvm::StringRef stageIdForPhase(llvm::StringRef phaseId) {
+  // Unified mapping for the GenericDataflow domain: every Phase id comes
+  // from the fine-grained dataflow-role machine and maps to exactly one
+  // Stage id from the kGenericRoles table (head stages before the anchor,
+  // tail stages behind it).
   return llvm::StringSwitch<llvm::StringRef>(phaseId)
-      .Case("index_setup", "index_generation")
-      .Case("gather_tiles", "indirect_tile_gather")
-      .Case("dot", "tiny_cube_dot")
-      .Case("output_store", "store_dot_result")
+      .Case("generic_setup", "prologue_setup")
+      .Case("generic_load", "input_load")
+      .Case("generic_gather", "indirect_gather")
+      .Case("generic_dot", "cube_dot")
+      .Case("generic_reduce", "rowwise_reduce")
+      .Case("generic_loop", "pipelined_loop")
+      .Case("generic_convert", "conversion_pack")
+      .Case("generic_store", "main_store")
+      .Case("generic_anchor", "local_simt_anchor")
+      .Case("generic_tail_setup", "epilogue_setup")
+      .Case("generic_tail_load", "tail_load")
+      .Case("generic_tail_gather", "tail_indirect_gather")
+      .Case("generic_tail_dot", "tail_cube_dot")
+      .Case("generic_tail_reduce", "tail_rowwise_reduce")
+      .Case("generic_tail_loop", "tail_pipelined_loop")
+      .Case("generic_tail_convert", "tail_conversion_pack")
+      .Case("generic_tail_store", "epilogue_store")
       .Default({});
 }
 
@@ -813,13 +1033,15 @@ static llvm::Error assignOperation(LogicalStage *stage, Operation *operation,
 static llvm::Error
 attachCompleteOperationOwnership(StagePartition &partition,
                                  const PhaseBoundaryPlan &plan) {
-  if (!plan.hasOperationGraph())
+  COSTMODEL_TRACE_DEBUG("attachCompleteOperationOwnership");
+  if (!plan.hasOperationGraph()) {
+    costModelLog() << "ERROR: no operation graph\n";
     return llvm::createStringError(
         std::errc::invalid_argument,
         "StageBoundaryAnalysis requires complete Phase root ownership");
+  }
   llvm::DenseSet<Operation *> owned;
   int64_t lastStageOrdinal = -1;
-  bool mergeStoreReached = findStage(partition, "dense_dot_tail") == nullptr;
 
   for (auto indexedRoot : llvm::enumerate(plan.rootOperations)) {
     Operation *root = indexedRoot.value();
@@ -840,14 +1062,8 @@ attachCompleteOperationOwnership(StagePartition &partition,
                                : "physical_program_dispatch");
     }
 
-    if (!target && plan.domain == PhaseBoundaryDomain::TriangularRecurrence &&
-        phaseId == "merge_store") {
-      mergeStoreReached |= operationTreeContainsName(root, "tt.store");
-      target = findStage(partition, mergeStoreReached ? "store_inverse_tile"
-                                                      : "dense_dot_tail");
-    }
     if (!target)
-      target = findStage(partition, stageIdForPhase(plan.domain, phaseId));
+      target = findStage(partition, stageIdForPhase(phaseId));
     const int64_t ordinal = getStageOrdinal(partition, target);
     if (ordinal < 0)
       return llvm::createStringError(
@@ -871,6 +1087,8 @@ attachCompleteOperationOwnership(StagePartition &partition,
   partition.operationOwnershipComplete = true;
   partition.modeledOperationCount =
       static_cast<int64_t>(plan.rootOperations.size());
+  costModelDebug() << "operationOwnershipComplete=true modeledOperationCount="
+                   << partition.modeledOperationCount << "\n";
   return llvm::Error::success();
 }
 
@@ -931,6 +1149,7 @@ static int64_t staticTensorBytes(llvm::ArrayRef<Value> values) {
 /// Values defined outside and consumed inside are live-ins; values defined
 /// inside and consumed by any operation outside are live-outs.
 static void deriveStageLiveValues(StagePartition &partition) {
+  COSTMODEL_TRACE_DEBUG("deriveStageLiveValues");
   for (LogicalPhase &phase : partition.phases) {
     for (LogicalStage &stage : phase.stages) {
       llvm::DenseSet<Operation *> owned;
@@ -953,6 +1172,11 @@ static void deriveStageLiveValues(StagePartition &partition) {
       stage.liveOuts.assign(liveOuts.begin(), liveOuts.end());
       stage.liveInBytes = staticTensorBytes(stage.liveIns);
       stage.liveOutBytes = staticTensorBytes(stage.liveOuts);
+      costModelDebug() << "stage \"" << stage.id
+                       << "\" liveIns.size()=" << stage.liveIns.size()
+                       << " liveOuts.size()=" << stage.liveOuts.size()
+                       << " liveInBytes=" << stage.liveInBytes
+                       << " liveOutBytes=" << stage.liveOutBytes << "\n";
     }
   }
 }
@@ -963,14 +1187,18 @@ static void deriveStageLiveValues(StagePartition &partition) {
 /// charging its complete live-out footprint would invent UB traffic.
 static void deriveLocalSimtScopeTraffic(StagePartition &partition,
                                         const SimtAnchorPlan &anchorPlan) {
+  COSTMODEL_TRACE_DEBUG("deriveLocalSimtScopeTraffic");
   for (LogicalPhase &phase : partition.phases) {
     for (LogicalStage &stage : phase.stages) {
       stage.localSimtScopeCount = 0;
       stage.scopeInputTensorBytes = 0;
       stage.scopeOutputTensorBytes = 0;
       auto merged = mergeSimtStageAnchors(anchorPlan, stage.simtAnchorIndices);
-      if (!merged)
+      if (!merged) {
+        costModelDebug() << "stage \"" << stage.id
+                         << "\" no merged anchor (localSimtScopeCount=0)\n";
         continue;
+      }
       {
         const SimtAnchorDescriptor &anchor = *merged;
         llvm::SmallVector<Operation *> roots;
@@ -1030,6 +1258,12 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
         stage.scopeOutputTensorBytes +=
             staticTensorBytes(returned.getArrayRef());
       }
+      costModelDebug() << "stage \"" << stage.id
+                       << "\" localSimtScopeCount=" << stage.localSimtScopeCount
+                       << " scopeInputTensorBytes="
+                       << stage.scopeInputTensorBytes
+                       << " scopeOutputTensorBytes="
+                       << stage.scopeOutputTensorBytes << "\n";
     }
   }
 }
@@ -1039,6 +1273,7 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
 llvm::Expected<ProgramStructure>
 ProgramStructureAnalysis::analyze(ModuleOp module,
                                   const SimtAnchorPlan &anchorPlan) const {
+  COSTMODEL_TRACE_DEBUG("ProgramStructureAnalysis::analyze");
   if (!module)
     return llvm::createStringError(
         std::errc::invalid_argument,
@@ -1114,28 +1349,32 @@ ProgramStructureAnalysis::analyze(ModuleOp module,
 static std::optional<PhaseBoundaryPlan>
 identifyPhaseBoundary(const SimdSimtFeatureSummary &features,
                       const StagePartitionerOptions &options) {
-  if (features.simtAnchors.triangularSolves.size() == 1 &&
-      features.simtAnchors.count > 0) {
-    PhaseBoundaryPlan plan{PhaseBoundaryDomain::TriangularRecurrence,
-                           "triangular_recurrence",
-                           features.simtAnchors.triangularSolves.front()};
-    return plan;
+  COSTMODEL_TRACE_DEBUG("identifyPhaseBoundary");
+  costModelDebug() << "features.simtAnchors.triangularSolves.size()="
+                   << features.simtAnchors.triangularSolves.size() << "\n";
+  costModelDebug() << "features.simtAnchors.count="
+                   << features.simtAnchors.count << "\n";
+  costModelDebug()
+      << "features.dotOps=" << features.dotOps
+      << " reduceOps=" << features.reduceOps
+      << " loadedIndexDependentMemoryOps="
+      << features.loadedIndexDependentMemoryOps
+      << " loadOps=" << features.loadOps << " storeOps=" << features.storeOps
+      << " dotFlops=" << features.dotFlops
+      << " tinyDotFlopsMax=" << options.tinyDotFlopsMax << "\n";
+  // Every kernel with memory traffic is partitioned by the same
+  // fine-grained monotonic dataflow-role state machine; there is no domain
+  // or per-pattern dispatch.  The stage structures that the retired
+  // specialized templates (triangular recurrence, loaded-index rowwise
+  // reduction, indirect underfilled dot) used to hard-code emerge from the
+  // machine itself.
+  if (features.loadOps > 0 || features.storeOps > 0) {
+    costModelLog() << "generic dataflow machine engaged (loadOps="
+                   << features.loadOps << " storeOps=" << features.storeOps
+                   << ")\n";
+    return PhaseBoundaryPlan{};
   }
-  if (features.dotOps == 0 && features.reduceOps > 0 &&
-      features.loadedIndexDependentMemoryOps > 0 && features.loadOps > 0 &&
-      features.storeOps > 0) {
-    PhaseBoundaryPlan plan{PhaseBoundaryDomain::LoadedIndexRowwiseReduction,
-                           "loaded_index_rowwise_reduction", std::nullopt};
-    return plan;
-  }
-  if (features.dotOps > 0 && features.reduceOps == 0 &&
-      features.loadedIndexDependentMemoryOps > 0 &&
-      features.dotFlops <= options.tinyDotFlopsMax && features.loadOps > 0 &&
-      features.storeOps > 0) {
-    PhaseBoundaryPlan plan{PhaseBoundaryDomain::IndirectUnderfilledDot,
-                           "indirect_underfilled_dot", std::nullopt};
-    return plan;
-  }
+  costModelLog() << "no memory traffic, nothing to route\n";
   return std::optional<PhaseBoundaryPlan>{};
 }
 
@@ -1144,12 +1383,17 @@ PhaseBoundaryAnalysis::analyze(ModuleOp module,
                                const SimtAnchorPlan &anchorPlan,
                                const SimdSimtFeatureSummary &features,
                                const StagePartitionerOptions &options) const {
+  COSTMODEL_TRACE("PhaseBoundaryAnalysis::analyze");
   auto plan = identifyPhaseBoundary(features, options);
-  if (!plan)
+  if (!plan) {
+    costModelLog() << "no PhaseBoundaryPlan identified\n";
     return std::optional<PhaseBoundaryPlan>{};
+  }
   auto structure = ProgramStructureAnalysis().analyze(module, anchorPlan);
   if (!structure)
     return structure.takeError();
+  costModelDebug() << "ProgramStructure.rootOperations.size()="
+                   << structure->rootOperations.size() << "\n";
   plan->rootOperations = std::move(structure->rootOperations);
   plan->localSimtAnchorRoots = std::move(structure->localSimtAnchorRoots);
   if (llvm::Error error = assignRootPhaseIds(*plan))
@@ -1161,28 +1405,20 @@ llvm::Expected<StagePartition>
 StageBoundaryAnalysis::analyze(const PhaseBoundaryPlan &phasePlan,
                                const SimdSimtFeatureSummary &features,
                                const SimtAnchorPlan *anchorPlan) const {
-  if (!phasePlan.hasOperationGraph() || !anchorPlan)
+  COSTMODEL_TRACE("StageBoundaryAnalysis::analyze");
+  if (!phasePlan.hasOperationGraph() || !anchorPlan) {
+    costModelLog() << "ERROR: requires PreparedTTIR ownership\n";
     return llvm::createStringError(
         std::errc::invalid_argument,
         "StageBoundaryAnalysis requires PreparedTTIR ownership");
-  StagePartition partition;
-  switch (phasePlan.domain) {
-  case PhaseBoundaryDomain::TriangularRecurrence:
-    if (!phasePlan.triangularSolve)
-      return llvm::createStringError(
-          std::errc::invalid_argument,
-          "triangular PhaseBoundaryPlan has no recurrence facts");
-    partition =
-        partitionTriangular(features, *phasePlan.triangularSolve, &phasePlan);
-    break;
-  case PhaseBoundaryDomain::LoadedIndexRowwiseReduction:
-    partition = partitionRowwise(features, &phasePlan);
-    break;
-  case PhaseBoundaryDomain::IndirectUnderfilledDot:
-    partition = partitionIndirectDot(features, &phasePlan);
-    break;
   }
-  partition.domain = phasePlan.domainName;
+  StagePartition partition;
+  {
+    auto partitionOr = partitionGeneric(features, &phasePlan, anchorPlan);
+    if (!partitionOr)
+      return partitionOr.takeError();
+    partition = std::move(*partitionOr);
+  }
   if (llvm::Error error =
           attachCompleteOperationOwnership(partition, phasePlan))
     return std::move(error);
@@ -1193,6 +1429,7 @@ StageBoundaryAnalysis::analyze(const PhaseBoundaryPlan &phasePlan,
 }
 
 llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
+  COSTMODEL_TRACE("StageFeatureAnalysis::analyze");
   for (LogicalPhase &phase : partition.phases) {
     for (LogicalStage &stage : phase.stages) {
       StageModelFeatures &facts = stage.features;
@@ -1268,6 +1505,20 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
             std::max<int64_t>(facts.divergentBranchCount > 0 ? 1 : 0,
                               facts.divergentBranchCount / algorithmLoopCount);
       }
+      costModelDebug() << "stage \"" << stage.id
+                       << "\" features: hasLoop=" << facts.hasLoop
+                       << " hasLoopCarriedDataDependency="
+                       << facts.hasLoopCarriedDataDependency
+                       << " hasReduction=" << facts.hasReduction
+                       << " hasDot=" << facts.hasDot
+                       << " hasIndirectMemory=" << facts.hasIndirectMemory
+                       << " hasContiguousMemory=" << facts.hasContiguousMemory
+                       << " hasConversionPack=" << facts.hasConversionPack
+                       << " conditionalBranchCount="
+                       << facts.conditionalBranchCount
+                       << " divergentBranchCount=" << facts.divergentBranchCount
+                       << " parallelRecurrenceGroupCount="
+                       << facts.parallelRecurrenceGroupCount << "\n";
       if (!facts.isValid())
         return llvm::createStringError(std::errc::invalid_argument,
                                        "Stage '%s' has invalid features",
@@ -1279,8 +1530,11 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
 
 llvm::Error StageKindClassifier::analyze(StagePartition &partition,
                                          int64_t tinyDotFlopsMax) const {
-  if (!partition.operationOwnershipComplete)
+  COSTMODEL_TRACE("StageKindClassifier::analyze");
+  if (!partition.operationOwnershipComplete) {
+    costModelLog() << "operationOwnershipComplete=false, skipping\n";
     return llvm::Error::success();
+  }
   auto compatible = [](StageCostModelKind kind,
                        const StageModelFeatures &facts) {
     switch (kind) {
@@ -1356,16 +1610,24 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
         stage.scheduleKind = StageScheduleKind::IndependentPipelined;
       else if (stage.costModelKind == StageCostModelKind::LoopCarriedRecurrence)
         stage.scheduleKind = StageScheduleKind::LoopCarriedSerial;
+      costModelDebug() << "stage \"" << stage.id
+                       << "\" final costModelKind="
+                       << stringifyStageCostModel(stage.costModelKind)
+                       << " scheduleKind="
+                       << static_cast<int>(stage.scheduleKind) << "\n";
     }
   }
   return llvm::Error::success();
 }
 
 llvm::Error StageWorkloadAnalysis::analyze(StagePartition &partition) const {
-  if (!partition.operationOwnershipComplete)
+  COSTMODEL_TRACE("StageWorkloadAnalysis::analyze");
+  if (!partition.operationOwnershipComplete) {
+    costModelLog() << "ERROR: requires complete operation ownership\n";
     return llvm::createStringError(
         std::errc::invalid_argument,
         "StageWorkloadAnalysis requires complete operation ownership");
+  }
   for (LogicalPhase &phase : partition.phases) {
     for (LogicalStage &stage : phase.stages) {
       StageWorkload work;
@@ -1374,16 +1636,25 @@ llvm::Error StageWorkloadAnalysis::analyze(StagePartition &partition) const {
       const int64_t fallbackLoopTripCount =
           loopCount > 0 ? std::max<int64_t>(1, stage.iterationCount / loopCount)
                         : 1;
+      costModelDebug() << "stage \"" << stage.id
+                       << "\" iterationCount=" << stage.iterationCount
+                       << " loopCount=" << loopCount
+                       << " fallbackLoopTripCount=" << fallbackLoopTripCount
+                       << " operations.size()=" << stage.operations.size()
+                       << "\n";
       for (Operation *root : stage.operations)
         accumulateDynamicOperationTree(root, work, 1.0, fallbackLoopTripCount);
       recomputeIssueElements(work);
       stage.workload = std::move(work);
       makePerIteration(stage);
-      if (!stage.workload.isFiniteAndNonNegative())
+      if (!stage.workload.isFiniteAndNonNegative()) {
+        costModelLog() << "ERROR: invalid workload for stage \"" << stage.id
+                       << "\"\n";
         return llvm::createStringError(
             std::errc::invalid_argument,
             "Stage '%s' has invalid operation-derived workload",
             stage.id.c_str());
+      }
     }
   }
   return llvm::Error::success();
@@ -1391,9 +1662,12 @@ llvm::Error StageWorkloadAnalysis::analyze(StagePartition &partition) const {
 
 llvm::Error
 StagePartitionVerifier::verify(const StagePartition &partition) const {
-  if (partition.phases.empty())
+  COSTMODEL_TRACE("StagePartitionVerifier::verify");
+  if (partition.phases.empty()) {
+    costModelLog() << "ERROR: no Phase\n";
     return llvm::createStringError(std::errc::invalid_argument,
                                    "StagePartition has no Phase");
+  }
   llvm::StringSet<> phaseIds;
   llvm::StringSet<> stageIds;
   llvm::DenseSet<Operation *> ownedOperations;
@@ -1451,6 +1725,9 @@ StagePartitionVerifier::verify(const StagePartition &partition) const {
     return llvm::createStringError(
         std::errc::invalid_argument,
         "StagePartition requires complete TTIR operation ownership");
+  costModelLog() << "verify passed: phases=" << partition.phases.size()
+                 << " modeledOperationCount=" << partition.modeledOperationCount
+                 << " ownedOperations=" << ownedOperations.size() << "\n";
   return llvm::Error::success();
 }
 
@@ -1458,6 +1735,11 @@ llvm::Error
 StageModeLegalityAnalysis::analyze(StagePartition &partition,
                                    int64_t maximumSuperblockFactor,
                                    bool scopeSuperblockMaterializable) const {
+  COSTMODEL_TRACE("StageModeLegalityAnalysis::analyze");
+  costModelDebug() << "maximumSuperblockFactor=" << maximumSuperblockFactor
+                   << " scopeSuperblockMaterializable="
+                   << (scopeSuperblockMaterializable ? "true" : "false")
+                   << "\n";
   const int64_t maximum = std::clamp<int64_t>(maximumSuperblockFactor, 1, 4);
   // Local and whole-kernel SuperBlock candidates consume the same SIMT warp
   // resources.  Do not regenerate F4 here after evaluateStageModel has
@@ -1507,31 +1789,107 @@ llvm::Expected<std::optional<StagePartition>>
 StagePartitioner::partition(ModuleOp module, const SimtAnchorPlan &anchorPlan,
                             const SimdSimtFeatureSummary &features,
                             const StagePartitionerOptions &options) const {
+  COSTMODEL_TRACE("StagePartitioner::partition");
+  costModelLog() << "input: maxFactor=" << options.maximumSuperblockFactor
+                 << " tinyDotFlopsMax=" << options.tinyDotFlopsMax
+                 << " scopeF4="
+                 << (options.scopeSuperblockMaterializable ? "true" : "false")
+                 << " anchors=" << features.simtAnchors.count
+                 << " loadOps=" << features.loadOps
+                 << " storeOps=" << features.storeOps
+                 << " reduceOps=" << features.reduceOps
+                 << " dotOps=" << features.dotOps << "\n";
+
   auto phasePlan =
       PhaseBoundaryAnalysis().analyze(module, anchorPlan, features, options);
   if (!phasePlan)
     return phasePlan.takeError();
-  if (!*phasePlan)
+  if (!*phasePlan) {
+    costModelLog() << "no PhaseBoundaryPlan (no memory traffic)\n";
     return std::optional<StagePartition>{};
+  }
+  costModelDebug() << "PhaseBoundaryPlan.rootOperations.size()="
+                   << (*phasePlan)->rootOperations.size() << "\n";
+
+  // The unified GenericDataflow domain is best-effort: any downstream
+  // partition failure (requires_split, non-contiguous ownership, verifier
+  // rejection, ...) soft-falls back to "no stage model" so the selector
+  // keeps backend_default lowering instead of failing the compile.  This
+  // also replaces the hard-error semantics the retired specialized domains
+  // had.
+  auto softFail =
+      [&](llvm::Error error) -> llvm::Expected<std::optional<StagePartition>> {
+    costModelLog() << "dataflow partition failed: "
+                   << llvm::toString(std::move(error))
+                   << " -> falling back to backend_default\n";
+    return std::optional<StagePartition>{};
+  };
+
   auto result =
       StageBoundaryAnalysis().analyze(**phasePlan, features, &anchorPlan);
   if (!result)
-    return result.takeError();
+    return softFail(result.takeError());
+  costModelLog() << "output: phases=" << result->phases.size() << "\n";
+  for (const LogicalPhase &phase : result->phases) {
+    std::string stageList;
+    llvm::raw_string_ostream os(stageList);
+    llvm::interleave(
+        phase.stages, os,
+        [&](const LogicalStage &stage) { os << stage.id; }, ", ");
+    costModelLog() << "Phase \"" << phase.id << "\" stages=[" << os.str()
+                   << "]\n";
+  }
+
   StageWorkloadAnalysis workloadAnalysis;
   if (llvm::Error error = workloadAnalysis.analyze(*result))
-    return std::move(error);
+    return softFail(std::move(error));
+  for (const LogicalPhase &phase : result->phases)
+    for (const LogicalStage &stage : phase.stages)
+      costModelDebug() << "stage \"" << stage.id
+                       << "\" workload: scalarOps="
+                       << stage.workload.scalarOperations
+                       << " loadBytes=" << stage.workload.loadBytes
+                       << " storeBytes=" << stage.workload.storeBytes
+                       << " dotFlops=" << stage.workload.dotFlops
+                       << " issueElements=" << stage.workload.issueElements
+                       << "\n";
+
   StageFeatureAnalysis featureAnalysis;
   if (llvm::Error error = featureAnalysis.analyze(*result))
-    return std::move(error);
+    return softFail(std::move(error));
+
   if (llvm::Error error =
           StageKindClassifier().analyze(*result, options.tinyDotFlopsMax))
-    return std::move(error);
+    return softFail(std::move(error));
+  for (const LogicalPhase &phase : result->phases)
+    for (const LogicalStage &stage : phase.stages)
+      costModelLog() << "stage \"" << stage.id
+                     << "\" costModelKind="
+                     << stringifyStageCostModel(stage.costModelKind)
+                     << " scheduleKind=" << static_cast<int>(stage.scheduleKind)
+                     << "\n";
+
   StageModeLegalityAnalysis legalityAnalysis;
   if (llvm::Error error =
           legalityAnalysis.analyze(*result, options.maximumSuperblockFactor,
                                    options.scopeSuperblockMaterializable))
-    return std::move(error);
+    return softFail(std::move(error));
+  for (const LogicalPhase &phase : result->phases)
+    for (const LogicalStage &stage : phase.stages) {
+      std::string factors;
+      llvm::raw_string_ostream os(factors);
+      llvm::interleave(stage.legalSimtFactors, os,
+                       [&](int64_t factor) { os << factor; }, ", ");
+      costModelDebug() << "stage \"" << stage.id << "\" simdLegal="
+                       << (stage.simdLegal ? "true" : "false") << " simtLegal="
+                       << (stage.simtLegal ? "true" : "false")
+                       << " legalSimtFactors=[" << os.str()
+                       << "] localSimtMaterializable="
+                       << (stage.localSimtMaterializable ? "true" : "false")
+                       << "\n";
+    }
+
   if (llvm::Error error = StagePartitionVerifier().verify(*result))
-    return std::move(error);
+    return softFail(std::move(error));
   return std::optional<StagePartition>{std::move(*result)};
 }

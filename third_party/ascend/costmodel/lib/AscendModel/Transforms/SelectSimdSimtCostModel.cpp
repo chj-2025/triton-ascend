@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AscendModel/Analysis/SimtAnchorAnalysis.h"
+#include "AscendModel/CostModelTrace.h"
 #include "AscendModel/RouteModel/SimdSimtCostModel.h"
 #include "AscendModel/Transforms/Passes.h"
 #include "AscendModel/Transforms/SimtSelection.h"
@@ -140,9 +141,13 @@ struct SelectSimdSimtCostModelPass
   using SelectSimdSimtCostModelPassBase::SelectSimdSimtCostModelPassBase;
 
   void runOnOperation() override {
+    COSTMODEL_TRACE("SelectSimdSimtCostModelPass::runOnOperation");
     ModuleOp module = getOperation();
     clearPreviousSelection(module);
     const bool autoMode = mode.getValue() == "auto";
+    costModelLog() << "mode=" << mode.getValue()
+                   << " logLevel=" << costModelLogLevel << "\n";
+    costModelDumpIR("costmodel input module", module);
 
     // Selection may inspect a transformed analysis view while materializing
     // the chosen route on the route-neutral module owned by this pass.  This
@@ -160,6 +165,8 @@ struct SelectSimdSimtCostModelPass
         return;
       }
       analysisModule = *parsedAnalysisModule;
+      costModelDumpIR("analysis module (post-layout/post-AutoBlockify TTIR)",
+                      analysisModule);
     }
 
     SimdSimtCostModelOptions options;
@@ -175,6 +182,17 @@ struct SelectSimdSimtCostModelPass
         scopeSuperblockMaterializable.getValue();
     options.logicalProgramCountHint =
         std::max<int64_t>(0, logicalProgramCountHint.getValue());
+    costModelLog() << "options: numWarps=" << options.numWarps
+                   << " target=\"" << options.actualTarget
+                   << "\" compileOn91095="
+                   << (options.compileOn91095 ? "true" : "false")
+                   << " wholeKernelF4="
+                   << (options.wholeKernelSuperblockMaterializable ? "true"
+                                                                   : "false")
+                   << " scopeF4="
+                   << (options.scopeSuperblockMaterializable ? "true" : "false")
+                   << " programCountHint="
+                   << options.logicalProgramCountHint << "\n";
     if (auto capability =
             llvm::json::parse(routeTransformCapabilityJSON.getValue()))
       if (auto *object = capability->getAsObject())
@@ -185,6 +203,8 @@ struct SelectSimdSimtCostModelPass
         buildMixedSimtAnchorPlan(module, options.compileOn91095);
     SimtAnchorPlan analysisAnchorPlan =
         buildMixedSimtAnchorPlan(analysisModule, options.compileOn91095);
+    costModelDebug() << "anchorPlan.anchors.size()=" << anchorPlan.anchors.size()
+                     << "\n";
     auto reportOr =
         analyzeSimdSimtCandidates(analysisModule, analysisAnchorPlan, options);
     if (!reportOr) {
@@ -194,6 +214,15 @@ struct SelectSimdSimtCostModelPass
       return;
     }
     SimdSimtCostReport report = std::move(*reportOr);
+    costModelLog() << "report: decision="
+                   << stringifySimdSimtCandidate(report.decision)
+                   << " stageModel.applied="
+                   << (report.stageModel.applied ? "true" : "false") << "\n";
+    costModelLog() << "report: candidateCosts allSimd="
+                   << report.candidateCosts.allSimd
+                   << " allSimtOnly=" << report.candidateCosts.allSimtOnly
+                   << " mixedSimdSimt=" << report.candidateCosts.mixedSimdSimt
+                   << "\n";
 
     std::string recommended =
         report.stageModel.applied
@@ -221,21 +250,31 @@ struct SelectSimdSimtCostModelPass
     if (!report.stageModel.applied)
       applicationReason = "stage_model_not_applicable";
     bool hasExplicitScope = containsExplicitVectorScope(module);
+    costModelLog() << "hasExplicitScope="
+                   << (hasExplicitScope ? "true" : "false") << "\n";
     if (recommended == kMixedSimdSimt) {
+      costModelLog() << "recommended=mixed_simd_simt, checking action support\n";
       if (hasExplicitScope) {
         actionSupported = false;
         applicationReason = "explicit_scope_present";
+        costModelLog() << "actionSupported=false reason=explicit_scope_present\n";
       } else if (!anchorPlansHaveCompatibleIndices(analysisAnchorPlan,
                                                    anchorPlan)) {
         actionSupported = false;
         applicationReason = "analysis_materialization_anchor_mismatch";
+        costModelLog() << "actionSupported=false reason=analysis_materialization_anchor_mismatch\n";
       } else {
         selectedMixedAnchorPlan =
             buildSelectedMixedAnchorPlan(report.stageModel, anchorPlan);
         mixedAnchors = selectedMixedAnchorPlan.materializableRoots();
+        costModelDebug()
+            << "selectedMixedAnchorPlan.anchors.size()="
+            << selectedMixedAnchorPlan.anchors.size()
+            << " mixedAnchors.size()=" << mixedAnchors.size() << "\n";
         if (mixedAnchors.empty()) {
           actionSupported = false;
           applicationReason = "no_materializable_mixed_anchor";
+          costModelLog() << "actionSupported=false reason=no_materializable_mixed_anchor\n";
         }
       }
       // A factor>1 mixed route needs batching of the surrounding SIMD
@@ -246,12 +285,14 @@ struct SelectSimdSimtCostModelPass
           !options.scopeSuperblockMaterializable) {
         actionSupported = false;
         applicationReason = "scope_superblock_not_materializable";
+        costModelLog() << "actionSupported=false reason=scope_superblock_not_materializable\n";
       }
     } else if (recommended == kAllSimtOnly && hasExplicitScope) {
       // Preserve explicit local SIMD/SIMT/cube scope semantics instead of
       // replacing the whole kernel with a pure-SIMT route.
       actionSupported = false;
       applicationReason = "explicit_scope_present";
+      costModelLog() << "recommended=all_simt_only, hasExplicitScope=true, actionSupported=false\n";
     }
     // Both whole-kernel and mixed-kernel V1 schedules launch
     // numWarps * factor logical warp groups.  Treating a mixed factor as the
@@ -261,13 +302,26 @@ struct SelectSimdSimtCostModelPass
     if (selectedSuperblockFactor > 1 && selectedWarpCount > 64) {
       actionSupported = false;
       applicationReason = "superblock_warp_limit_exceeded";
+      costModelLog() << "actionSupported=false reason=superblock_warp_limit_exceeded"
+                     << " selectedSuperblockFactor=" << selectedSuperblockFactor
+                     << " selectedWarpCount=" << selectedWarpCount
+                     << " (limit=64)\n";
     }
     if (recommended == kAllSimtOnly && selectedSuperblockFactor > 1 &&
         !report.features.autoBlockifyV1Applied &&
         !options.wholeKernelSuperblockMaterializable) {
       actionSupported = false;
       applicationReason = "superblock_requires_auto_blockify_v1";
+      costModelLog() << "actionSupported=false reason=superblock_requires_auto_blockify_v1\n";
     }
+
+    costModelLog() << "final: recommended=\"" << recommended
+                   << "\" actionSupported="
+                   << (actionSupported ? "true" : "false")
+                   << " selectedSuperblockFactor=" << selectedSuperblockFactor
+                   << "\n";
+    costModelLog() << "final: applicationReason=\"" << applicationReason
+                   << "\"\n";
 
     if (autoMode && actionSupported) {
       effective = recommended;
@@ -307,8 +361,15 @@ struct SelectSimdSimtCostModelPass
     if (effective == kMixedSimdSimt &&
         failed(materializeSimtAnchorPlan(module, selectedMixedAnchorPlan,
                                          selectedSuperblockFactor))) {
+      costModelLog() << "ERROR: materializeSimtAnchorPlan failed\n";
       signalPassFailure();
       return;
+    }
+    costModelLog() << "effective=\"" << effective << "\" selectionSource=\""
+                   << selectionSource << "\"\n";
+    if (effective == kMixedSimdSimt) {
+      costModelLog() << "materialized mixed anchors successfully\n";
+      costModelDumpIR("materialized module (SIMT scopes applied)", module);
     }
 
     llvm::json::Object reportJSON = report.toJSON();

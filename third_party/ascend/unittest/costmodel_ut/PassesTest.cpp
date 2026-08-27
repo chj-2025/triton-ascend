@@ -356,6 +356,84 @@ module {
 }
 
 TEST(CostModelPassesTest,
+     SynthesizesGenericComputeRegionForPlainComputeSpan) {
+  mlir::MLIRContext context;
+  context.allowUnregisteredDialects();
+  auto module = parseModule(context, R"mlir(
+module {
+  func.func @main(%base: tensor<4xi64>, %value: tensor<4xf32>)
+      -> tensor<4xf32> {
+    %ptrs = "tt.addptr"(%base, %base)
+      : (tensor<4xi64>, tensor<4xi64>) -> tensor<4x!tt.ptr<f32>>
+    %loaded = "tt.load"(%ptrs) : (tensor<4x!tt.ptr<f32>>) -> tensor<4xf32>
+    %squared = arith.mulf %loaded, %loaded : tensor<4xf32>
+    %sum = arith.addf %squared, %value : tensor<4xf32>
+    return %sum : tensor<4xf32>
+  }
+}
+)mlir");
+  ASSERT_TRUE(module);
+
+  // No specialized anchor matches (the load pointer is a block argument, not
+  // a loaded index), so the plain elementwise span between the load and the
+  // return is synthesized as generic scope evidence for the mixed route.
+  auto plan = buildMixedSimtAnchorPlan(*module, /*compileOn91095=*/true);
+  ASSERT_EQ(plan.anchors.size(), 1u);
+  const auto &anchor = plan.anchors.front();
+  EXPECT_EQ(anchor.kind, mlir::ascend::SimtAnchorKind::GenericComputeRegion);
+  EXPECT_TRUE(anchor.materializable);
+  EXPECT_TRUE(anchor.lowerability.allSimd);
+  EXPECT_TRUE(anchor.lowerability.mixed);
+  // The span is the elementwise compute chain; pointer setup stays outside
+  // because it carries no compute substance.
+  ASSERT_EQ(anchor.scopeOperations.size(), 2u);
+  EXPECT_EQ(anchor.scopeOperations.front()->getName().getStringRef(),
+            "arith.mulf");
+  EXPECT_EQ(anchor.scopeOperations.back()->getName().getStringRef(),
+            "arith.addf");
+  EXPECT_EQ(anchor.scopeInsertionPoint, anchor.operation);
+  EXPECT_TRUE(plan.kernelLowerability.mixed);
+
+  auto features = analyzeSimdSimtFeatures(*module, plan);
+  if (!features)
+    FAIL() << llvm::toString(features.takeError());
+  EXPECT_EQ(features->simtAnchors.count, 1);
+  ASSERT_TRUE(mlir::succeeded(materializeSimtAnchorPlan(*module, plan, 1)));
+  Operation *scope = findFirstOp(*module, "scope.scope");
+  ASSERT_NE(scope, nullptr);
+  EXPECT_EQ(scope->getAttrOfType<mlir::StringAttr>("vector_mode").getValue(),
+            "simt");
+}
+
+TEST(CostModelPassesTest,
+     GenericComputeRegionRejectedWhenPointerEscapesTheSpan) {
+  mlir::MLIRContext context;
+  context.allowUnregisteredDialects();
+  auto module = parseModule(context, R"mlir(
+module {
+  func.func @main(%a: tensor<4xf32>, %base: tensor<4xi64>, %c: tensor<4xi64>)
+      -> tensor<4xf32> {
+    %x = arith.mulf %a, %a : tensor<4xf32>
+    %ptrs = "tt.addptr"(%base, %c)
+      : (tensor<4xi64>, tensor<4xi64>) -> tensor<4x!tt.ptr<f32>>
+    %loaded = "tt.load"(%ptrs) : (tensor<4x!tt.ptr<f32>>) -> tensor<4xf32>
+    %y = arith.addf %loaded, %x : tensor<4xf32>
+    "tt.store"(%ptrs, %y) : (tensor<4x!tt.ptr<f32>>, tensor<4xf32>) -> ()
+    return %y : tensor<4xf32>
+  }
+}
+)mlir");
+  ASSERT_TRUE(module);
+
+  // The span between the two compute runs swallows the pointer that the
+  // trailing store consumes; a scope may capture pointers but must never
+  // return them, so no anchor is synthesized and the kernel keeps the
+  // backend_default mixed path.
+  auto plan = buildMixedSimtAnchorPlan(*module, /*compileOn91095=*/true);
+  EXPECT_TRUE(plan.anchors.empty());
+}
+
+TEST(CostModelPassesTest,
      SimtAnchorAnalysisRecognizesTriangularSolveLoopGroup) {
   mlir::MLIRContext context;
   context.allowUnregisteredDialects();

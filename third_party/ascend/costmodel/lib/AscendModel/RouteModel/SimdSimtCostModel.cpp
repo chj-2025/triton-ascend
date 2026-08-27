@@ -9,6 +9,7 @@
 #include "AscendModel/RouteModel/SimdSimtCostModel.h"
 #include "AscendModel/Analysis/SimtAnchorAnalysis.h"
 #include "AscendModel/Analysis/StagePartitioner.h"
+#include "AscendModel/CostModelTrace.h"
 #include "AscendModel/Profile/MicrobenchmarkProfile.h"
 #include "AscendModel/RouteModel/StageCostModels.h"
 
@@ -335,12 +336,17 @@ static void readStageResources(ProfileJSONReader &reader,
 
 static llvm::Expected<CandidateProfile>
 loadCandidateProfile(llvm::StringRef requestedPath) {
+  COSTMODEL_TRACE("loadCandidateProfile");
   std::string path = requestedPath.empty() ? getDefaultSimdSimtProfilePath()
                                            : requestedPath.str();
-  if (path.empty())
+  costModelLog() << "requestedPath=\"" << requestedPath << "\"\n";
+  costModelLog() << "resolvedPath=\"" << path << "\"\n";
+  if (path.empty()) {
+    costModelLog() << "ERROR: profile path is empty\n";
     return llvm::createStringError(std::errc::no_such_file_or_directory,
                                    "SIMD/SIMT profile path is empty; set "
                                    "TRITON_ASCEND_SIMD_SIMT_PROFILE");
+  }
 
   auto buffer = llvm::MemoryBuffer::getFile(path);
   if (!buffer)
@@ -550,6 +556,17 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
     return llvm::createStringError(
         std::errc::invalid_argument,
         "SIMD/SIMT profile contains invalid hardware rates");
+  costModelLog() << "profile loaded: version=\"" << hardware.profileVersion
+                 << "\" target=\"" << hardware.target << "\"\n";
+  costModelDebug() << "simd.vectorWidth=" << hardware.simd.vectorWidth
+                   << " simd.issueWidth=" << hardware.simd.issueWidth
+                   << " simt.issueWidth=" << hardware.simt.issueWidth
+                   << " superblockUsefulFactorLimit="
+                   << hardware.superblockUsefulFactorLimit
+                   << " transition.simdToSimtCycles="
+                   << hardware.transition.simdToSimtCycles
+                   << " transition.simtToSimdCycles="
+                   << hardware.transition.simtToSimdCycles << "\n";
   std::string canonicalProfile;
   llvm::raw_string_ostream canonicalStream(canonicalProfile);
   emitPythonCanonicalJSON(*parsed, canonicalStream);
@@ -573,6 +590,8 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
     profile.contentSha256 =
         llvm::toHex(llvm::ArrayRef<uint8_t>(combinedHash), true);
   }
+  costModelDebug() << "contentSha256=" << profile.contentSha256.substr(0, 16)
+                   << "...\n";
   return profile;
 }
 
@@ -582,6 +601,17 @@ static llvm::Expected<std::optional<StageCostModelSummary>> evaluateStageModel(
     bool scopeSuperblockMaterializable, int64_t logicalProgramCountHint,
     int64_t physicalCoreCountHint, ModuleOp module,
     const SimtAnchorPlan *anchorPlan) {
+  COSTMODEL_TRACE("evaluateStageModel");
+  costModelDebug() << "numWarps=" << numWarps << "\n";
+  costModelDebug() << "wholeKernelSuperblockMaterializable="
+                   << (wholeKernelSuperblockMaterializable ? "true" : "false")
+                   << "\n";
+  costModelDebug() << "scopeSuperblockMaterializable="
+                   << (scopeSuperblockMaterializable ? "true" : "false")
+                   << "\n";
+  costModelDebug() << "logicalProgramCountHint=" << logicalProgramCountHint
+                   << "\n";
+  costModelDebug() << "physicalCoreCountHint=" << physicalCoreCountHint << "\n";
   StagePartitionerOptions partitionerOptions;
   partitionerOptions.tinyDotFlopsMax = profile.structural.tinyDotFlopsMax;
   partitionerOptions.maximumSuperblockFactor =
@@ -603,17 +633,29 @@ static llvm::Expected<std::optional<StageCostModelSummary>> evaluateStageModel(
   }
   partitionerOptions.scopeSuperblockMaterializable =
       scopeSuperblockMaterializable;
+  costModelDebug() << "partitionerOptions.tinyDotFlopsMax="
+                   << partitionerOptions.tinyDotFlopsMax << "\n";
+  costModelDebug() << "partitionerOptions.maximumSuperblockFactor="
+                   << partitionerOptions.maximumSuperblockFactor << "\n";
+  costModelDebug() << "partitionerOptions.scopeSuperblockMaterializable="
+                   << (partitionerOptions.scopeSuperblockMaterializable ? "true"
+                                                                        : "false")
+                   << "\n";
   StagePartitioner partitioner;
-  if (!module || !anchorPlan)
+  if (!module || !anchorPlan) {
+    costModelLog() << "ERROR: module or anchorPlan is null\n";
     return llvm::createStringError(std::errc::invalid_argument,
                                    "Stage model requires PreparedTTIR and "
                                    "its anchor plan");
+  }
   auto partition =
       partitioner.partition(module, *anchorPlan, features, partitionerOptions);
   if (!partition)
     return partition.takeError();
-  if (!*partition)
+  if (!*partition) {
+    costModelLog() << "partition returned empty (no stage model)\n";
     return std::optional<StageCostModelSummary>{};
+  }
 
   HardwareProfile hardwareProfile = profile.hardware;
   hardwareProfile.logicalWarpGroupCount = std::max<int64_t>(1, numWarps);
@@ -626,13 +668,25 @@ static llvm::Expected<std::optional<StageCostModelSummary>> evaluateStageModel(
   auto routes = solveStageRoutes(*costTable, hardwareProfile.transition);
   if (!routes)
     return routes.takeError();
+  costModelDebug() << "allSimd.totalCycles=" << routes->allSimd.totalCycles
+                   << "\n";
+  costModelDebug() << "allSimt.totalCycles=" << routes->allSimt.totalCycles
+                   << "\n";
+  costModelDebug() << "mixed.totalCycles=" << routes->mixed.totalCycles << "\n";
   return std::optional<StageCostModelSummary>{std::move(*routes)};
 }
 
 static llvm::SmallVector<std::pair<double, SimdSimtCandidateKind>>
 legalCandidates(const SimdSimtCandidateScores &scores, bool allSimdLegal,
                 bool allSimtLegal, bool mixedLegal) {
+  COSTMODEL_TRACE_DEBUG("legalCandidates");
   llvm::SmallVector<std::pair<double, SimdSimtCandidateKind>> candidates;
+  costModelDebug() << "scores.allSimd=" << scores.allSimd
+                   << " legal=" << (allSimdLegal ? "true" : "false") << "\n";
+  costModelDebug() << "scores.allSimtOnly=" << scores.allSimtOnly
+                   << " legal=" << (allSimtLegal ? "true" : "false") << "\n";
+  costModelDebug() << "scores.mixedSimdSimt=" << scores.mixedSimdSimt
+                   << " legal=" << (mixedLegal ? "true" : "false") << "\n";
   if (allSimdLegal)
     candidates.push_back({scores.allSimd, SimdSimtCandidateKind::AllSIMD});
   if (allSimtLegal)
@@ -644,15 +698,21 @@ legalCandidates(const SimdSimtCandidateScores &scores, bool allSimdLegal,
   llvm::stable_sort(candidates, [](const auto &lhs, const auto &rhs) {
     return lhs.first < rhs.first;
   });
+  for (const auto &c : candidates)
+    costModelDebug() << "candidate " << stringifySimdSimtCandidate(c.second)
+                     << " cost=" << c.first << "\n";
   return candidates;
 }
 
 static SimdSimtCandidateKind chooseBest(const SimdSimtCandidateScores &scores,
                                         bool allSimdLegal, bool allSimtLegal,
                                         bool mixedLegal) {
-  return legalCandidates(scores, allSimdLegal, allSimtLegal, mixedLegal)
+  COSTMODEL_TRACE("chooseBest");
+  auto best = legalCandidates(scores, allSimdLegal, allSimtLegal, mixedLegal)
       .front()
       .second;
+  costModelLog() << "decision=" << stringifySimdSimtCandidate(best) << "\n";
+  return best;
 }
 
 } // namespace
@@ -787,19 +847,27 @@ std::string mlir::ascend::getDefaultSimdSimtProfilePath() {
 
 llvm::Expected<SimdSimtFeatureSummary>
 mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module, bool compileOn91095) {
-  if (!module)
+  COSTMODEL_TRACE("analyzeSimdSimtFeatures (module, compileOn91095)");
+  if (!module) {
+    costModelLog() << "ERROR: null ModuleOp\n";
     return llvm::createStringError(std::errc::invalid_argument,
                                    "cannot analyze a null ModuleOp");
+  }
   SimtAnchorPlan anchorPlan = buildMixedSimtAnchorPlan(module, compileOn91095);
+  costModelDebug() << "anchorPlan.anchors.size()=" << anchorPlan.anchors.size()
+                   << "\n";
   return analyzeSimdSimtFeatures(module, anchorPlan);
 }
 
 llvm::Expected<SimdSimtFeatureSummary>
 mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
                                       const SimtAnchorPlan &anchorPlan) {
-  if (!module)
+  COSTMODEL_TRACE("analyzeSimdSimtFeatures");
+  if (!module) {
+    costModelLog() << "ERROR: null ModuleOp\n";
     return llvm::createStringError(std::errc::invalid_argument,
                                    "cannot analyze a null ModuleOp");
+  }
 
   SimdSimtFeatureSummary features;
   llvm::DenseSet<Operation *> anchorRoots;
@@ -808,6 +876,18 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
       anchorPlan.anchors,
       [](const SimtAnchorDescriptor &anchor) { return anchor.materializable; });
   features.simtAnchors.kernelLowerability = anchorPlan.kernelLowerability;
+  costModelLog() << "anchors: count=" << features.simtAnchors.count
+                 << " lowerability allSimd="
+                 << (features.simtAnchors.kernelLowerability.allSimd ? "true"
+                                                                     : "false")
+                 << " allSimtOnly="
+                 << (features.simtAnchors.kernelLowerability.allSimtOnly
+                         ? "true"
+                         : "false")
+                 << " mixed="
+                 << (features.simtAnchors.kernelLowerability.mixed ? "true"
+                                                                   : "false")
+                 << "\n";
 
   for (const SimtAnchorDescriptor &anchor : anchorPlan.anchors) {
     if (anchor.triangularSolve)
@@ -824,6 +904,9 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
         if (operation && operation->getName().getStringRef() == "scf.for")
           structuralTripEstimates[operation] = 14;
   }
+  costModelDebug() << "anchorRoots.size()=" << anchorRoots.size() << "\n";
+  costModelDebug() << "structuralTripEstimates.size()="
+                   << structuralTripEstimates.size() << "\n";
 
   auto isInAnchor = [&](Operation *operation) {
     for (; operation; operation = operation->getParentOp())
@@ -831,6 +914,7 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
         return true;
     return false;
   };
+  costModelDebug() << "walking module operations to accumulate features\n";
   module.walk([&](Operation *operation) {
     if (operation->hasAttr("ta.auto_blockify_v1"))
       features.autoBlockifyV1Applied = true;
@@ -882,6 +966,25 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
       }
     }
   });
+  costModelLog() << "features: loadOps=" << features.loadOps
+                 << " storeOps=" << features.storeOps
+                 << " reduceOps=" << features.reduceOps
+                 << " dotOps=" << features.dotOps
+                 << " dotFlops=" << features.dotFlops
+                 << " tripCountMax=" << features.staticLoopTripCountMax
+                 << " anchors=" << features.simtAnchors.count << "\n";
+  costModelLog() << "features: branches=" << features.conditionalBranchCount
+                 << " divergent=" << features.divergentBranchCount
+                 << " loadedIndexOps="
+                 << features.loadedIndexDependentMemoryOps
+                 << " scope="
+                 << (features.hasExplicitScope ? "true" : "false")
+                 << " autoBlockifyV1="
+                 << (features.autoBlockifyV1Applied ? "true" : "false")
+                 << " triangularSolves="
+                 << features.simtAnchors.triangularSolves.size() << "\n";
+  costModelDebug() << "detail: autoBlockifyV1LoopCount="
+                   << features.autoBlockifyV1LoopCount << "\n";
   return features;
 }
 
@@ -890,6 +993,25 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
                                const SimdSimtCostModelOptions &options,
                                ModuleOp module,
                                const SimtAnchorPlan *anchorPlan) {
+  COSTMODEL_TRACE("estimateSimdSimtCandidatesImpl");
+  costModelDebug() << "options.numWarps=" << options.numWarps << "\n";
+  costModelDebug() << "options.compileOn91095="
+                   << (options.compileOn91095 ? "true" : "false") << "\n";
+  costModelDebug() << "options.actualTarget=\"" << options.actualTarget
+                   << "\"\n";
+  costModelDebug() << "options.profilePath=\"" << options.profilePath
+                   << "\"\n";
+  costModelDebug() << "options.logicalProgramCountHint="
+                   << options.logicalProgramCountHint << "\n";
+  costModelDebug() << "options.physicalVectorCoreCountHint="
+                   << options.physicalVectorCoreCountHint << "\n";
+  costModelDebug() << "options.wholeKernelSuperblockMaterializable="
+                   << (options.wholeKernelSuperblockMaterializable ? "true"
+                                                                   : "false")
+                   << "\n";
+  costModelDebug() << "options.scopeSuperblockMaterializable="
+                   << (options.scopeSuperblockMaterializable ? "true" : "false")
+                   << "\n";
   auto profileOrError = loadCandidateProfile(options.profilePath);
   if (!profileOrError)
     return profileOrError.takeError();
@@ -917,6 +1039,12 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
                                features.simtAnchors.count > 0 &&
                                features.simtAnchors.kernelLowerability.mixed;
   report.includeFeaturesInJSON = options.includeFeaturesInJSON;
+  costModelLog() << "candidate legality: allSimd="
+                 << (report.allSimdCandidateLegal ? "true" : "false")
+                 << " allSimtOnly="
+                 << (report.allSimtOnlyCandidateLegal ? "true" : "false")
+                 << " mixed="
+                 << (report.mixedCandidateLegal ? "true" : "false") << "\n";
 
   const int64_t numWarps =
       std::max<int64_t>(1, static_cast<int64_t>(options.numWarps));
@@ -935,23 +1063,37 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
     report.allSimdCandidateLegal &= report.stageModel.allSimd.legal;
     report.allSimtOnlyCandidateLegal &= report.stageModel.allSimt.legal;
     report.mixedCandidateLegal &= report.stageModel.mixed.legal;
+    costModelLog() << "stage model: allSimd=" << report.candidateCosts.allSimd
+                   << " allSimtOnly=" << report.candidateCosts.allSimtOnly
+                   << " mixedSimdSimt="
+                   << report.candidateCosts.mixedSimdSimt
+                   << " legal(allSimd/allSimtOnly/mixed)="
+                   << (report.allSimdCandidateLegal ? "true" : "false") << "/"
+                   << (report.allSimtOnlyCandidateLegal ? "true" : "false")
+                   << "/" << (report.mixedCandidateLegal ? "true" : "false")
+                   << "\n";
     const unsigned legalCandidateCount =
         static_cast<unsigned>(report.allSimdCandidateLegal) +
         static_cast<unsigned>(report.allSimtOnlyCandidateLegal) +
         static_cast<unsigned>(report.mixedCandidateLegal);
-    if (legalCandidateCount == 0)
+    if (legalCandidateCount == 0) {
+      costModelLog() << "ERROR: no materializable candidate\n";
       return llvm::createStringError(
           std::errc::not_supported,
           "Stage Route Model found no materializable candidate");
+    }
     report.decision = chooseBest(
         report.candidateCosts, report.allSimdCandidateLegal,
         report.allSimtOnlyCandidateLegal, report.mixedCandidateLegal);
+    costModelLog() << "final decision="
+                   << stringifySimdSimtCandidate(report.decision) << "\n";
     return report;
   }
 
   // Unknown Stage domains are deliberately not scored. The online Route
   // Model has no legacy whole-kernel fallback; the selector leaves the
   // existing backend-default lowering unchanged.
+  costModelLog() << "stage_model_not_applicable (no stage model)\n";
   report.stageModel.applied = false;
   report.unsupported.push_back("stage_model_not_applicable");
   return report;
@@ -959,9 +1101,12 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
 
 llvm::Expected<SimdSimtCostReport> mlir::ascend::analyzeSimdSimtCandidates(
     ModuleOp module, const SimdSimtCostModelOptions &options) {
-  if (!module)
+  COSTMODEL_TRACE("analyzeSimdSimtCandidates (module, options)");
+  if (!module) {
+    costModelLog() << "ERROR: null ModuleOp\n";
     return llvm::createStringError(std::errc::invalid_argument,
                                    "cannot analyze a null ModuleOp");
+  }
   SimtAnchorPlan anchorPlan =
       buildMixedSimtAnchorPlan(module, options.compileOn91095);
   return analyzeSimdSimtCandidates(module, anchorPlan, options);
@@ -970,6 +1115,7 @@ llvm::Expected<SimdSimtCostReport> mlir::ascend::analyzeSimdSimtCandidates(
 llvm::Expected<SimdSimtCostReport> mlir::ascend::analyzeSimdSimtCandidates(
     ModuleOp module, const SimtAnchorPlan &anchorPlan,
     const SimdSimtCostModelOptions &options) {
+  COSTMODEL_TRACE("analyzeSimdSimtCandidates (module, anchorPlan, options)");
   auto features = analyzeSimdSimtFeatures(module, anchorPlan);
   if (!features)
     return features.takeError();

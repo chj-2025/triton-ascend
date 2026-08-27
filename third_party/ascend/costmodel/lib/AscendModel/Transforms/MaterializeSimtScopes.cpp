@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AscendModel/Analysis/SimtAnchorAnalysis.h"
+#include "AscendModel/CostModelTrace.h"
 #include "AscendModel/Transforms/Passes.h"
 #include "AscendModel/Transforms/SimtSelection.h"
 
@@ -163,9 +164,14 @@ static LogicalResult wrapAnchorRange(ArrayRef<Operation *> ops,
 LogicalResult materializeSimtAnchorPlan(ModuleOp module,
                                         const SimtAnchorPlan &plan,
                                         int64_t superblockFactor) {
-  if (superblockFactor <= 0 || (superblockFactor & (superblockFactor - 1)) != 0)
+  COSTMODEL_TRACE("materializeSimtAnchorPlan");
+  costModelLog() << "input: anchors=" << plan.anchors.size()
+                 << " superblockFactor=" << superblockFactor << "\n";
+  if (superblockFactor <= 0 || (superblockFactor & (superblockFactor - 1)) != 0) {
+    costModelLog() << "ERROR: superblock factor must be positive power of two\n";
     return module.emitError(
         "SIMT scope superblock factor must be a positive power of two");
+  }
   struct PlannedRange {
     SmallVector<Operation *> operations;
     Operation *insertionPoint = nullptr;
@@ -188,31 +194,44 @@ LogicalResult materializeSimtAnchorPlan(ModuleOp module,
       llvm::append_range(range.operations, anchor.scopeOperations);
       range.insertionPoint = anchor.scopeInsertionPoint;
       anchorRanges.push_back(std::move(range));
+      costModelDebug() << "added anchor range: ops=" << range.operations.size()
+                       << "\n";
       continue;
     }
 
-    if (!isMaterializable(op))
+    if (!isMaterializable(op)) {
+      costModelLog() << "ERROR: anchor not materializable as local scope\n";
       return op->emitError(
           "SIMT anchor is not materializable as a local scope");
+    }
     anchorOps.push_back(op);
+    costModelDebug() << "added single anchor op\n";
   }
 
   int64_t materialized = 0;
   for (const PlannedRange &range : anchorRanges) {
+    costModelDebug() << "wrapAnchorRange ops=" << range.operations.size()
+                     << "\n";
     if (failed(wrapAnchorRange(range.operations, range.insertionPoint,
                                superblockFactor)))
       return failure();
     ++materialized;
   }
   for (Operation *op : anchorOps) {
+    costModelDebug() << "wrapAnchorOperation\n";
     if (failed(wrapAnchorOperation(op, superblockFactor)))
       return failure();
     ++materialized;
   }
 
-  if (materialized == 0)
+  if (materialized == 0) {
+    costModelLog() << "ERROR: no materializable local SIMT scope\n";
     return module.emitError(
         "mixed_simd_simt has no materializable local SIMT scope");
+  }
+  costModelLog() << "output: materialized " << materialized << " scope(s)"
+                 << " (ranges=" << anchorRanges.size()
+                 << " single=" << anchorOps.size() << ")\n";
   return success();
 }
 
@@ -237,11 +256,17 @@ struct MaterializeSimtScopesPass
   using MaterializeSimtScopesPassBase::MaterializeSimtScopesPassBase;
 
   void runOnOperation() override {
+    COSTMODEL_TRACE("MaterializeSimtScopesPass::runOnOperation");
     ModuleOp module = getOperation();
-    if (!isMixedModelDecision(module))
+    if (!isMixedModelDecision(module)) {
+      costModelLog() << "not a mixed_simd_simt decision, skipping\n";
       return;
-    if (containsLocalSimtScope(module))
+    }
+    if (containsLocalSimtScope(module)) {
+      costModelLog() << "module already contains local SIMT scope, skipping\n";
       return;
+    }
+    costModelLog() << "ERROR: missing scope.scope<simt> contract\n";
     module.emitError(
         "mixed_simd_simt requires a materialized scope.scope<simt> contract");
     signalPassFailure();

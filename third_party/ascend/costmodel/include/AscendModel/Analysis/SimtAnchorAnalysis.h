@@ -31,6 +31,17 @@ enum class SimtAnchorKind {
   PlainOneDimensionalCumsum,
   TensorAtomic,
   TriangularSolveLoop,
+  /// Synthesized scope evidence for an ordinary compute region of a kernel
+  /// where no specialized anchor matched.  This closes the mixed-route blind
+  /// spot: a plain transform span (e.g. an elementwise chain between loads)
+  /// that is faster on the scalar units previously had no materializable
+  /// anchor, so the mixed candidate was rejected before scoring.  The span
+  /// is validated up front against the same SSA contract the scope
+  /// materializer enforces (one block, no terminators/isolated/scope ops,
+  /// no pointer-like value escaping the span).  Whether the region actually
+  /// runs on SIMT is still a route-model decision that pays the scope
+  /// switching cost.
+  GenericComputeRegion,
 };
 
 llvm::StringRef stringifySimtAnchorKind(SimtAnchorKind kind);
