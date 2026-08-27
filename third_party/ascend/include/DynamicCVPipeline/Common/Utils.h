@@ -68,7 +68,10 @@ inline constexpr llvm::StringLiteral kIntraDeps = "ssbuffer.intraDeps";
 inline constexpr llvm::StringLiteral kMemCrossDeps = "ssbuffer.memCrossDeps";
 inline constexpr llvm::StringLiteral kDepMark = "ssbuffer.dep_mark";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
+inline constexpr llvm::StringLiteral kMayNotExecNPU = "may_not_exec";
 inline constexpr llvm::StringLiteral kIterCounter = "ssbuffer.iterCounter";
+inline constexpr llvm::StringLiteral kForMayNotExec =
+    "ssbuffer.for_may_not_exec";
 inline constexpr llvm::StringLiteral kClone = "ssbuffer.clone";
 inline constexpr llvm::StringLiteral kInsertionOptimization =
     "ssbuffer.insertionOptimization";
@@ -259,7 +262,80 @@ std::optional<int> getTightlyCoupledBufferId(Value allocVal);
 // `bufferization.to_tensor`'s source. Returns the input unchanged when no
 // such cast is found.
 Value traceBackToMemrefAlloc(Value v);
+bool allResultHasOneUser(Operation *op);
+
+int64_t getBTSizeFromValidBroadcastOp(linalg::BroadcastOp broadcastOp);
+
 int getLoopCarriedArgIndex(Value operand, Block *block);
+
+// Returns the index of `v` in `iterArgs` when `v` is a tensor-type iter_arg,
+// or -1 otherwise.
+int getTensorIterArgIndex(Value v, ArrayRef<Value> iterArgs);
+
+// Helper: convert OpCoreType to string for IR attribute
+inline llvm::StringRef coreTypeToString(CoreType ct) {
+  switch (ct) {
+  case CUBE_ONLY:
+    return "CUBE";
+  case VECTOR_ONLY:
+    return "VECTOR";
+  case CUBE_AND_VECTOR:
+    return "CUBE_AND_VECTOR";
+  default:
+    return "UNDETERMINED";
+  }
+}
+
+CoreType getValueCoreType(Value value);
+
+inline OpOperand *getTiedYieldOperand(Value value, Block *block) {
+  int argIdx = getLoopCarriedArgIndex(value, block);
+  if (argIdx == -1) {
+    return nullptr;
+  }
+  auto *terminator = block->getTerminator();
+  return &terminator->getOpOperand(argIdx);
+}
+
+inline Operation *getLoopCarriedDefOp(Value value, Block *block) {
+  auto *yieldOperand = getTiedYieldOperand(value, block);
+  if (yieldOperand && yieldOperand->get()) {
+    return yieldOperand->get().getDefiningOp();
+  }
+  return nullptr;
+}
+
+inline bool isTensorComputeOp(Operation *op) {
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+    if (linalg::isaCopyOpInterface(linalgOp))
+      return false;
+    auto genericOp = dyn_cast<linalg::GenericOp>(op);
+    if (genericOp && linalg::isaBroadcastOpInterface(genericOp).has_value())
+      return false;
+    if (isa<linalg::FillOp>(op))
+      return false;
+    return true;
+  }
+
+  if (op->hasTrait<mlir::OpTrait::Elementwise>()) {
+    return llvm::any_of(op->getResultTypes(),
+                        [](Type t) { return isa<RankedTensorType>(t); });
+  }
+
+  return false;
+}
+
+// Determine FixpipePreQuantMode from a trunc op.
+// Returns std::nullopt for scalars (non-shaped types) or unrecognized patterns.
+// Supported patterns:
+// - arith.truncf: f32 -> bf16, f32 -> f16
+// - arith.trunci: i32 -> i8
+std::optional<hivm::FixpipePreQuantMode>
+getFixpipePreQuantMode(Operation *truncOp);
+
+// Trace an operand's defining op back through C2C intermediate ops to find the
+// underlying producing op. Returns null when the operand has no defining op.
+Operation *getSourceThroughCIntermediateOps(Value operand);
 
 } // namespace CVPipeline
 } // namespace mlir
