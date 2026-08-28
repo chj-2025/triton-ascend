@@ -32,10 +32,11 @@ def test_indirect_load_pointer_cast_precise_size_e2e():
     block_size = 4
     block = 8
 
-    block_table_cpu = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
+    block_table_cpu = torch.tensor([10, 11, 12, 13], dtype=torch.int32, device="cpu")
     positions_cpu = torch.tensor(
         [0, 1, 4, 7, 8, 11, 12, 15],
         dtype=torch.int32,
+        device="cpu",
     )
 
     block_table = block_table_cpu.npu()

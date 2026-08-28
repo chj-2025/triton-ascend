@@ -96,10 +96,11 @@ def test_route_transform_capability_is_single_resolved_fact():
     assert capability["auto_blockify_v1_materializable"]
     assert capability["whole_kernel_superblock_factors"] == [1, 2, 4]
     assert capability["scope_superblock_factors"] == [1, 2, 4]
-    assert capability["logical_program_count_hint"] == 9
+    assert capability["source_logical_program_count_hint"] == 9
+    assert capability["logical_program_count_hint"] == 2
     assert capability["superblock_runtime_groups"]["4"] == {
-        "full_group_count": 2,
-        "tail_count": 1,
+        "full_group_count": 0,
+        "tail_count": 2,
     }
 
 
