@@ -162,7 +162,7 @@ def test_costmodel_gather_dot_min(tmp_path):
     expected = torch.matmul(a[:, indices].float(), b[indices, :].float())
     torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
     report = _load_route_report(report_path, "all_simt_only")
-    assert report["features"]["dot_ops"] == 1
+    assert any(stage["features"]["has_dot"] for stage in report["stage_model"]["logical_stages"])
     _assert_performance("gather_dot_min", launch, tmp_path / "gather_profile", 5.478, tolerance=1.35)
 
 

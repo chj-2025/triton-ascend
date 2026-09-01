@@ -16,8 +16,6 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
@@ -32,7 +30,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
-#include <limits>
 #include <optional>
 #include <set>
 #include <system_error>
@@ -126,70 +123,6 @@ public:
 private:
   std::string error;
 };
-
-static std::optional<int64_t> getConstantInteger(Value value) {
-  Operation *definingOp = value.getDefiningOp();
-  if (!definingOp || definingOp->getName().getStringRef() != "arith.constant")
-    return std::nullopt;
-  if (auto integer = definingOp->getAttrOfType<IntegerAttr>("value"))
-    return integer.getInt();
-  return std::nullopt;
-}
-
-static std::optional<int64_t> getKnownStaticLoopTripCount(Operation *op) {
-  if (!op || op->getName().getStringRef() != "scf.for" ||
-      op->getNumOperands() < 3)
-    return std::nullopt;
-  auto lower = getConstantInteger(op->getOperand(0));
-  auto upper = getConstantInteger(op->getOperand(1));
-  auto step = getConstantInteger(op->getOperand(2));
-  if (!lower || !upper || !step || *step == 0)
-    return std::nullopt;
-  int64_t span = *upper - *lower;
-  if (span > 0 && *step > 0)
-    return std::max<int64_t>(1, (span + *step - 1) / *step);
-  if (span < 0 && *step < 0) {
-    int64_t positiveSpan = -span;
-    int64_t positiveStep = -*step;
-    return std::max<int64_t>(1,
-                             (positiveSpan + positiveStep - 1) / positiveStep);
-  }
-  return std::nullopt;
-}
-
-static int64_t getModeledLoopTripCount(
-    Operation *op,
-    const llvm::DenseMap<Operation *, int64_t> &structuralTripEstimates) {
-  if (auto knownTripCount = getKnownStaticLoopTripCount(op))
-    return *knownTripCount;
-  if (auto iterator = structuralTripEstimates.find(op);
-      iterator != structuralTripEstimates.end())
-    return iterator->second;
-  return 1;
-}
-
-static int64_t getLoopMultiplier(
-    Operation *op,
-    const llvm::DenseMap<Operation *, int64_t> &structuralTripEstimates) {
-  int64_t multiplier = 1;
-  for (Operation *parent = op->getParentOp(); parent;
-       parent = parent->getParentOp()) {
-    if (parent->getName().getStringRef() != "scf.for")
-      continue;
-    // AutoBlockify V1 wraps the original logical program in a physical-core
-    // scheduling loop.  Its dispatch cost is modeled as a separate phase;
-    // it must not multiply every algorithm operation as if it were an
-    // algorithmic loop.
-    if (parent->hasAttr("ta.auto_blockify_v1.schedule"))
-      continue;
-    int64_t tripCount =
-        getModeledLoopTripCount(parent, structuralTripEstimates);
-    if (tripCount > 0 &&
-        multiplier <= std::numeric_limits<int64_t>::max() / tripCount)
-      multiplier *= tripCount;
-  }
-  return multiplier;
-}
 
 static double resolveNumberOrMeasurement(
     const llvm::json::Object &object, llvm::StringRef numberKey,
@@ -576,7 +509,7 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
   return profile;
 }
 
-static llvm::Expected<std::optional<StageCostModelSummary>> evaluateStageModel(
+static llvm::Expected<StageCostModelSummary> evaluateStageModel(
     const SimdSimtFeatureSummary &features, const CandidateProfile &profile,
     unsigned numWarps, bool wholeKernelSuperblockMaterializable,
     bool scopeSuperblockMaterializable, int64_t logicalProgramCountHint,
@@ -609,16 +542,14 @@ static llvm::Expected<std::optional<StageCostModelSummary>> evaluateStageModel(
                                    "Stage model requires PreparedTTIR and "
                                    "its anchor plan");
   auto partition =
-      partitioner.partition(module, *anchorPlan, features, partitionerOptions);
+      partitioner.partition(module, *anchorPlan, partitionerOptions);
   if (!partition)
     return partition.takeError();
-  if (!*partition)
-    return std::optional<StageCostModelSummary>{};
 
   HardwareProfile hardwareProfile = profile.hardware;
   hardwareProfile.logicalWarpGroupCount = std::max<int64_t>(1, numWarps);
   StageCostEvaluator evaluator;
-  auto costTable = evaluator.evaluate(**partition, hardwareProfile);
+  auto costTable = evaluator.evaluate(*partition, hardwareProfile);
   if (!costTable)
     return costTable.takeError();
   costTable->logicalProgramCountHint = logicalProgramCountHint;
@@ -626,7 +557,7 @@ static llvm::Expected<std::optional<StageCostModelSummary>> evaluateStageModel(
   auto routes = solveStageRoutes(*costTable, hardwareProfile.transition);
   if (!routes)
     return routes.takeError();
-  return std::optional<StageCostModelSummary>{std::move(*routes)};
+  return std::move(*routes);
 }
 
 static llvm::SmallVector<std::pair<double, SimdSimtCandidateKind>>
@@ -698,9 +629,6 @@ toTriangularSolveFactsJSON(const TriangularSolveFacts &facts) {
 llvm::json::Object SimtAnchorFeatureSummary::toJSON() const {
   llvm::json::Object result;
   result["count"] = count;
-  result["conditional_branch_count"] = conditionalBranchCount;
-  result["divergent_branch_count"] = divergentBranchCount;
-  result["active_lane_ratio"] = activeLaneRatio;
   llvm::json::Array triangularFacts;
   for (const TriangularSolveFacts &facts : triangularSolves)
     triangularFacts.push_back(toTriangularSolveFactsJSON(facts));
@@ -711,19 +639,8 @@ llvm::json::Object SimtAnchorFeatureSummary::toJSON() const {
 
 llvm::json::Object SimdSimtFeatureSummary::toJSON() const {
   llvm::json::Object result;
-  result["load_ops"] = loadOps;
-  result["store_ops"] = storeOps;
-  result["reduce_ops"] = reduceOps;
-  result["dot_ops"] = dotOps;
-  result["loaded_index_dependent_memory_ops"] = loadedIndexDependentMemoryOps;
-  result["dot_flops"] = dotFlops;
-  result["static_loop_trip_count_max"] = staticLoopTripCountMax;
-  result["conditional_branch_count"] = conditionalBranchCount;
-  result["divergent_branch_count"] = divergentBranchCount;
-  result["active_lane_ratio"] = activeLaneRatio;
   llvm::json::Object postTransform;
   postTransform["auto_blockify_v1_applied"] = autoBlockifyV1Applied;
-  postTransform["auto_blockify_v1_loop_count"] = autoBlockifyV1LoopCount;
   result["post_transform"] = std::move(postTransform);
   result["has_explicit_scope"] = hasExplicitScope;
   result["simt_anchors"] = simtAnchors.toJSON();
@@ -802,8 +719,6 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
                                    "cannot analyze a null ModuleOp");
 
   SimdSimtFeatureSummary features;
-  llvm::DenseSet<Operation *> anchorRoots;
-  llvm::DenseMap<Operation *, int64_t> structuralTripEstimates;
   features.simtAnchors.count = llvm::count_if(
       anchorPlan.anchors,
       [](const SimtAnchorDescriptor &anchor) { return anchor.materializable; });
@@ -812,75 +727,14 @@ mlir::ascend::analyzeSimdSimtFeatures(ModuleOp module,
   for (const SimtAnchorDescriptor &anchor : anchorPlan.anchors) {
     if (anchor.triangularSolve)
       features.simtAnchors.triangularSolves.push_back(*anchor.triangularSolve);
-    if (!anchor.materializable)
-      continue;
-    for (Operation *operation : anchor.scopeOperations)
-      if (operation)
-        anchorRoots.insert(operation);
-    if (anchor.scopeOperations.empty() && anchor.operation)
-      anchorRoots.insert(anchor.operation);
-    if (anchor.kind == SimtAnchorKind::TriangularSolveLoop)
-      for (Operation *operation : anchor.scopeOperations)
-        if (operation && operation->getName().getStringRef() == "scf.for")
-          structuralTripEstimates[operation] = 14;
   }
 
-  auto isInAnchor = [&](Operation *operation) {
-    for (; operation; operation = operation->getParentOp())
-      if (anchorRoots.contains(operation))
-        return true;
-    return false;
-  };
   module.walk([&](Operation *operation) {
-    if (operation->hasAttr("ta.auto_blockify_v1"))
+    if (operation->hasAttr("ta.auto_blockify_v1") ||
+        operation->hasAttr("ta.auto_blockify_v1.loop"))
       features.autoBlockifyV1Applied = true;
-    if (operation->hasAttr("ta.auto_blockify_v1.loop")) {
-      features.autoBlockifyV1Applied = true;
-      ++features.autoBlockifyV1LoopCount;
-    }
-    if (operation->hasAttr("ta.auto_blockify_v1.schedule"))
-      return;
-
-    llvm::StringRef name = operation->getName().getStringRef();
-    const bool inAnchor = isInAnchor(operation);
-    const int64_t multiplier =
-        getLoopMultiplier(operation, structuralTripEstimates);
-    features.hasExplicitScope |= name == "scope.scope";
-    features.loadOps += name == "tt.load";
-    features.storeOps += name == "tt.store";
-    features.reduceOps += name == "tt.reduce";
-    features.dotOps += name == "tt.dot";
-
-    if (name == "scf.if" || name == "cf.cond_br") {
-      ++features.conditionalBranchCount;
-      if (inAnchor)
-        ++features.simtAnchors.conditionalBranchCount;
-      const bool divergent =
-          operation->getNumOperands() > 0 &&
-          isa<RankedTensorType>(operation->getOperand(0).getType());
-      features.divergentBranchCount += divergent;
-      if (inAnchor)
-        features.simtAnchors.divergentBranchCount += divergent;
-    }
-    if (name == "scf.for") {
-      const int64_t trip =
-          getModeledLoopTripCount(operation, structuralTripEstimates);
-      features.staticLoopTripCountMax =
-          std::max(features.staticLoopTripCountMax, trip);
-    }
-    if (isLoadedIndexDependentMemoryOp(operation))
-      ++features.loadedIndexDependentMemoryOps;
-    if (name == "tt.dot" && operation->getNumOperands() >= 2) {
-      auto lhs = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
-      auto rhs = dyn_cast<RankedTensorType>(operation->getOperand(1).getType());
-      if (lhs && rhs && lhs.getRank() >= 2 && rhs.getRank() >= 2) {
-        const int64_t m = lhs.getShape()[lhs.getRank() - 2];
-        const int64_t k = lhs.getShape()[lhs.getRank() - 1];
-        const int64_t n = rhs.getShape()[rhs.getRank() - 1];
-        if (m > 0 && n > 0 && k > 0)
-          features.dotFlops += 2 * m * n * k * multiplier;
-      }
-    }
+    features.hasExplicitScope |=
+        operation->getName().getStringRef() == "scope.scope";
   });
   return features;
 }
@@ -927,33 +781,24 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
       options.physicalVectorCoreCountHint, module, anchorPlan);
   if (!stageModel)
     return stageModel.takeError();
-  if (*stageModel) {
-    report.stageModel = std::move(**stageModel);
-    report.candidateCosts.allSimd = report.stageModel.allSimd.totalCycles;
-    report.candidateCosts.allSimtOnly = report.stageModel.allSimt.totalCycles;
-    report.candidateCosts.mixedSimdSimt = report.stageModel.mixed.totalCycles;
-    report.allSimdCandidateLegal &= report.stageModel.allSimd.legal;
-    report.allSimtOnlyCandidateLegal &= report.stageModel.allSimt.legal;
-    report.mixedCandidateLegal &= report.stageModel.mixed.legal;
-    const unsigned legalCandidateCount =
-        static_cast<unsigned>(report.allSimdCandidateLegal) +
-        static_cast<unsigned>(report.allSimtOnlyCandidateLegal) +
-        static_cast<unsigned>(report.mixedCandidateLegal);
-    if (legalCandidateCount == 0)
-      return llvm::createStringError(
-          std::errc::not_supported,
-          "Stage Route Model found no materializable candidate");
-    report.decision = chooseBest(
-        report.candidateCosts, report.allSimdCandidateLegal,
-        report.allSimtOnlyCandidateLegal, report.mixedCandidateLegal);
-    return report;
-  }
-
-  // Unknown Stage domains are deliberately not scored. The online Route
-  // Model has no legacy whole-kernel fallback; the selector leaves the
-  // existing backend-default lowering unchanged.
-  report.stageModel.applied = false;
-  report.unsupported.push_back("stage_model_not_applicable");
+  report.stageModel = std::move(*stageModel);
+  report.candidateCosts.allSimd = report.stageModel.allSimd.totalCycles;
+  report.candidateCosts.allSimtOnly = report.stageModel.allSimt.totalCycles;
+  report.candidateCosts.mixedSimdSimt = report.stageModel.mixed.totalCycles;
+  report.allSimdCandidateLegal &= report.stageModel.allSimd.legal;
+  report.allSimtOnlyCandidateLegal &= report.stageModel.allSimt.legal;
+  report.mixedCandidateLegal &= report.stageModel.mixed.legal;
+  const unsigned legalCandidateCount =
+      static_cast<unsigned>(report.allSimdCandidateLegal) +
+      static_cast<unsigned>(report.allSimtOnlyCandidateLegal) +
+      static_cast<unsigned>(report.mixedCandidateLegal);
+  if (legalCandidateCount == 0)
+    return llvm::createStringError(
+        std::errc::not_supported,
+        "Stage Route Model found no materializable candidate");
+  report.decision =
+      chooseBest(report.candidateCosts, report.allSimdCandidateLegal,
+                 report.allSimtOnlyCandidateLegal, report.mixedCandidateLegal);
   return report;
 }
 

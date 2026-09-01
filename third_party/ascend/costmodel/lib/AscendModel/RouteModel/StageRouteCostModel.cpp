@@ -58,6 +58,24 @@ static double mixedEquivalentStageCost(const LogicalStageCost &stage,
          outputHandoffCycles;
 }
 
+static double mixedExecutionMultiplicity(const LogicalStageCost &stage,
+                                         const StageImplementationCost &cost,
+                                         int64_t factor) {
+  if (factor <= 1 || cost.implementation.mode != StageMode::SIMD ||
+      !stage.features.replicatedByLocalSuperBlock)
+    return 1.0;
+  // MaterializeSIMTScopeSuperBlock groups F logical programs in one physical
+  // V1-loop iteration.  The selected SIMT scope executes them as one F-way
+  // VF, but every SIMD segment left in the logical body is cloned F times.
+  return static_cast<double>(factor);
+}
+
+static double mixedBaseStageCost(const LogicalStageCost &stage,
+                                 const StageImplementationCost &cost,
+                                 int64_t factor) {
+  return cost.totalCycles * mixedExecutionMultiplicity(stage, cost, factor);
+}
+
 /// AutoBlockify V1 is a route-conditional execution schedule.  The analysis
 /// view contains its real dispatch/loop operations so pure-SIMT and Mixed can
 /// pay them, but an all-SIMD executable restores the original logical grid.
@@ -189,6 +207,7 @@ llvm::json::Object StageModelFeatures::toJSON() const {
   result["has_reduction"] = hasReduction;
   result["has_dot"] = hasDot;
   result["has_conversion_pack"] = hasConversionPack;
+  result["replicated_by_local_superblock"] = replicatedByLocalSuperBlock;
   result["conditional_branch_count"] = conditionalBranchCount;
   result["divergent_branch_count"] = divergentBranchCount;
   result["loop_backedge_count"] = loopBackedgeCount;
@@ -249,6 +268,10 @@ llvm::json::Object LogicalStageCost::toJSON() const {
   result["features"] = features.toJSON();
   result["workload"] = workload.toJSON();
   result["owned_operation_count"] = ownedOperationCount;
+  llvm::json::Array locations;
+  for (const std::string &location : sourceLocations)
+    locations.push_back(location);
+  result["source_locations"] = std::move(locations);
   result["live_in_count"] = liveInCount;
   result["live_out_count"] = liveOutCount;
   result["live_in_bytes"] = liveInBytes;
@@ -261,6 +284,7 @@ llvm::json::Object LogicalStageCost::toJSON() const {
     anchorIndices.push_back(static_cast<int64_t>(index));
   result["simt_anchor_indices"] = std::move(anchorIndices);
   result["local_simt_materializable"] = localSimtMaterializable;
+  result["local_superblock_materializable"] = localSuperblockMaterializable;
   llvm::json::Array legalFactors;
   for (int64_t factor : legalSimtFactors)
     legalFactors.push_back(factor);
@@ -274,13 +298,6 @@ llvm::json::Object LogicalStageCost::toJSON() const {
     costs.push_back(implementation.toJSON());
   result["implementations"] = std::move(costs);
   return result;
-}
-
-llvm::json::Object LogicalPhaseCost::toJSON() const {
-  llvm::json::Array stageArray;
-  for (const LogicalStageCost &stage : stages)
-    stageArray.push_back(stage.toJSON());
-  return llvm::json::Object{{"id", id}, {"stages", std::move(stageArray)}};
 }
 
 bool StageTransitionCost::isValid() const {
@@ -333,25 +350,16 @@ llvm::json::Object StageRoutePlan::toJSON() const {
     stages.push_back(std::move(stage));
   }
   result["stages"] = std::move(stages);
-  llvm::json::Array phases;
-  for (double cycles : logicalPhaseCycles)
-    phases.push_back(cycles);
-  result["logical_phase_system_cycles"] = std::move(phases);
   return result;
 }
 
 llvm::json::Object StageCostModelSummary::toJSON() const {
   llvm::json::Object result;
   result["applied"] = applied;
-  result["domain"] = domain;
   result["boundary_source"] = "operation_graph";
   result["operation_ownership_complete"] = operationOwnershipComplete;
   result["modeled_operation_count"] = modeledOperationCount;
   result["profile_version"] = profileVersion;
-  llvm::json::Array phaseArray;
-  for (const LogicalPhaseCost &phase : phases)
-    phaseArray.push_back(phase.toJSON());
-  result["logical_phases"] = std::move(phaseArray);
   llvm::json::Array stageArray;
   for (const LogicalStageCost &stage : stages)
     stageArray.push_back(stage.toJSON());
@@ -417,8 +425,9 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
             findImplementation(stage, StageMode::SIMD, 1, false);
         const StageImplementationCost *simt =
             findImplementation(stage, StageMode::SIMT, factor, true);
-        const double simdCycles =
-            simd ? simd->totalCycles : std::numeric_limits<double>::infinity();
+        const double simdCycles = simd
+                                      ? mixedBaseStageCost(stage, *simd, factor)
+                                      : std::numeric_limits<double>::infinity();
         const double simtCycles =
             simt ? mixedEquivalentStageCost(stage, *simt, transition)
                  : std::numeric_limits<double>::infinity();
@@ -431,13 +440,72 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
       if (kind != StageKernelRouteKind::Mixed)
         stageCycles = selected->totalCycles;
 
-      const double transitionCycles = stageCycles - selected->totalCycles;
+      const double transitionCycles =
+          stageCycles - mixedBaseStageCost(stage, *selected, factor);
       plan.implementations.push_back(selected->implementation);
       plan.entryTransitionCycles.push_back(transitionCycles);
       plan.logicalStageCycles.push_back(stageCycles);
       plan.totalCycles += stageCycles;
     }
     if (kind == StageKernelRouteKind::Mixed) {
+      if (factor > 1) {
+        // The current local-SuperBlock ABI widens one AutoBlockify V1 loop
+        // around exactly one selected local SIMT scope.  Selecting two
+        // factor>1 scopes in the same loop would require preserving two
+        // independent warp/task mappings across the intervening SIMD
+        // segment, which the backend does not yet implement.  Enumerate the
+        // one-SIMT-Stage routes instead of reporting an unmaterializable
+        // independent per-Stage minimum.
+        size_t bestSimtIndex = mixedChoices.size();
+        double bestTotal = std::numeric_limits<double>::infinity();
+        for (size_t simtIndex = 0; simtIndex < mixedChoices.size();
+             ++simtIndex) {
+          const MixedChoice &simtChoice = mixedChoices[simtIndex];
+          if (!simtChoice.simt ||
+              std::max<int64_t>(
+                  1, costTable.stages[simtIndex].localSimtScopeCount) != 1)
+            continue;
+          double candidateTotal = simtChoice.simtCycles;
+          bool candidateLegal = mixedChoices.size() > 1;
+          for (size_t index = 0; index < mixedChoices.size(); ++index) {
+            if (index == simtIndex)
+              continue;
+            if (!mixedChoices[index].simd) {
+              candidateLegal = false;
+              break;
+            }
+            candidateTotal += mixedChoices[index].simdCycles;
+          }
+          if (candidateLegal && candidateTotal < bestTotal) {
+            bestTotal = candidateTotal;
+            bestSimtIndex = simtIndex;
+          }
+        }
+        if (bestSimtIndex == mixedChoices.size()) {
+          StageRoutePlan invalid;
+          invalid.candidate = kind;
+          return invalid;
+        }
+
+        plan.implementations.clear();
+        plan.entryTransitionCycles.clear();
+        plan.logicalStageCycles.clear();
+        plan.totalCycles = 0.0;
+        for (size_t index = 0; index < mixedChoices.size(); ++index) {
+          const MixedChoice &choice = mixedChoices[index];
+          const StageImplementationCost *selected =
+              index == bestSimtIndex ? choice.simt : choice.simd;
+          const double selectedCycles =
+              index == bestSimtIndex ? choice.simtCycles : choice.simdCycles;
+          plan.implementations.push_back(selected->implementation);
+          plan.entryTransitionCycles.push_back(
+              selectedCycles -
+              mixedBaseStageCost(costTable.stages[index], *selected, factor));
+          plan.logicalStageCycles.push_back(selectedCycles);
+          plan.totalCycles += selectedCycles;
+        }
+      }
+
       auto countMode = [&](StageMode mode) {
         return llvm::count_if(plan.implementations, [&](const auto &selected) {
           return selected.mode == mode;
@@ -474,7 +542,8 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
         plan.implementations[bestIndex] = replacement->implementation;
         plan.logicalStageCycles[bestIndex] = replacementCycles;
         plan.entryTransitionCycles[bestIndex] =
-            replacementCycles - replacement->totalCycles;
+            replacementCycles - mixedBaseStageCost(costTable.stages[bestIndex],
+                                                   *replacement, factor);
         return true;
       };
 
@@ -519,11 +588,9 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
 
   StageCostModelSummary result;
   result.applied = true;
-  result.domain = costTable.domain;
   result.operationOwnershipComplete = costTable.operationOwnershipComplete;
   result.modeledOperationCount = costTable.modeledOperationCount;
   result.profileVersion = costTable.profileVersion;
-  result.phases = costTable.phases;
   result.stages = costTable.stages;
   result.transition = transition;
   result.allSimd = buildPlan(StageKernelRouteKind::AllSIMD, 1);
@@ -531,19 +598,5 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
   result.mixed = bestFactoredPlan(StageKernelRouteKind::Mixed);
   removeAutoBlockifyCostFromAllSIMD(result.allSimd, costTable);
 
-  auto aggregatePhases = [&](StageRoutePlan &plan) {
-    if (!plan.legal)
-      return;
-    size_t stageIndex = 0;
-    for (const LogicalPhaseCost &phase : costTable.phases) {
-      double phaseCycles = 0.0;
-      for (size_t i = 0; i < phase.stages.size(); ++i)
-        phaseCycles += plan.logicalStageCycles[stageIndex++];
-      plan.logicalPhaseCycles.push_back(phaseCycles);
-    }
-  };
-  aggregatePhases(result.allSimd);
-  aggregatePhases(result.allSimt);
-  aggregatePhases(result.mixed);
   return result;
 }

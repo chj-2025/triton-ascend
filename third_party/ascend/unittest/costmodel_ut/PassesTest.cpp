@@ -217,7 +217,6 @@ module {
   if (!features)
     FAIL() << llvm::toString(features.takeError());
 
-  EXPECT_EQ(features->loadedIndexDependentMemoryOps, 1);
   EXPECT_EQ(features->simtAnchors.count, 1);
 }
 
@@ -518,7 +517,7 @@ TEST(CostModelPassesTest, PerfReportPassAcceptsEstimatedPipeline) {
                         createPipelineAnalysisPass(), createPerfReportPass()));
 }
 
-TEST(CostModelPassesTest, SimdSimtReturnsBackendDefaultOutsideStageDomain) {
+TEST(CostModelPassesTest, SimdSimtScoresGenericSemanticStages) {
   auto configureOptions = [](SelectSimdSimtCostModelPassOptions &options,
                              llvm::StringRef mode) {
     options.mode = mode.str();
@@ -548,19 +547,19 @@ TEST(CostModelPassesTest, SimdSimtReturnsBackendDefaultOutsideStageDomain) {
   ASSERT_TRUE(autoEffective);
   ASSERT_TRUE(autoRecommended);
   ASSERT_TRUE(autoReport);
-  EXPECT_EQ(autoEffective.getValue(), "backend_default");
-  EXPECT_EQ(autoRecommended.getValue(), "backend_default");
-  EXPECT_FALSE((*autoModule)->hasAttr("ascend.simt_costmodel.all_simd_score"));
+  EXPECT_NE(autoEffective.getValue(), "backend_default");
+  EXPECT_EQ(autoEffective.getValue(), autoRecommended.getValue());
+  EXPECT_TRUE((*autoModule)->hasAttr("ascend.simt_costmodel.all_simd_score"));
   auto autoJSON = llvm::json::parse(autoReport.getValue());
   ASSERT_TRUE(static_cast<bool>(autoJSON));
   auto *autoObject = autoJSON->getAsObject();
   ASSERT_NE(autoObject, nullptr);
   auto autoDecision = autoObject->getString("decision_kind");
   ASSERT_TRUE(autoDecision);
-  EXPECT_EQ(*autoDecision, "backend_default");
+  EXPECT_NE(*autoDecision, "backend_default");
   auto autoReason = autoObject->getString("application_reason");
   ASSERT_TRUE(autoReason);
-  EXPECT_EQ(*autoReason, "stage_model_not_applicable");
+  EXPECT_EQ(*autoReason, "minimum_cost_candidate");
 
   mlir::MLIRContext reportContext;
   auto reportModule = parseModule(reportContext, kOutOfSimdSimtCoverageModule);
@@ -579,18 +578,17 @@ TEST(CostModelPassesTest, SimdSimtReturnsBackendDefaultOutsideStageDomain) {
   ASSERT_TRUE(reportEffective);
   ASSERT_TRUE(reportJSONAttr);
   EXPECT_EQ(reportEffective.getValue(), "backend_default");
-  EXPECT_FALSE(
-      (*reportModule)->hasAttr("ascend.simt_costmodel.all_simd_score"));
+  EXPECT_TRUE((*reportModule)->hasAttr("ascend.simt_costmodel.all_simd_score"));
   auto reportJSON = llvm::json::parse(reportJSONAttr.getValue());
   ASSERT_TRUE(static_cast<bool>(reportJSON));
   auto *reportObject = reportJSON->getAsObject();
   ASSERT_NE(reportObject, nullptr);
   auto reportDecision = reportObject->getString("decision_kind");
   ASSERT_TRUE(reportDecision);
-  EXPECT_EQ(*reportDecision, "backend_default");
+  EXPECT_NE(*reportDecision, "backend_default");
   auto reportReason = reportObject->getString("application_reason");
   ASSERT_TRUE(reportReason);
-  EXPECT_EQ(*reportReason, "stage_model_not_applicable");
+  EXPECT_EQ(*reportReason, "report_mode");
 }
 
 TEST(CostModelPassesTest, SimdSimtSelectionUsesExternalAnalysisIR) {

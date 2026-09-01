@@ -195,31 +195,23 @@ struct SelectSimdSimtCostModelPass
     }
     SimdSimtCostReport report = std::move(*reportOr);
 
-    std::string recommended =
-        report.stageModel.applied
-            ? stringifySimdSimtCandidate(report.decision).str()
-            : kBackendDefault.str();
+    std::string recommended = stringifySimdSimtCandidate(report.decision).str();
     std::string effective = kBackendDefault.str();
     std::string selectionSource = "backend_default";
     std::string applicationReason;
     SmallVector<Operation *> mixedAnchors;
     SimtAnchorPlan selectedMixedAnchorPlan;
     int64_t selectedSuperblockFactor = 1;
-    if (report.stageModel.applied) {
-      if (report.decision == SimdSimtCandidateKind::AllSIMD)
-        selectedSuperblockFactor =
-            report.stageModel.allSimd.routeSuperblockFactor;
-      else if (report.decision == SimdSimtCandidateKind::AllSIMTOnly)
-        selectedSuperblockFactor =
-            report.stageModel.allSimt.routeSuperblockFactor;
-      else
-        selectedSuperblockFactor =
-            report.stageModel.mixed.routeSuperblockFactor;
-    }
+    if (report.decision == SimdSimtCandidateKind::AllSIMD)
+      selectedSuperblockFactor =
+          report.stageModel.allSimd.routeSuperblockFactor;
+    else if (report.decision == SimdSimtCandidateKind::AllSIMTOnly)
+      selectedSuperblockFactor =
+          report.stageModel.allSimt.routeSuperblockFactor;
+    else
+      selectedSuperblockFactor = report.stageModel.mixed.routeSuperblockFactor;
 
-    bool actionSupported = report.stageModel.applied;
-    if (!report.stageModel.applied)
-      applicationReason = "stage_model_not_applicable";
+    bool actionSupported = true;
     bool hasExplicitScope = containsExplicitVectorScope(module);
     if (recommended == kMixedSimdSimt) {
       if (hasExplicitScope) {
@@ -239,7 +231,7 @@ struct SelectSimdSimtCostModelPass
         }
       }
       // A factor>1 mixed route needs batching of the surrounding SIMD
-      // producer/consumer phases, not just a scope attribute.  Keep the
+      // producer/consumer Stages, not just a scope attribute.  Keep the
       // recommendation visible but do not apply it until ScopeSuperBlockPass
       // implements that exact materialization.
       if (selectedSuperblockFactor > 1 &&
@@ -273,7 +265,7 @@ struct SelectSimdSimtCostModelPass
       effective = recommended;
       selectionSource = "cpp_cost_model";
       applicationReason = "minimum_cost_candidate";
-    } else if (!autoMode && report.stageModel.applied) {
+    } else if (!autoMode) {
       applicationReason = "report_mode";
     } else if (applicationReason.empty()) {
       applicationReason = "candidate_not_materializable";
@@ -285,20 +277,12 @@ struct SelectSimdSimtCostModelPass
     module->setAttr(kEffectiveExecutionAttr, builder.getStringAttr(effective));
     module->setAttr(kSelectionSourceAttr,
                     builder.getStringAttr(selectionSource));
-    if (report.stageModel.applied) {
-      module->setAttr(kAllSimdScoreAttr,
-                      builder.getF64FloatAttr(report.candidateCosts.allSimd));
-      module->setAttr(
-          kAllSimtScoreAttr,
-          builder.getF64FloatAttr(report.candidateCosts.allSimtOnly));
-      module->setAttr(
-          kMixedScoreAttr,
-          builder.getF64FloatAttr(report.candidateCosts.mixedSimdSimt));
-    } else {
-      module->removeAttr(kAllSimdScoreAttr);
-      module->removeAttr(kAllSimtScoreAttr);
-      module->removeAttr(kMixedScoreAttr);
-    }
+    module->setAttr(kAllSimdScoreAttr,
+                    builder.getF64FloatAttr(report.candidateCosts.allSimd));
+    module->setAttr(kAllSimtScoreAttr,
+                    builder.getF64FloatAttr(report.candidateCosts.allSimtOnly));
+    module->setAttr(kMixedScoreAttr, builder.getF64FloatAttr(
+                                         report.candidateCosts.mixedSimdSimt));
     module->setAttr(kSuperblockFactorAttr,
                     builder.getI64IntegerAttr(selectedSuperblockFactor));
 
@@ -312,14 +296,6 @@ struct SelectSimdSimtCostModelPass
     }
 
     llvm::json::Object reportJSON = report.toJSON();
-    if (!report.stageModel.applied) {
-      // No Legacy/aggregate fallback exists.  Do not publish
-      // default-initialized candidate scores as if the Stage model had
-      // evaluated this kernel.
-      reportJSON.erase("candidate_costs");
-      reportJSON["decision_kind"] = kBackendDefault;
-      reportJSON["selectable_candidates"] = llvm::json::Array();
-    }
     reportJSON["mode"] = mode.getValue();
     reportJSON["recommended_decision_kind"] = recommended;
     reportJSON["effective_decision_kind"] = effective;

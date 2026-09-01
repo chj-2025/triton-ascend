@@ -230,6 +230,20 @@ class CompilerCostmodelContractTest(unittest.TestCase):
         source = inspect.getsource(cmplr.linalg_to_bin_enable_npu_compile_910_95)
         self.assertNotIn("--enable-hivm-delayed-cross-core-gss=false", source)
 
+    def test_all_bishengir_entries_share_debug_info_option(self):
+        cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
+
+        options = []
+        cmplr._append_debug_info_option(options)
+        self.assertEqual(options, ["--enable-debug-info=true"])
+        source = inspect.getsource(cmplr.ttir_to_npubin)
+        self.assertIn("_append_debug_info_option(_compile_option_list)", source)
+
+        cmplr._is_debug_line_info_disabled = lambda: True
+        options = []
+        cmplr._append_debug_info_option(options)
+        self.assertEqual(options, [])
+
 
 if __name__ == "__main__":
     unittest.main()

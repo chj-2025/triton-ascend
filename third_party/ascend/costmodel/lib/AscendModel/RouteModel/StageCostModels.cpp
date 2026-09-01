@@ -5,6 +5,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <array>
@@ -19,6 +20,22 @@ namespace {
 
 static double iterations(const LogicalStage &stage) {
   return static_cast<double>(std::max<int64_t>(1, stage.iterationCount));
+}
+
+static std::vector<std::string>
+collectSourceLocations(const LogicalStage &stage) {
+  std::vector<std::string> result;
+  llvm::StringSet<> seen;
+  for (Operation *operation : stage.operations) {
+    std::string location;
+    llvm::raw_string_ostream stream(location);
+    operation->getLoc().print(stream);
+    stream.flush();
+    if (location.empty() || !seen.insert(location).second)
+      continue;
+    result.push_back(std::move(location));
+  }
+  return result;
 }
 
 static double controlBody(const StageResourceCycles &resources) {
@@ -221,8 +238,18 @@ static double estimateStage(const LogicalStage &stage,
                                                controlBody(r) + r.spill,
                                            r.issue)
                                 : serialBody(r);
-    if (mode == StageMode::SIMD)
-      return r.setup + count * critical;
+    if (mode == StageMode::SIMD) {
+      // A loop-carried tensor is not ordinary embarrassingly-parallel vector
+      // work: the updated state must remain live until the next recurrence
+      // step.  The operation-throughput terms above account for arithmetic,
+      // but not this persistent register/stack traffic.  Charge the exact
+      // SSA live-out footprint once per Stage invocation using the target
+      // profile's persistent-state byte rate.
+      const double persistentState =
+          static_cast<double>(stage.liveOutBytes) /
+          profile.superblockPersistentStateBytesPerCycle;
+      return r.setup + count * critical + persistentState;
+    }
     const int64_t groups = std::max<int64_t>(
         1, std::min(stage.features.parallelRecurrenceGroupCount,
                     profile.logicalWarpGroupCount));
@@ -376,104 +403,95 @@ bool HardwareProfile::isValid() const {
 llvm::Expected<StageCostTable>
 StageCostEvaluator::evaluate(const StagePartition &partition,
                              const HardwareProfile &profile) const {
-  if (partition.domain.empty() || partition.phases.empty())
+  if (partition.stages.empty())
     return llvm::createStringError(
         std::errc::invalid_argument,
-        "StagePartition requires a domain and at least one Phase");
+        "StagePartition requires at least one Stage");
   if (!profile.isValid())
     return llvm::createStringError(std::errc::invalid_argument,
                                    "HardwareProfile is invalid");
   StageCostTable table;
-  table.domain = partition.domain;
   table.operationOwnershipComplete = partition.operationOwnershipComplete;
   table.modeledOperationCount = partition.modeledOperationCount;
   table.profileVersion = profile.profileVersion;
   llvm::StringSet<> stageIds;
 
-  for (const LogicalPhase &phase : partition.phases) {
-    if (phase.id.empty() || phase.stages.empty())
+  for (const LogicalStage &stage : partition.stages) {
+    if (stage.id.empty() || !stageIds.insert(stage.id).second)
+      return llvm::createStringError(
+          std::errc::invalid_argument,
+          "Stage ids must be non-empty and unique: '%s'", stage.id.c_str());
+    if (stage.iterationCount <= 0 || !stage.features.isValid() ||
+        !stage.workload.isFiniteAndNonNegative())
+      return llvm::createStringError(
+          std::errc::invalid_argument,
+          "Stage '%s' has invalid iteration/features", stage.id.c_str());
+    if (!stage.simdLegal && !stage.simtLegal)
       return llvm::createStringError(std::errc::invalid_argument,
-                                     "every Phase requires an id and Stage");
-    LogicalPhaseCost phaseCost;
-    phaseCost.id = phase.id;
+                                     "Stage '%s' has no legal StageMode",
+                                     stage.id.c_str());
+    if (stage.simtLegal && stage.legalSimtFactors.empty())
+      return llvm::createStringError(
+          std::errc::invalid_argument,
+          "SIMT Stage '%s' has no legal SuperBlock factor", stage.id.c_str());
 
-    for (const LogicalStage &stage : phase.stages) {
-      if (stage.id.empty() || !stageIds.insert(stage.id).second)
-        return llvm::createStringError(
-            std::errc::invalid_argument,
-            "Stage ids must be non-empty and unique: '%s'", stage.id.c_str());
-      if (stage.iterationCount <= 0 || !stage.features.isValid() ||
-          !stage.workload.isFiniteAndNonNegative())
-        return llvm::createStringError(
-            std::errc::invalid_argument,
-            "Stage '%s' has invalid iteration/features", stage.id.c_str());
-      if (!stage.simdLegal && !stage.simtLegal)
+    LogicalStageCost logicalCost;
+    logicalCost.id = stage.id;
+    logicalCost.model = stringifyStageCostModel(stage.costModelKind).str();
+    logicalCost.schedule = stage.scheduleKind;
+    logicalCost.iterationCount = stage.iterationCount;
+    logicalCost.features = stage.features;
+    logicalCost.workload = stage.workload;
+    logicalCost.ownedOperationCount =
+        static_cast<int64_t>(stage.operations.size());
+    logicalCost.sourceLocations = collectSourceLocations(stage);
+    logicalCost.liveInCount = static_cast<int64_t>(stage.liveIns.size());
+    logicalCost.liveOutCount = static_cast<int64_t>(stage.liveOuts.size());
+    logicalCost.liveInBytes = stage.liveInBytes;
+    logicalCost.liveOutBytes = stage.liveOutBytes;
+    logicalCost.localSimtScopeCount = stage.localSimtScopeCount;
+    logicalCost.scopeInputTensorBytes = stage.scopeInputTensorBytes;
+    logicalCost.scopeOutputTensorBytes = stage.scopeOutputTensorBytes;
+    logicalCost.simtAnchorIndices = stage.simtAnchorIndices;
+    logicalCost.localSimtMaterializable = stage.localSimtMaterializable;
+    logicalCost.localSuperblockMaterializable =
+        stage.localSuperblockMaterializable;
+    logicalCost.legalSimtFactors = stage.legalSimtFactors;
+    logicalCost.localSimtFactors = stage.localSimtFactors;
+
+    llvm::SmallVector<StageImplementation> implementations;
+    if (stage.simdLegal)
+      implementations.push_back({StageMode::SIMD, 1, false});
+    if (stage.simtLegal)
+      for (int64_t factor : stage.legalSimtFactors)
+        implementations.push_back({StageMode::SIMT, factor, false});
+    if (stage.simtLegal && stage.localSimtMaterializable)
+      for (int64_t factor : stage.localSimtFactors)
+        implementations.push_back({StageMode::SIMT, factor, true});
+
+    for (const StageImplementation &implementation : implementations) {
+      if (!isDeclaredLegal(stage, implementation))
         return llvm::createStringError(std::errc::invalid_argument,
-                                       "Stage '%s' has no legal StageMode",
+                                       "Stage '%s' has an illegal candidate",
                                        stage.id.c_str());
-      if (stage.simtLegal && stage.legalSimtFactors.empty())
-        return llvm::createStringError(
-            std::errc::invalid_argument,
-            "SIMT Stage '%s' has no legal SuperBlock factor", stage.id.c_str());
-
-      LogicalStageCost logicalCost;
-      logicalCost.id = stage.id;
-      logicalCost.model = stringifyStageCostModel(stage.costModelKind).str();
-      logicalCost.schedule = stage.scheduleKind;
-      logicalCost.iterationCount = stage.iterationCount;
-      logicalCost.features = stage.features;
-      logicalCost.workload = stage.workload;
-      logicalCost.ownedOperationCount =
-          static_cast<int64_t>(stage.operations.size());
-      logicalCost.liveInCount = static_cast<int64_t>(stage.liveIns.size());
-      logicalCost.liveOutCount = static_cast<int64_t>(stage.liveOuts.size());
-      logicalCost.liveInBytes = stage.liveInBytes;
-      logicalCost.liveOutBytes = stage.liveOutBytes;
-      logicalCost.localSimtScopeCount = stage.localSimtScopeCount;
-      logicalCost.scopeInputTensorBytes = stage.scopeInputTensorBytes;
-      logicalCost.scopeOutputTensorBytes = stage.scopeOutputTensorBytes;
-      logicalCost.simtAnchorIndices = stage.simtAnchorIndices;
-      logicalCost.localSimtMaterializable = stage.localSimtMaterializable;
-      logicalCost.legalSimtFactors = stage.legalSimtFactors;
-      logicalCost.localSimtFactors = stage.localSimtFactors;
-
-      llvm::SmallVector<StageImplementation> implementations;
-      if (stage.simdLegal)
-        implementations.push_back({StageMode::SIMD, 1, false});
-      if (stage.simtLegal)
-        for (int64_t factor : stage.legalSimtFactors)
-          implementations.push_back({StageMode::SIMT, factor, false});
-      if (stage.simtLegal && stage.localSimtMaterializable)
-        for (int64_t factor : stage.localSimtFactors)
-          implementations.push_back({StageMode::SIMT, factor, true});
-
-      for (const StageImplementation &implementation : implementations) {
-        if (!isDeclaredLegal(stage, implementation))
-          return llvm::createStringError(std::errc::invalid_argument,
-                                         "Stage '%s' has an illegal candidate",
-                                         stage.id.c_str());
-        StageResourceCycles resources =
-            mapWorkload(stage,
-                        implementation.mode == StageMode::SIMD ? profile.simd
-                                                               : profile.simt,
-                        implementation.mode);
-        StageImplementationCost cost;
-        cost.implementation = implementation;
-        cost.resources = resources;
-        cost.totalCycles = applySuperBlock(
-            stage, resources, implementation, profile,
-            estimateStage(stage, profile, implementation.mode, resources));
-        if (!cost.isValid())
-          return llvm::createStringError(std::errc::invalid_argument,
-                                         "Stage '%s' produced an invalid cost",
-                                         stage.id.c_str());
-        logicalCost.implementations.push_back(std::move(cost));
-      }
-
-      phaseCost.stages.push_back(logicalCost);
-      table.stages.push_back(std::move(logicalCost));
+      StageResourceCycles resources = mapWorkload(
+          stage,
+          implementation.mode == StageMode::SIMD ? profile.simd : profile.simt,
+          implementation.mode);
+      StageImplementationCost cost;
+      cost.implementation = implementation;
+      cost.resources = resources;
+      cost.totalCycles = applySuperBlock(
+          stage, resources, implementation, profile,
+          estimateStage(stage, profile, implementation.mode, resources));
+      if (!cost.isValid())
+        return llvm::createStringError(std::errc::invalid_argument,
+                                       "Stage '%s' produced an invalid cost",
+                                       stage.id.c_str());
+      logicalCost.implementations.push_back(std::move(cost));
     }
-    table.phases.push_back(std::move(phaseCost));
+
+    table.stages.push_back(std::move(logicalCost));
   }
   return table;
 }
