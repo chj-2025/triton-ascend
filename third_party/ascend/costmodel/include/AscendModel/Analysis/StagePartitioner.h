@@ -1,4 +1,4 @@
-//===- StagePartitioner.h - Build semantic Phase/Stage IR ----*- C++ -*-===//
+//===- StagePartitioner.h - Build semantic Stage IR ----------*- C++ -*-===//
 
 #ifndef ASCENDMODEL_ANALYSIS_STAGEPARTITIONER_H
 #define ASCENDMODEL_ANALYSIS_STAGEPARTITIONER_H
@@ -9,7 +9,6 @@
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -21,40 +20,12 @@ struct StagePartitionerOptions {
   bool scopeSuperblockMaterializable = false;
 };
 
-enum class PhaseBoundaryDomain {
-  TriangularRecurrence,
-  LoadedIndexRowwiseReduction,
-  IndirectUnderfilledDot,
-};
-
-/// Result of PhaseBoundaryAnalysis.  This is structural boundary evidence,
-/// not a route or a cost-model decision.
-struct PhaseBoundaryPlan {
-  PhaseBoundaryDomain domain;
-  std::string domainName;
-  std::optional<TriangularSolveFacts> triangularSolve;
-  /// Top-level semantic TTIR operations in execution order.  Nested region
-  /// operations are owned transitively by their top-level root.
-  std::vector<Operation *> rootOperations;
-  /// Algorithm Phase ownership parallel to rootOperations.  This is produced
-  /// by PhaseBoundaryAnalysis and is immutable input to StageBoundaryAnalysis;
-  /// Stage partitioning must not move a root across this boundary.
-  std::vector<std::string> rootPhaseIds;
-  std::vector<Operation *> localSimtAnchorRoots;
-
-  bool hasOperationGraph() const {
-    return !rootOperations.empty() &&
-           rootOperations.size() == rootPhaseIds.size();
-  }
-};
-
-/// Ordered post-transform TTIR roots plus the exact roots covered by each
-/// materializable SIMT anchor.  AutoBlockify V1's outer loop is represented
-/// as a scheduling shell while its direct body operations remain semantic
-/// roots; this prevents double ownership.
+/// Ordered post-transform TTIR semantic roots.  AutoBlockify V1's outer loop
+/// is represented as a scheduling shell while its direct body operations
+/// remain semantic roots; this prevents double ownership.  Exact local SIMT
+/// ownership is derived separately from the immutable SimtAnchorPlan.
 struct ProgramStructure {
   std::vector<Operation *> rootOperations;
-  std::vector<Operation *> localSimtAnchorRoots;
 };
 
 class ProgramStructureAnalysis {
@@ -63,26 +34,14 @@ public:
   analyze(ModuleOp module, const SimtAnchorPlan &anchorPlan) const;
 };
 
-/// Recognizes algorithm-level serial regions.  The current feature-summary
-/// overload is an explicit fallback; the operation-graph overload is the
-/// target implementation for production Stage ownership.
-class PhaseBoundaryAnalysis {
-public:
-  llvm::Expected<std::optional<PhaseBoundaryPlan>>
-  analyze(ModuleOp module, const SimtAnchorPlan &anchorPlan,
-          const SimdSimtFeatureSummary &features,
-          const StagePartitionerOptions &options) const;
-};
-
-/// Splits each Phase into single-kind Stages.  It does not evaluate cycles or
-/// choose SIMD/SIMT.  The optional anchor plan is used only as exact ownership
-/// evidence for materializable local SIMT Stages.
+/// Splits ordered semantic roots directly into single-kind Stages.  It does
+/// not evaluate cycles or choose SIMD/SIMT.  The anchor plan is used only as
+/// exact ownership evidence for materializable local SIMT Stages.
 class StageBoundaryAnalysis {
 public:
   llvm::Expected<StagePartition>
-  analyze(const PhaseBoundaryPlan &phasePlan,
-          const SimdSimtFeatureSummary &features,
-          const SimtAnchorPlan *anchorPlan = nullptr) const;
+  analyze(const ProgramStructure &structure,
+          const SimtAnchorPlan &anchorPlan) const;
 };
 
 /// Derives structural facts for every already-owned Stage.  It never chooses
@@ -122,14 +81,13 @@ public:
   llvm::Error verify(const StagePartition &partition) const;
 };
 
-/// Partitions post-layout/post-AutoBlockify-V1 TTIR facts into serial Phases
-/// and single-mode Stages.  A Stage may later be evaluated as SIMD or SIMT,
-/// but it is never internally mixed.
+/// Partitions post-layout/post-AutoBlockify-V1 TTIR directly into ordered,
+/// single-mode Stages.  A Stage may later be evaluated as SIMD or SIMT, but it
+/// is never internally mixed.
 class StagePartitioner {
 public:
-  llvm::Expected<std::optional<StagePartition>>
+  llvm::Expected<StagePartition>
   partition(ModuleOp module, const SimtAnchorPlan &anchorPlan,
-            const SimdSimtFeatureSummary &features,
             const StagePartitionerOptions &options) const;
 };
 

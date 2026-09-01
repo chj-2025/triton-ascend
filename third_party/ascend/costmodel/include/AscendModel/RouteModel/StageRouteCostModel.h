@@ -57,6 +57,11 @@ struct StageModelFeatures {
   bool hasReduction = false;
   bool hasDot = false;
   bool hasConversionPack = false;
+  /// True when the Stage is part of the logical-program body created by
+  /// AutoBlockify V1.  A factor-F local SuperBlock executes SIMD Stages in
+  /// this body once for every grouped logical program, while the selected
+  /// local SIMT Stage consumes the factor through its SuperBlock model.
+  bool replicatedByLocalSuperBlock = false;
   int64_t conditionalBranchCount = 0;
   int64_t divergentBranchCount = 0;
   int64_t loopBackedgeCount = 0;
@@ -134,6 +139,11 @@ struct LogicalStageCost {
   StageModelFeatures features;
   StageWorkload workload;
   int64_t ownedOperationCount = 0;
+  /// Unique source locations of the TTIR operations owned by this Stage.
+  /// These are calibration provenance only: they let a debug-line-enabled
+  /// CaModel artifact map binary PCs back to the immutable StagePartition
+  /// without adding marker operations or attributes to production IR.
+  std::vector<std::string> sourceLocations;
   int64_t liveInCount = 0;
   int64_t liveOutCount = 0;
   /// Static tensor footprint crossing the Stage boundary.  Counts alone are
@@ -149,6 +159,7 @@ struct LogicalStageCost {
   int64_t scopeOutputTensorBytes = 0;
   std::vector<unsigned> simtAnchorIndices;
   bool localSimtMaterializable = false;
+  bool localSuperblockMaterializable = false;
   /// Factors legal for a whole-kernel pure-SIMT schedule.
   std::vector<int64_t> legalSimtFactors;
   /// Factors legal when this Stage alone is materialized as a local scope.
@@ -158,21 +169,12 @@ struct LogicalStageCost {
   llvm::json::Object toJSON() const;
 };
 
-struct LogicalPhaseCost {
-  std::string id;
-  std::vector<LogicalStageCost> stages;
-
-  llvm::json::Object toJSON() const;
-};
-
 struct StageCostTable {
-  std::string domain;
   bool operationOwnershipComplete = false;
   int64_t modeledOperationCount = 0;
   std::string profileVersion;
   int64_t logicalProgramCountHint = 0;
   int64_t physicalCoreCountHint = 0;
-  std::vector<LogicalPhaseCost> phases;
   std::vector<LogicalStageCost> stages;
 };
 
@@ -199,7 +201,6 @@ struct StageRoutePlan {
   std::vector<StageImplementation> implementations;
   std::vector<double> entryTransitionCycles;
   std::vector<double> logicalStageCycles;
-  std::vector<double> logicalPhaseCycles;
   int64_t routeSuperblockFactor = 1;
   int64_t runtimePhysicalProgramCount = 0;
   int64_t runtimeWaveCount = 1;
@@ -210,11 +211,9 @@ struct StageRoutePlan {
 
 struct StageCostModelSummary {
   bool applied = false;
-  std::string domain;
   bool operationOwnershipComplete = false;
   int64_t modeledOperationCount = 0;
   std::string profileVersion;
-  std::vector<LogicalPhaseCost> phases;
   std::vector<LogicalStageCost> stages;
   StageTransitionCost transition;
   StageRoutePlan allSimd;

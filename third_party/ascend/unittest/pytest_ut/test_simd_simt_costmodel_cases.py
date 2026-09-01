@@ -162,7 +162,7 @@ def test_costmodel_gather_dot_min(tmp_path):
     expected = torch.matmul(a[:, indices].float(), b[indices, :].float())
     torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
     report = _load_route_report(report_path, "all_simt_only")
-    assert report["features"]["dot_ops"] == 1
+    assert any(stage["features"]["has_dot"] for stage in report["stage_model"]["logical_stages"])
     _assert_performance("gather_dot_min", launch, tmp_path / "gather_profile", 5.478, tolerance=1.35)
 
 
@@ -448,10 +448,26 @@ def test_costmodel_fbgemm_rowwise_quant(tmp_path):
     launch()
     gathered = input_tensor[token_indices].float() * scores[token_indices, expert_indices].float()[:, None]
     row_max = torch.clamp(torch.amax(torch.abs(gathered), dim=1), min=1.0e-12)
-    expected_scale = row_max / 448.0
-    expected = torch.clamp(gathered / expected_scale[:, None], -448.0, 448.0).to(torch.float8_e4m3fn)
+    # Match the kernel's floating-point operation order.  Although
+    # ``x / (row_max / 448)`` is algebraically equivalent to
+    # ``x * (448 / row_max)``, their FP32 rounding differs at FP8 bin
+    # boundaries and can select adjacent values whose spacing is 32.
+    quant_scale = 448.0 / row_max
+    expected_scale = 1.0 / quant_scale
+    expected = torch.clamp(gathered * quant_scale[:, None], -448.0, 448.0).to(torch.float8_e4m3fn)
     torch.testing.assert_close(output_scale, expected_scale, rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(output.float(), expected.float(), rtol=0, atol=16)
+    output_f32 = output.float()
+    expected_f32 = expected.float()
+    difference = torch.abs(output_f32 - expected_f32)
+    # The device conversion and torch's reference conversion may choose
+    # adjacent FP8 values for an exact rounding tie.  Check one E4M3 ULP at
+    # each expected value instead of using a fixed tolerance: E4M3 spacing is
+    # 16 around 128 but 32 around 256, while subnormals have spacing 2^-9.
+    magnitude = torch.abs(expected_f32)
+    normal_ulp = torch.pow(2.0, torch.floor(torch.log2(torch.clamp(magnitude, min=2**-6))) - 3)
+    fp8_ulp = torch.where(magnitude < 2**-6, torch.full_like(magnitude, 2**-9), normal_ulp)
+    assert torch.all(difference <= fp8_ulp), (f"FBGEMM FP8 output exceeds one ULP: max_abs={difference.max().item()}, "
+                                              f"max_ulp_error={(difference / fp8_ulp).max().item()}")
     layout_merge_disabled = os.getenv("TRITON_TEST_DISABLE_TTIR_LAYOUT_MERGE") == "1"
     expected_route = "all_simd" if layout_merge_disabled else "all_simt_only"
     report = _load_route_report(report_path, expected_route)

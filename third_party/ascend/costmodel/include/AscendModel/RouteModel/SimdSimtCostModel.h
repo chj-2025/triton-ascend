@@ -35,35 +35,20 @@ llvm::StringRef stringifySimdSimtCandidate(SimdSimtCandidateKind candidate);
 /// contains no Operation pointers, so reports remain stable and serializable.
 struct SimtAnchorFeatureSummary {
   int64_t count = 0;
-  int64_t conditionalBranchCount = 0;
-  int64_t divergentBranchCount = 0;
-  double activeLaneRatio = 1.0;
   std::vector<TriangularSolveFacts> triangularSolves;
   CandidateLowerability kernelLowerability;
 
   llvm::json::Object toJSON() const;
 };
 
-/// Static, workload-name-independent properties extracted directly from a
-/// generic TTIR ModuleOp.  Weighted fields include statically known scf.for
-/// trip counts.
+/// Kernel-level facts needed before Stage partitioning.  Operation workload
+/// belongs to StageFeatureAnalysis/StageWorkloadAnalysis and is intentionally
+/// not duplicated here.
 struct SimdSimtFeatureSummary {
-  int64_t loadOps = 0;
-  int64_t storeOps = 0;
-  int64_t reduceOps = 0;
-  int64_t dotOps = 0;
-  int64_t loadedIndexDependentMemoryOps = 0;
-  int64_t dotFlops = 0;
-  int64_t staticLoopTripCountMax = 1;
-  int64_t conditionalBranchCount = 0;
-  int64_t divergentBranchCount = 0;
-  double activeLaneRatio = 1.0;
-
   /// Scheduling/layout facts read from the transformed TTIR consumed by this
   /// model.  These make it explicit that layout merging and AutoBlockify V1
   /// ran before feature extraction rather than being guessed from source TTIR.
   bool autoBlockifyV1Applied = false;
-  int64_t autoBlockifyV1LoopCount = 0;
   bool hasExplicitScope = false;
 
   SimtAnchorFeatureSummary simtAnchors;

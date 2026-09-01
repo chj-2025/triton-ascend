@@ -287,7 +287,7 @@
         "useful_factor_limit": 4,
         "persistent_state_pressure_free_factor": 2,
         "persistent_state_bytes_per_system_cycle": 8.0,
-        "description": "Independent logical programs may continue hiding latency through F4. Loop-carried live state is pressure-free only through F2 and is charged above that point. Keeping the two limits separate lets straight-line FBGEMM-like work benefit from F4 without making recurrence-heavy solve_tril pressure-free."
+        "description": "Independent logical programs may continue hiding latency through F4. The 8 B/system-cycle persistent-state rate is shared by the generic SIMD loop-carried-state term and by the extra pressure of replicating that state in SIMT SuperBlock; state replication is pressure-free only through F2. The rule consumes SSA live-out bytes and contains no workload-name check."
       },
       "scope_handoff": {
         "fixed_directional_system_cycles": 668.0,
@@ -325,7 +325,7 @@
         "measurement": "simt.setup.transition_harness_net.warps_32"
       },
       "confidence": "low",
-      "note": "These values are mode1(empty SIMT plus tail barrier) minus mode6(barrier only) in a branch-heavy harness. They contain no SIMD phase and are used only as conservative setup fallbacks. Directional SIMD-to-SIMT, SIMT-to-SIMD, and dependent UB hand-off costs remain unmeasured."
+      "note": "These values are mode1(empty SIMT plus tail barrier) minus mode6(barrier only) in a branch-heavy harness. They contain no SIMD Stage and are used only as conservative setup fallbacks. Directional SIMD-to-SIMT, SIMT-to-SIMD, and dependent UB hand-off costs remain unmeasured."
     }
   }
 }

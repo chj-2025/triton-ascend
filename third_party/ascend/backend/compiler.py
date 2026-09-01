@@ -1862,6 +1862,9 @@ def ttir_to_npubin(mod, metadata, opt):
                 selected_factor = _selected_npuir_superblock_factor(metadata, opt)
                 _compile_option_list += [f"--super-block-factor={selected_factor}"]
 
+        if not _is_debug_line_info_disabled():
+            _compile_option_list += ["--enable-debug-info=true"]
+
         npu_compiler_path, env = _get_npucompiler_path()
         cmd_list = ([npu_compiler_path, src_path] + _compile_option_list + ["-o", bin_file])
         ret = subprocess.run(cmd_list, env=env, capture_output=True, check=True)

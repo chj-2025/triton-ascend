@@ -89,20 +89,18 @@ struct LogicalStage {
   /// True when this Stage has exact operation ownership/live-in/live-out and
   /// can therefore become a local SIMT scope inside a mixed kernel.
   bool localSimtMaterializable = false;
+  /// True when the one selected local scope will be a direct operation of an
+  /// AutoBlockify V1 loop body.  NPUIR's current scope-SuperBlock ABI requires
+  /// this stronger condition for F2/F4; nested scopes remain legal at F1.
+  bool localSuperblockMaterializable = false;
   std::vector<int64_t> legalSimtFactors;
   std::vector<int64_t> localSimtFactors;
 };
 
-struct LogicalPhase {
-  std::string id;
-  std::vector<LogicalStage> stages;
-};
-
 struct StagePartition {
-  std::string domain;
   bool operationOwnershipComplete = false;
   int64_t modeledOperationCount = 0;
-  std::vector<LogicalPhase> phases;
+  std::vector<LogicalStage> stages;
 };
 
 struct StageOperationRate {
@@ -144,9 +142,10 @@ struct HardwareProfile {
   /// option, not a hardware constant, and bounds cross-group interleaving in
   /// recurrence Stage models.
   int64_t logicalWarpGroupCount = 1;
-  /// SuperBlock hides latency, but large factors also replicate long-lived
-  /// recurrence state.  These target-profile values model the resulting
-  /// register/stack pressure without naming a workload.
+  /// Long-lived recurrence state consumes finite register/stack bandwidth.
+  /// The byte rate is shared by the SIMD recurrence-state term and the extra
+  /// pressure created when a SIMT SuperBlock replicates that state; neither
+  /// formula depends on a workload name.
   /// Largest factor that still gives proportional latency-hiding benefit.
   int64_t superblockUsefulFactorLimit = 1;
   /// Largest factor that may replicate loop-carried live state without an

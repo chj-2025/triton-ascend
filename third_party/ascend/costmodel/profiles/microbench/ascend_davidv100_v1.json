@@ -196,7 +196,7 @@
       "confidence": "medium"
     },
     "simt.setup.transition_harness_net.warps_1": {
-      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for one launched warp. It is mode1 minus barrier-only mode6 and does not contain a SIMD phase, so it is neither a mixed transition nor a dependent handoff latency.",
+      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for one launched warp. It is mode1 minus barrier-only mode6 and does not contain a SIMD Stage, so it is neither a mixed transition nor a dependent handoff latency.",
       "value": 182.0,
       "unit": "system_cycle",
       "cycle_domain": "SYS_CNT",
@@ -206,7 +206,7 @@
       "confidence": "low"
     },
     "simt.setup.transition_harness_net.warps_2": {
-      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for two launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD phase, so it is neither a mixed transition nor a dependent handoff latency.",
+      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for two launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD Stage, so it is neither a mixed transition nor a dependent handoff latency.",
       "value": 182.0,
       "unit": "system_cycle",
       "cycle_domain": "SYS_CNT",
@@ -216,7 +216,7 @@
       "confidence": "low"
     },
     "simt.setup.transition_harness_net.warps_4": {
-      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for four launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD phase, so it is neither a mixed transition nor a dependent handoff latency.",
+      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for four launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD Stage, so it is neither a mixed transition nor a dependent handoff latency.",
       "value": 182.0,
       "unit": "system_cycle",
       "cycle_domain": "SYS_CNT",
@@ -226,7 +226,7 @@
       "confidence": "low"
     },
     "simt.setup.transition_harness_net.warps_8": {
-      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for eight launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD phase, so it is neither a mixed transition nor a dependent handoff latency.",
+      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for eight launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD Stage, so it is neither a mixed transition nor a dependent handoff latency.",
       "value": 182.0,
       "unit": "system_cycle",
       "cycle_domain": "SYS_CNT",
@@ -236,7 +236,7 @@
       "confidence": "low"
     },
     "simt.setup.transition_harness_net.warps_16": {
-      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for sixteen launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD phase, so it is neither a mixed transition nor a dependent handoff latency.",
+      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for sixteen launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD Stage, so it is neither a mixed transition nor a dependent handoff latency.",
       "value": 182.0,
       "unit": "system_cycle",
       "cycle_domain": "SYS_CNT",
@@ -246,7 +246,7 @@
       "confidence": "low"
     },
     "simt.setup.transition_harness_net.warps_32": {
-      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for thirty-two launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD phase, so it is neither a mixed transition nor a dependent handoff latency.",
+      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for thirty-two launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD Stage, so it is neither a mixed transition nor a dependent handoff latency.",
       "value": 223.0,
       "unit": "system_cycle",
       "cycle_domain": "SYS_CNT",
