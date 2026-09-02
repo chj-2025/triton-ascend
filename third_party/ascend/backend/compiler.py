@@ -1929,9 +1929,6 @@ class AscendBackend(BaseBackend):
                     stacklevel=2,
                 )
                 object.__setattr__(options, "compile_mode", "simd_simt_template")
-            if not options.compile_on_910_95:
-                raise ValueError(f"compile_mode='{options.compile_mode}' is only supported on 910_95. "
-                                 "A2/A3 targets do not support SIMT mix compile.")
             if options.shared_mem_dynamic_size is None:
                 object.__setattr__(options, "shared_mem_dynamic_size", 221184)
         elif options.compile_mode == "simt_only":
