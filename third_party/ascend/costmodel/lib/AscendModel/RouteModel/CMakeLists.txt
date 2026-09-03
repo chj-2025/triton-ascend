@@ -5,13 +5,13 @@ add_compile_definitions(
 )
 
 add_mlir_library(AscendModelRouteModel
-  SimtAnchorAnalysis.cpp
-  StagePartitioner.cpp
+  ../Analysis/SimtAnchorAnalysis.cpp
+  ../Analysis/StagePartitioner.cpp
   StageCostModels.cpp
   StageRouteCostModel.cpp
   SimdSimtCostModel.cpp
-  Transforms/SelectSimdSimtCostModel.cpp
-  Transforms/MaterializeSimtScopes.cpp
+  ../Transforms/SelectSimdSimtCostModel.cpp
+  ../Transforms/MaterializeSimtScopes.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${TRITON_ASCEND_COSTMODEL_SOURCE_DIR}/include/AscendModel/RouteModel

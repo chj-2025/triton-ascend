@@ -6,10 +6,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "ascend/include/TritonToLinalg/TTIRLayoutMergePass.h"
+#include "ascend/include/TTIRLayoutMerge/TTIRLayoutMergePass.h"
 
+#include "ascend/include/TTIRLayoutMerge/RowCoalescing.h"
 #include "ascend/include/TritonToLinalg/ImplicitPermute.h"
-#include "ascend/include/TritonToLinalg/RowCoalescing.h"
 #include "ascend/include/TritonToLinalg/StridedAxisCoalescing.h"
 #include "ascend/include/TritonToLinalg/TileChunkCoalescing.h"
 
@@ -53,7 +53,7 @@ public:
     // more specific layout rewrites so it cannot steal their proven access
     // patterns.  All three transformations share hacc.coalesce_factor/axis,
     // therefore a successful earlier rewrite makes this call a no-op.
-    RowCoalescing::rewriteRowCoalesce(module);
+    RowCoalescing::rewriteRowCoalesceForLayoutMerge(module);
 
     PassManager cleanup(&getContext(), module.getOperationName());
     cleanup.addPass(createCSEPass());

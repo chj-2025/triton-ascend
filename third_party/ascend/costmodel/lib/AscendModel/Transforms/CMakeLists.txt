@@ -1,4 +1,5 @@
 add_mlir_library(AscendModelTransforms
+  PARTIAL_SOURCES_INTENDED
   ConvertTritonToAscend.cpp
   InsertDataTransfers.cpp
   AssignOpIDs.cpp

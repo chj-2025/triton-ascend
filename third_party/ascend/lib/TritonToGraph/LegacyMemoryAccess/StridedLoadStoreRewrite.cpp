@@ -20,10 +20,10 @@
  * THE SOFTWARE.
  */
 
-#include "TritonToLinalg/StridedLoadStoreRewrite.h"
-#include "AscendModel/RouteModel/SimtSelection.h"
-#include "TritonToLinalg/ImplicitPermute.h"
-#include "TritonToLinalg/MaskAnalysis.h"
+#include "TritonToGraph/LegacyMemoryAccess/StridedLoadStoreRewrite.h"
+#include "AscendModel/Transforms/SimtSelection.h"
+#include "TritonMemoryAccess/LoadStoreMaskAnalysis.h"
+#include "TritonMemoryAccess/MemoryAccessTags.h"
 #include "TritonToStructured/PtrAnalysis.h"
 #include "Utils/Utils.h"
 
@@ -814,14 +814,7 @@ static LogicalResult tryRewriteAddPtrLoad(triton::LoadOp op,
   unstructuredLoad->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
                             UnitAttr::get(rewriter.getContext()));
 
-  LLVM_DEBUG({
-    llvm::dbgs() << "----------------------------------------------\n";
-    llvm::dbgs() << "StridedLoadStoreRewrite [AddPtr]: tt.load -> "
-                    "ascend.unstructured_load\n";
-    llvm::dbgs() << "  last_stride = " << lastStride << "\n";
-    llvm::dbgs() << unstructuredLoad << "\n";
-    llvm::dbgs() << "----------------------------------------------\n";
-  });
+  logMatch(loc, "AddPtr", "tt.load -> ascend.unstructured_load", lastStride);
   rewriter.replaceOp(op, unstructuredLoad.getResult());
   return success();
 }
@@ -1023,16 +1016,10 @@ static LogicalResult tryRewriteBlockPtrLoad(triton::LoadOp op,
   unstructuredLoad->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
                             UnitAttr::get(rewriter.getContext()));
 
-  LLVM_DEBUG({
-    llvm::dbgs() << "----------------------------------------------\n";
-    llvm::dbgs() << "StridedLoadStoreRewrite [BlockPtr"
-                 << (advance ? "+Advance" : "")
-                 << (boundaryCheck.empty() ? "" : "+Boundary")
-                 << "]: tt.load -> ascend.unstructured_load\n";
-    llvm::dbgs() << "  last_stride = " << lastStride << "\n";
-    llvm::dbgs() << unstructuredLoad << "\n";
-    llvm::dbgs() << "----------------------------------------------\n";
-  });
+  logMatch(loc,
+           llvm::Twine("BlockPtr") + (advance ? "+Advance" : "") +
+               (boundaryCheck.empty() ? "" : "+Boundary"),
+           "tt.load -> ascend.unstructured_load", lastStride);
   rewriter.replaceOp(op, unstructuredLoad.getResult());
   return success();
 }
@@ -1152,14 +1139,7 @@ static LogicalResult tryRewriteAddPtrStore(triton::StoreOp op,
   unstructuredStore->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
                              UnitAttr::get(rewriter.getContext()));
 
-  LLVM_DEBUG({
-    llvm::dbgs() << "----------------------------------------------\n";
-    llvm::dbgs() << "StridedLoadStoreRewrite [AddPtr/Store]: tt.store -> "
-                    "ascend.unstructured_store\n";
-    llvm::dbgs() << "  last_stride = " << lastStride << "\n";
-    llvm::dbgs() << unstructuredStore << "\n";
-    llvm::dbgs() << "----------------------------------------------\n";
-  });
+  logMatch(loc, "AddPtr", "tt.store -> ascend.unstructured_store", lastStride);
   rewriter.eraseOp(op);
   return success();
 }
@@ -1319,16 +1299,10 @@ static LogicalResult tryRewriteBlockPtrStore(triton::StoreOp op,
   unstructuredStore->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
                              UnitAttr::get(rewriter.getContext()));
 
-  LLVM_DEBUG({
-    llvm::dbgs() << "----------------------------------------------\n";
-    llvm::dbgs() << "StridedLoadStoreRewrite [BlockPtr"
-                 << (advance ? "+Advance" : "")
-                 << (boundaryCheck.empty() ? "" : "+Boundary")
-                 << "/Store]: tt.store -> ascend.unstructured_store\n";
-    llvm::dbgs() << "  last_stride = " << lastStride << "\n";
-    llvm::dbgs() << unstructuredStore << "\n";
-    llvm::dbgs() << "----------------------------------------------\n";
-  });
+  logMatch(loc,
+           llvm::Twine("BlockPtr") + (advance ? "+Advance" : "") +
+               (boundaryCheck.empty() ? "" : "+Boundary"),
+           "tt.store -> ascend.unstructured_store", lastStride);
   rewriter.eraseOp(op);
   return success();
 }

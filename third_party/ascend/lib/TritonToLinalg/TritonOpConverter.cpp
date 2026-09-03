@@ -22,7 +22,7 @@
  */
 
 #include "ascend/include/TritonToLinalg/TritonOpConverter.h"
-#include "AscendModel/RouteModel/SimtSelection.h"
+#include "AscendModel/Transforms/SimtSelection.h"
 #include "ascend/include/TritonToLinalg/BlockPtrAnalysis.h"
 #include "ascend/include/TritonToLinalg/MaskAnalysis.h"
 #include "ascend/include/TritonToLinalg/TritonToLinalgPass.h"
@@ -110,7 +110,7 @@ generateUniqueFuncName(ModuleOp moduleOp, llvm::StringRef funcNameBase) {
   return funcName;
 }
 
-// Indirect load/store conversion normally consumes the already-converted
+// Unstructured load/store conversion normally consumes the already-converted
 // memref adaptor directly. That is correct for ordinary pointer bases, but it
 // skips BlockDataParser::materializePointer for an int_to_ptr base and loses
 // the required one-element identity view. Only scalar pointer-preserving
@@ -3662,13 +3662,14 @@ LogicalResult ScatterUbToOutConverter::matchAndRewrite(
   return success();
 }
 
+// Derive the contiguous burst length of an unstructured access from the
+// trailing structured dimensions, mirroring the SIMD/SIMT fusion contract.
 static int64_t computeUnstructuredBurstLength(ArrayRef<int64_t> shape,
                                               ArrayRef<int64_t> dimensions) {
   int64_t firstStructuredDimension = 0;
-  if (!dimensions.empty()) {
+  if (!dimensions.empty())
     firstStructuredDimension =
         *std::max_element(dimensions.begin(), dimensions.end()) + 1;
-  }
 
   int64_t burstLength = 1;
   for (int64_t i = firstStructuredDimension;
@@ -3684,62 +3685,90 @@ LogicalResult UnstructuredLoadConverter::matchAndRewrite(
     triton::ascend::UnstructuredLoadOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
   auto loc = op.getLoc();
-  Value base = adaptor.getBase();
-  Value indices = adaptor.getIndices();
-  Value mask = adaptor.getMask();
-  Value other = adaptor.getOther();
 
-  if (!isa<MemRefType>(base.getType()))
-    return rewriter.notifyMatchFailure(op, "expected MemRefType for base");
+  auto src = adaptor.getBase();
+  auto offsets = op.getIndices();
+  auto mask = op.getMask();
+  auto other = op.getOther();
+  auto res = op.getResult();
+  auto resTy = res.getType();
 
-  auto resultType = cast<RankedTensorType>(op.getResult().getType());
+  // SIMD/SIMT mixed mode fuses the unstructured access into a gather whose
+  // burst length is derived from the unstructured dimensions.
   if (compileModeFlag == triton::ascend::CompileMode::SimdSimt) {
+    if (!isa<MemRefType>(src.getType()))
+      return rewriter.notifyMatchFailure(op, "expected MemRefType for base");
+    auto resultType = cast<RankedTensorType>(resTy);
     int64_t burstLength = computeUnstructuredBurstLength(
         resultType.getShape(), op.getUnstructuredDims());
     Value burstLengthValue =
         rewriter.create<arith::ConstantIntOp>(loc, burstLength, 32);
     Value destination = rewriter.create<tensor::EmptyOp>(
         loc, resultType.getShape(), resultType.getElementType());
-
     auto gather = rewriter.create<hfusion::GatherLoadOp>(
-        loc, base, indices, burstLengthValue, mask, other, destination,
+        loc, src, offsets, burstLengthValue, mask, other, destination,
         hfusion::CacheModifierAttr{}, hfusion::EvictionPolicyAttr{},
         op.getIsVolatileAttr());
     rewriter.replaceOp(op, gather.getResult());
     return success();
   }
 
-  if (compileModeFlag != triton::ascend::CompileMode::SimdSimtTemplate) {
+  if (compileModeFlag != triton::ascend::CompileMode::SimdSimtTemplate)
     return rewriter.notifyMatchFailure(
         op, "unstructured load requires a SIMD/SIMT mixed compile mode");
+
+  // The adaptor may already expose the dynamic carrier created by
+  // IntToPtrConverter.  Re-materialize that narrow provenance before the
+  // MemRefType fast path, otherwise the indirect helper receives memref<?xT>
+  // instead of the required one-element identity descriptor.
+  if (isIntToPtrBasedScalarPointer(op.getBase()) ||
+      (op.getIsVolatile() && isVolatileBitcastScalarPointer(op.getBase()))) {
+    llvm::SmallDenseMap<Value, BlockData> known;
+    FailureOr<Value> materialized =
+        BlockDataParser::materializePointer(op.getBase(), rewriter, known);
+    if (failed(materialized))
+      return rewriter.notifyMatchFailure(
+          op, "unable to materialize int_to_ptr unstructured-load source");
+    src = *materialized;
+  } else if (!isa<MemRefType>(src.getType())) {
+    llvm::SmallDenseMap<Value, BlockData> known;
+    FailureOr<Value> materialized =
+        BlockDataParser::materializePointer(op.getBase(), rewriter, known);
+    if (failed(materialized))
+      return rewriter.notifyMatchFailure(
+          op, "unable to materialize unstructured-load source as a memref");
+    src = *materialized;
+  }
+  // convert !tt.ptr<f32> to memref<?xf32>
+  auto srcTy = dyn_cast<MemRefType>(src.getType());
+  if (!srcTy) {
+    return rewriter.notifyMatchFailure(op, "expected MemRefType for src");
   }
 
-  // Keep the existing SIMT template ABI while using UnstructuredLoadOp as the
-  // single canonical intermediate operation.
   auto moduleOp = op->getParentOfType<ModuleOp>();
   rewriter.setInsertionPoint(moduleOp.getBody(),
                              std::prev(moduleOp.getBody()->end()));
   auto funcName = generateUniqueFuncName(moduleOp, funcNameBase);
 
-  SmallVector<Type> inputTypes({base.getType(), indices.getType()});
+  SmallVector<Type> inputTypes({srcTy, offsets.getType()});
   if (mask)
     inputTypes.push_back(mask.getType());
   if (other)
     inputTypes.push_back(other.getType());
-  auto libFnType = rewriter.getFunctionType(inputTypes, {resultType});
+  auto libFnType = rewriter.getFunctionType(inputTypes, {resTy});
   auto funcOp = rewriter.create<func::FuncOp>(loc, funcName.str(), libFnType);
   SymbolTable::setSymbolVisibility(funcOp, SymbolTable::Visibility::Private);
   auto isVolatileAttr = rewriter.getBoolAttr(op.getIsVolatile());
   funcOp->setAttr("isVolatile", isVolatileAttr);
 
   rewriter.setInsertionPoint(op);
-  SmallVector<Value> inputVals({base, indices});
+  SmallVector<Value> inputVals({src, offsets});
   if (mask)
     inputVals.push_back(mask);
   if (other)
     inputVals.push_back(other);
-  auto callOp = rewriter.create<func::CallOp>(
-      loc, funcOp.getSymNameAttr(), TypeRange({resultType}), inputVals);
+  auto callOp = rewriter.create<func::CallOp>(loc, funcOp.getSymNameAttr(),
+                                              TypeRange({resTy}), inputVals);
   callOp->setAttr("isVolatile", isVolatileAttr);
   rewriter.replaceOp(op, callOp);
   return success();
@@ -3838,31 +3867,57 @@ LogicalResult UnstructuredStoreConverter::matchAndRewrite(
     triton::ascend::UnstructuredStoreOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
   auto loc = op.getLoc();
-  Value base = adaptor.getBase();
-  Value indices = adaptor.getIndices();
-  Value value = adaptor.getValue();
-  Value mask = adaptor.getMask();
 
-  if (!isa<MemRefType>(base.getType()))
-    return rewriter.notifyMatchFailure(op, "expected MemRefType for base");
+  auto src = adaptor.getBase();
+  auto offsets = op.getIndices();
+  auto value = op.getValue();
+  auto mask = op.getMask();
 
-  auto valueType = cast<RankedTensorType>(value.getType());
+  // SIMD/SIMT mixed mode fuses the unstructured access into a scatter whose
+  // burst length is derived from the unstructured dimensions.
   if (compileModeFlag == triton::ascend::CompileMode::SimdSimt) {
+    if (!isa<MemRefType>(src.getType()))
+      return rewriter.notifyMatchFailure(op, "expected MemRefType for base");
+    auto valueType = cast<RankedTensorType>(value.getType());
     int64_t burstLength = computeUnstructuredBurstLength(
         valueType.getShape(), op.getUnstructuredDims());
     Value burstLengthValue =
         rewriter.create<arith::ConstantIntOp>(loc, burstLength, 32);
-
     rewriter.create<hfusion::ScatterStoreOp>(
-        loc, TypeRange{}, indices, value, burstLengthValue, mask, base,
+        loc, TypeRange{}, offsets, value, burstLengthValue, mask, src,
         hfusion::CacheModifierAttr{}, hfusion::EvictionPolicyAttr{});
     rewriter.eraseOp(op);
     return success();
   }
 
-  if (compileModeFlag != triton::ascend::CompileMode::SimdSimtTemplate) {
+  if (compileModeFlag != triton::ascend::CompileMode::SimdSimtTemplate)
     return rewriter.notifyMatchFailure(
         op, "unstructured store requires a SIMD/SIMT mixed compile mode");
+
+  // Keep the unstructured-store ABI consistent with unstructured-load for a
+  // scalar address reconstructed by tt.int_to_ptr.  Ordinary dynamic memrefs
+  // retain the existing direct path.
+  if (isIntToPtrBasedScalarPointer(op.getBase())) {
+    llvm::SmallDenseMap<Value, BlockData> known;
+    FailureOr<Value> materialized =
+        BlockDataParser::materializePointer(op.getBase(), rewriter, known);
+    if (failed(materialized))
+      return rewriter.notifyMatchFailure(
+          op, "unable to materialize int_to_ptr unstructured-store source");
+    src = *materialized;
+  } else if (!isa<MemRefType>(src.getType())) {
+    llvm::SmallDenseMap<Value, BlockData> known;
+    FailureOr<Value> materialized =
+        BlockDataParser::materializePointer(op.getBase(), rewriter, known);
+    if (failed(materialized))
+      return rewriter.notifyMatchFailure(
+          op, "unable to materialize unstructured-store source as a memref");
+    src = *materialized;
+  }
+  // convert !tt.ptr<f32> to memref<?xf32>
+  auto srcTy = dyn_cast<MemRefType>(src.getType());
+  if (!srcTy) {
+    return rewriter.notifyMatchFailure(op, "expected MemRefType for src");
   }
 
   auto moduleOp = op->getParentOfType<ModuleOp>();
@@ -3870,16 +3925,16 @@ LogicalResult UnstructuredStoreConverter::matchAndRewrite(
                              std::prev(moduleOp.getBody()->end()));
   auto funcName = generateUniqueFuncName(moduleOp, funcNameBase);
 
-  SmallVector<Type> inputTypes(
-      {base.getType(), indices.getType(), value.getType()});
+  SmallVector<Type> inputTypes({srcTy, offsets.getType(), value.getType()});
   if (mask)
     inputTypes.push_back(mask.getType());
+
   auto libFnType = rewriter.getFunctionType(inputTypes, {});
   auto funcOp = rewriter.create<func::FuncOp>(loc, funcName.str(), libFnType);
   SymbolTable::setSymbolVisibility(funcOp, SymbolTable::Visibility::Private);
 
   rewriter.setInsertionPoint(op);
-  SmallVector<Value> inputVals({base, indices, value});
+  SmallVector<Value> inputVals({src, offsets, value});
   if (mask)
     inputVals.push_back(mask);
   rewriter.create<func::CallOp>(loc, funcOp.getSymNameAttr(), TypeRange({}),

@@ -20,7 +20,7 @@
  * THE SOFTWARE.
  */
 
-#include "TritonToLinalg/RowCoalescing.h"
+#include "TTIRLayoutMerge/RowCoalescing.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -141,7 +141,6 @@ static std::optional<RowSeed> matchRowSeed(ModuleOp moduleOp) {
 
     return RowSeed{pid, axis, cmp.getRhs(), cmp, falseBlock};
   }
-
   return std::nullopt;
 }
 
@@ -648,7 +647,7 @@ static void rewriteModule(ModuleOp moduleOp, IRRewriter &rw) {
 
 } // namespace
 
-void rewriteRowCoalesce(ModuleOp moduleOp) {
+void rewriteRowCoalesceForLayoutMerge(ModuleOp moduleOp) {
   IRRewriter rw(moduleOp.getContext());
   rewriteModule(moduleOp, rw);
 }
@@ -665,7 +664,7 @@ struct RowCoalescingPass
   }
 
   void runOnOperation() override {
-    RowCoalescing::rewriteRowCoalesce(getOperation());
+    RowCoalescing::rewriteRowCoalesceForLayoutMerge(getOperation());
   }
 };
 

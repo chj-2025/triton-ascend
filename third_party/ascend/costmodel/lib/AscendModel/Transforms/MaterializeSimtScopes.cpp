@@ -7,9 +7,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "AscendModel/RouteModel/SimtAnchorAnalysis.h"
-#include "AscendModel/RouteModel/SimtSelection.h"
+#include "AscendModel/Analysis/SimtAnchorAnalysis.h"
 #include "AscendModel/Transforms/Passes.h"
+#include "AscendModel/Transforms/SimtSelection.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -48,13 +48,24 @@ static bool isMaterializable(Operation *op) {
 /// Scope regions are not isolated from above, so operands remain legal
 /// captures.  Moving only the planned operation keeps SIMD producers and
 /// consumers outside the SIMT region.
-static LogicalResult wrapAnchorOperation(Operation *op) {
+inline constexpr llvm::StringLiteral kScopeSuperblockFactorAttr =
+    "ascend.scope_superblock.factor";
+
+static void setScopeExecutionAttrs(Operation *scopeOp, OpBuilder &builder,
+                                   int64_t superblockFactor) {
+  scopeOp->setAttr(kVectorModeAttr, builder.getStringAttr("simt"));
+  scopeOp->setAttr(kScopeSuperblockFactorAttr,
+                   builder.getI64IntegerAttr(superblockFactor));
+}
+
+static LogicalResult wrapAnchorOperation(Operation *op,
+                                         int64_t superblockFactor) {
   OpBuilder builder(op);
   OperationState scopeState(op->getLoc(), "scope.scope");
   scopeState.addTypes(op->getResultTypes());
-  scopeState.addAttribute(kVectorModeAttr, builder.getStringAttr("simt"));
   scopeState.addRegion();
   Operation *scopeOp = builder.create(scopeState);
+  setScopeExecutionAttrs(scopeOp, builder, superblockFactor);
 
   Region &scopeRegion = scopeOp->getRegion(0);
   auto *scopeBody = new Block();
@@ -82,7 +93,8 @@ static LogicalResult wrapAnchorOperation(Operation *op) {
 /// `insertionPoint` lets solve_tril move pure mask setup across the initial
 /// loads while keeping those loads outside, matching the hand-written scope.
 static LogicalResult wrapAnchorRange(ArrayRef<Operation *> ops,
-                                     Operation *insertionPoint) {
+                                     Operation *insertionPoint,
+                                     int64_t superblockFactor) {
   if (ops.empty())
     return success();
   Block *parent = insertionPoint ? insertionPoint->getBlock() : nullptr;
@@ -120,9 +132,9 @@ static LogicalResult wrapAnchorRange(ArrayRef<Operation *> ops,
   for (Value value : escaping)
     escapingTypes.push_back(value.getType());
   scopeState.addTypes(escapingTypes);
-  scopeState.addAttribute(kVectorModeAttr, builder.getStringAttr("simt"));
   scopeState.addRegion();
   Operation *scopeOp = builder.create(scopeState);
+  setScopeExecutionAttrs(scopeOp, builder, superblockFactor);
 
   Region &scopeRegion = scopeOp->getRegion(0);
   auto *scopeBody = new Block();
@@ -149,7 +161,11 @@ static LogicalResult wrapAnchorRange(ArrayRef<Operation *> ops,
 } // namespace
 
 LogicalResult materializeSimtAnchorPlan(ModuleOp module,
-                                        const SimtAnchorPlan &plan) {
+                                        const SimtAnchorPlan &plan,
+                                        int64_t superblockFactor) {
+  if (superblockFactor <= 0 || (superblockFactor & (superblockFactor - 1)) != 0)
+    return module.emitError(
+        "SIMT scope superblock factor must be a positive power of two");
   struct PlannedRange {
     SmallVector<Operation *> operations;
     Operation *insertionPoint = nullptr;
@@ -183,12 +199,13 @@ LogicalResult materializeSimtAnchorPlan(ModuleOp module,
 
   int64_t materialized = 0;
   for (const PlannedRange &range : anchorRanges) {
-    if (failed(wrapAnchorRange(range.operations, range.insertionPoint)))
+    if (failed(wrapAnchorRange(range.operations, range.insertionPoint,
+                               superblockFactor)))
       return failure();
     ++materialized;
   }
   for (Operation *op : anchorOps) {
-    if (failed(wrapAnchorOperation(op)))
+    if (failed(wrapAnchorOperation(op, superblockFactor)))
       return failure();
     ++materialized;
   }

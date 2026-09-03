@@ -23,6 +23,7 @@
 
 #include <cstdlib>
 
+#include "AscendModel/Transforms/SimtSelection.h"
 #include "TritonControlFlowOpt/ControlFlowRewrite.h"
 #include "TritonToGraph/LayoutMemoryOptimization.h"
 #include "TritonToLinalg/BlockPtrAnalysis.h"
@@ -100,6 +101,36 @@
 
 using namespace mlir;
 using namespace triton;
+
+/// Translate the frontend Route Model contract into the native BiShengIR
+/// execution-region contract. `vector_mode` is intentionally the only
+/// attribute authored by TTIR producers, but the downstream mixed pipeline
+/// outlines a scope only when it carries the typed HIVM VF attributes.
+/// Keeping this bridge here makes hand-written and auto-materialized scopes
+/// follow the same lowering path without coupling the Route Model to HIVM.
+static void materializeSimtScopeExecutionContract(ModuleOp module) {
+  module.walk([&](scope::ScopeOp scopeOp) {
+    auto mode = mlir::ascend::simt_selection::getVectorMode(scopeOp);
+    if (!mode || mode.getValue() != "simt")
+      return;
+
+    OpBuilder builder(scopeOp);
+    // The Triton frontend historically emitted a discardable attribute named
+    // `noinline`.  BiShengIR's scope dialect instead models `no_inline` as an
+    // inherent property, and InlineScope only consults that property.  Make
+    // the boundary explicit here so the marked region survives until
+    // OutlineScope instead of being silently flattened back into SIMD code.
+    scopeOp->removeAttr("noinline");
+    scopeOp.setNoInline(true);
+    scopeOp->setAttr("outline", builder.getUnitAttr());
+    scopeOp->setAttr(hivm::TFuncCoreTypeAttr::name,
+                     hivm::TFuncCoreTypeAttr::get(module.getContext(),
+                                                  hivm::TFuncCoreType::AIV));
+    scopeOp->setAttr(
+        hivm::VFModeAttr::name,
+        hivm::VFModeAttr::get(module.getContext(), hivm::VFMode::SIMT));
+  });
+}
 
 int nd2nzFlag = 0;
 bool compileOn91095Flag = false;
@@ -1342,6 +1373,17 @@ void TritonToLinalgPass::addDynamicLegal(
 
 namespace {
 
+// Every axis of the tensor is unstructured so the downstream
+// UnstructuredStoreOp lowering can derive the scatter burst length.
+static DenseI64ArrayAttr getAllUnstructuredDims(RankedTensorType tensorType,
+                                                PatternRewriter &rewriter) {
+  SmallVector<int64_t> dimensions;
+  dimensions.reserve(tensorType.getRank());
+  for (int64_t dimension = 0; dimension < tensorType.getRank(); ++dimension)
+    dimensions.push_back(dimension);
+  return rewriter.getDenseI64ArrayAttr(dimensions);
+}
+
 /// Route the specific `splat(base) -> addptr(scan) -> addptr(constant) ->
 /// store` form through the existing indirect-store operation before use
 /// analysis. Lowering either addptr independently would materialize a memref
@@ -1369,9 +1411,13 @@ public:
     rewriter.setInsertionPoint(nextAddPtr);
     Value combinedOffset = rewriter.create<arith::AddIOp>(
         nextAddPtr.getLoc(), op.getOffset(), nextAddPtr.getOffset());
-    rewriter.create<triton::ascend::IndirectStoreOp>(
+    auto valueType = dyn_cast<RankedTensorType>(store.getValue().getType());
+    if (!valueType)
+      return failure();
+    rewriter.create<triton::ascend::UnstructuredStoreOp>(
         store.getLoc(), baseSplat.getSrc(), combinedOffset, store.getValue(),
-        store.getMask());
+        getAllUnstructuredDims(valueType, rewriter), store.getMask(),
+        store.getCacheAttr(), store.getEvictAttr());
     rewriter.eraseOp(store);
     rewriter.eraseOp(nextAddPtr);
     rewriter.eraseOp(op);
@@ -1870,6 +1916,7 @@ void TritonToLinalgPass::runOnOperation() {
   compileModeFlag = *compileMode;
 
   auto moduleOp = getOperation();
+  materializeSimtScopeExecutionContract(moduleOp);
 
   // Validate the CFO handoff before descriptor conversion, canonicalization,
   // or any other IR mutation can erase malformed metadata with dead code.

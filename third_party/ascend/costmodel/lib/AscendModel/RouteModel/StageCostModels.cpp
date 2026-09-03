@@ -4,8 +4,8 @@
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <array>
@@ -22,8 +22,24 @@ static double iterations(const LogicalStage &stage) {
   return static_cast<double>(std::max<int64_t>(1, stage.iterationCount));
 }
 
+static std::vector<std::string>
+collectSourceLocations(const LogicalStage &stage) {
+  std::vector<std::string> result;
+  llvm::StringSet<> seen;
+  for (Operation *operation : stage.operations) {
+    std::string location;
+    llvm::raw_string_ostream stream(location);
+    operation->getLoc().print(stream);
+    stream.flush();
+    if (location.empty() || !seen.insert(location).second)
+      continue;
+    result.push_back(std::move(location));
+  }
+  return result;
+}
+
 static double controlBody(const StageResourceCycles &resources) {
-  return resources.control + resources.loopControl + resources.branchControl +
+  return resources.loopControl + resources.branchControl +
          resources.divergence + resources.synchronization;
 }
 
@@ -35,11 +51,6 @@ static double serialBody(const StageResourceCycles &resources) {
   // Issue is a shared front-end throughput bound, not an extra instruction
   // stream.  Adding it to execution double-counts every instruction.
   return std::max(execution, resources.issue);
-}
-
-static bool supportsAny(StageCostModelKind kind,
-                        std::initializer_list<StageCostModelKind> kinds) {
-  return llvm::is_contained(kinds, kind);
 }
 
 static bool permitsSimdOverlap(const LogicalStage &stage) {
@@ -69,83 +80,36 @@ materializeControlFlow(const LogicalStage &stage, StageMode mode,
   return resources;
 }
 
-static StageResourceCycles mapSIMDWorkload(const LogicalStage &stage,
-                                           const StageModeProfile &profile) {
+static StageResourceCycles mapWorkload(const LogicalStage &stage,
+                                       const StageModeProfile &profile,
+                                       StageMode mode) {
   StageResourceCycles resources;
   const StageWorkload &work = stage.workload;
+  const bool simd = mode == StageMode::SIMD;
   resources.setup = work.paysKernelSetup ? profile.setupCycles : 0.0;
   for (const auto &[name, elements] : work.operationElements) {
     auto rate = profile.operationRates.find(name);
     if (rate == profile.operationRates.end() || rate->second.throughput <= 0.0)
       continue;
+    const double instructions =
+        simd ? std::ceil(elements / static_cast<double>(profile.vectorWidth))
+             : elements;
     resources.compute +=
-        std::ceil(elements / static_cast<double>(profile.vectorWidth)) /
-        rate->second.throughput * rate->second.factor;
+        instructions / rate->second.throughput * rate->second.factor;
   }
   resources.scalar = work.scalarOperations / profile.scalarOperationsPerCycle;
   if (stage.features.hasIndirectMemory) {
-    const double loadTransactions =
+    const double loads =
         std::max(work.loadWarpInstructions, work.loadBytes > 0.0 ? 1.0 : 0.0);
-    const double storeTransactions =
+    const double stores =
         std::max(work.storeWarpInstructions, work.storeBytes > 0.0 ? 1.0 : 0.0);
-    resources.load =
-        loadTransactions / profile.indirectLoadTransactionsPerCycle;
-    resources.store =
-        storeTransactions / profile.indirectStoreTransactionsPerCycle;
-    if (loadTransactions + storeTransactions > 0.0)
+    resources.load = loads / profile.indirectLoadTransactionsPerCycle;
+    resources.store = stores / profile.indirectStoreTransactionsPerCycle;
+    if (loads + stores > 0.0)
       resources.load += profile.indirectDependencyLatencyCycles;
-  } else {
+  } else if (simd) {
     resources.load = work.loadBytes / profile.loadBytesPerCycle;
     resources.store = work.storeBytes / profile.storeBytesPerCycle;
-  }
-  resources.predicate = std::ceil(work.predicateElements /
-                                  static_cast<double>(profile.vectorWidth)) /
-                        profile.predicateOperationsPerCycle;
-  resources.shuffle = work.shuffleLaneSteps / profile.shuffleLanesPerCycle;
-  if (work.dotFlops > 0.0) {
-    resources.setup += profile.dotSetupCycles;
-    resources.dot = work.dotFlops / profile.dotFlopsPerCycle;
-  }
-  resources.issue =
-      std::ceil(work.issueElements / static_cast<double>(profile.issueWidth)) /
-      profile.issueOperationsPerCycle;
-  resources.spill =
-      work.estimatedSpillTransactions / profile.spillTransactionsPerCycle;
-  if (stage.features.hasLoopCarriedDataDependency)
-    resources.criticalPath = resources.scalar + resources.compute +
-                             resources.predicate + resources.shuffle +
-                             resources.dot;
-  else if (stage.features.hasReduction)
-    resources.criticalPath =
-        resources.compute + resources.predicate + resources.shuffle;
-  return materializeControlFlow(stage, StageMode::SIMD, resources,
-                                profile.controlFlow);
-}
-
-static StageResourceCycles mapSIMTWorkload(const LogicalStage &stage,
-                                           const StageModeProfile &profile) {
-  StageResourceCycles resources;
-  const StageWorkload &work = stage.workload;
-  resources.setup = work.paysKernelSetup ? profile.setupCycles : 0.0;
-  for (const auto &[name, elements] : work.operationElements) {
-    auto rate = profile.operationRates.find(name);
-    if (rate == profile.operationRates.end() || rate->second.throughput <= 0.0)
-      continue;
-    resources.compute +=
-        elements / rate->second.throughput * rate->second.factor;
-  }
-  resources.scalar = work.scalarOperations / profile.scalarOperationsPerCycle;
-  if (stage.features.hasIndirectMemory) {
-    const double loadTransactions =
-        std::max(work.loadWarpInstructions, work.loadBytes > 0.0 ? 1.0 : 0.0);
-    const double storeTransactions =
-        std::max(work.storeWarpInstructions, work.storeBytes > 0.0 ? 1.0 : 0.0);
-    resources.load =
-        loadTransactions / profile.indirectLoadTransactionsPerCycle;
-    resources.store =
-        storeTransactions / profile.indirectStoreTransactionsPerCycle;
-    if (loadTransactions + storeTransactions > 0.0)
-      resources.load += profile.indirectDependencyLatencyCycles;
   } else {
     resources.load =
         work.loadWarpInstructions / profile.loadWarpInstructionsPerCycle;
@@ -153,7 +117,10 @@ static StageResourceCycles mapSIMTWorkload(const LogicalStage &stage,
         work.storeWarpInstructions / profile.storeWarpInstructionsPerCycle;
   }
   resources.predicate =
-      work.predicateElements / profile.predicateOperationsPerCycle;
+      (simd ? std::ceil(work.predicateElements /
+                        static_cast<double>(profile.vectorWidth))
+            : work.predicateElements) /
+      profile.predicateOperationsPerCycle;
   resources.shuffle = work.shuffleLaneSteps / profile.shuffleLanesPerCycle;
   if (work.dotFlops > 0.0) {
     resources.setup += profile.dotSetupCycles;
@@ -171,8 +138,7 @@ static StageResourceCycles mapSIMTWorkload(const LogicalStage &stage,
   else if (stage.features.hasReduction)
     resources.criticalPath =
         resources.compute + resources.predicate + resources.shuffle;
-  return materializeControlFlow(stage, StageMode::SIMT, resources,
-                                profile.controlFlow);
+  return materializeControlFlow(stage, mode, resources, profile.controlFlow);
 }
 
 static double applySuperBlock(const LogicalStage &stage,
@@ -183,6 +149,7 @@ static double applySuperBlock(const LogicalStage &stage,
   if (implementation.mode != StageMode::SIMT ||
       implementation.superblockFactor == 1)
     return stageCycles;
+
   const double factor = static_cast<double>(implementation.superblockFactor);
   const double effectiveFactor = std::min(
       factor, static_cast<double>(profile.superblockUsefulFactorLimit));
@@ -196,12 +163,13 @@ static double applySuperBlock(const LogicalStage &stage,
   // divide dependent arithmetic, loop control, or synchronization.
   const double pressure =
       iterations(stage) * resources.spill * std::max(0.0, factor - 1.0);
-  // A loop-carried Stage keeps its live-out state across iterations.  Factors
-  // above the target's pressure-free point replicate that persistent state
-  // across more logical warp groups.  This is a resource cost, not a blanket
-  // per-factor penalty: straight-line and small-state Stages are unaffected.
+  // Live-out bytes alone do not prove register pressure: they describe the
+  // Stage ABI, not the allocator's simultaneously-live set.  Charge replicated
+  // persistent state only when workload analysis has independently predicted
+  // spill traffic.  This keeps the penalty evidence based and lets independent
+  // recurrence groups use F4 when the generated SIMT VF has no STK/LDK.
   const double persistentStatePressure =
-      stage.features.hasLoopCarriedDataDependency
+      stage.features.hasLoopCarriedDataDependency && resources.spill > 0.0
           ? std::max(
                 0.0,
                 factor -
@@ -210,358 +178,132 @@ static double applySuperBlock(const LogicalStage &stage,
                 static_cast<double>(stage.liveOutBytes) /
                 profile.superblockPersistentStateBytesPerCycle
           : 0.0;
-  const double issueFloor = resources.setup +
-                            iterations(stage) * resources.issue +
-                            resources.epilogue;
-  // Persistent-state pressure is additional register/stack work and cannot
-  // disappear behind the ordinary issue floor.
-  return std::max(issueFloor, stageCycles - latencySensitive +
-                                  latencySensitive / effectiveFactor +
-                                  pressure) +
+  const double fixed = resources.setup;
+  const double issueFloor =
+      fixed + factor * iterations(stage) * resources.issue;
+  // A recurrence is serial inside one logical program.  SuperBlock contributes
+  // F independent logical programs to the same physical program, allowing the
+  // scheduler to cover one program's dependency stalls with another program.
+  // Normalize the critical-path portion per logical program, but retain the
+  // aggregate issue floor: F2/F4 cannot create additional issue bandwidth.
+  // This applies equally to whole-kernel and scope-local SuperBlock because
+  // both materializers batch complete logical programs around the Stage.
+  if (stage.costModelKind == StageCostModelKind::LoopCarriedRecurrence) {
+    const double recurrenceBody = std::max(0.0, stageCycles - fixed);
+    return std::max(issueFloor, fixed + recurrenceBody + pressure) +
+           persistentStatePressure;
+  }
+  // Proven persistent-state pressure is additional register/stack work and
+  // cannot disappear behind the ordinary issue floor.
+  const double body = std::max(0.0, stageCycles - fixed);
+  const double groupedBody = factor * std::max(0.0, body - latencySensitive) +
+                             factor * latencySensitive / effectiveFactor;
+  return std::max(issueFloor, fixed + groupedBody + pressure) +
          persistentStatePressure;
 }
 
-class SIMDDispatchStageCostModel final : public SIMDStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simd_dispatch"; }
-  bool supports(StageCostModelKind kind) const override {
-    return supportsAny(kind, {StageCostModelKind::AutoBlockifyDispatch,
-                              StageCostModelKind::AutoBlockifyLoop});
+static double estimateStage(const LogicalStage &stage,
+                            const HardwareProfile &profile, StageMode mode,
+                            const StageResourceCycles &r) {
+  const double count = iterations(stage);
+  const double serial = r.setup + count * serialBody(r);
+  switch (stage.costModelKind) {
+  case StageCostModelKind::AutoBlockifyDispatch:
+  case StageCostModelKind::AutoBlockifyLoop: {
+    const double dispatchCount =
+        stage.costModelKind == StageCostModelKind::AutoBlockifyLoop ? count
+                                                                    : 1.0;
+    return r.setup +
+           dispatchCount * std::max(r.scalar + controlBody(r), r.issue);
   }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    const double count =
-        context.stage.costModelKind == StageCostModelKind::AutoBlockifyLoop
-            ? iterations(context.stage)
-            : 1.0;
-    return r.setup + count * std::max(r.scalar + controlBody(r), r.issue) +
-           r.epilogue;
-  }
-};
-
-class SIMTDispatchStageCostModel final : public SIMTStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simt_dispatch"; }
-  bool supports(StageCostModelKind kind) const override {
-    return supportsAny(kind, {StageCostModelKind::AutoBlockifyDispatch,
-                              StageCostModelKind::AutoBlockifyLoop});
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    const double count =
-        context.stage.costModelKind == StageCostModelKind::AutoBlockifyLoop
-            ? iterations(context.stage)
-            : 1.0;
-    return r.setup + count * std::max(r.scalar + controlBody(r), r.issue) +
-           r.epilogue;
-  }
-};
-
-class SIMDScalarStageCostModel final : public SIMDStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simd_scalar"; }
-  bool supports(StageCostModelKind kind) const override {
-    return supportsAny(
-        kind,
-        {StageCostModelKind::ScalarIssue, StageCostModelKind::ScalarControl,
-         StageCostModelKind::ScalarMath, StageCostModelKind::IndexGeneration,
-         StageCostModelKind::PredicateMask, StageCostModelKind::LoopPredicate});
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    return r.setup + iterations(context.stage) * serialBody(r) + r.epilogue;
-  }
-};
-
-class SIMTScalarStageCostModel final : public SIMTStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simt_scalar"; }
-  bool supports(StageCostModelKind kind) const override {
-    return supportsAny(
-        kind,
-        {StageCostModelKind::ScalarIssue, StageCostModelKind::ScalarControl,
-         StageCostModelKind::ScalarMath, StageCostModelKind::IndexGeneration,
-         StageCostModelKind::PredicateMask, StageCostModelKind::LoopPredicate});
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    return r.setup + iterations(context.stage) * serialBody(r) + r.epilogue;
-  }
-};
-
-class SIMDContinuousMemoryStageCostModel final : public SIMDStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simd_continuous_memory"; }
-  bool supports(StageCostModelKind kind) const override {
-    return supportsAny(kind, {StageCostModelKind::ContinuousTileMemory,
-                              StageCostModelKind::ContinuousTileStore,
-                              StageCostModelKind::ContinuousShortLoad,
-                              StageCostModelKind::CachePolicyStore});
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    double body = serialBody(r);
-    if (permitsSimdOverlap(context.stage))
-      body = r.scalar + r.predicate + controlBody(r) + r.spill +
-             std::max({r.load, r.store, r.issue});
-    return r.setup + iterations(context.stage) * body + r.epilogue;
-  }
-};
-
-class SIMTContinuousMemoryStageCostModel final : public SIMTStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simt_continuous_memory"; }
-  bool supports(StageCostModelKind kind) const override {
-    return supportsAny(kind, {StageCostModelKind::ContinuousTileMemory,
-                              StageCostModelKind::ContinuousTileStore,
-                              StageCostModelKind::ContinuousShortLoad,
-                              StageCostModelKind::CachePolicyStore});
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    return r.setup + iterations(context.stage) * serialBody(r) + r.epilogue;
-  }
-};
-
-class SIMDIndirectMemoryStageCostModel final : public SIMDStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simd_indirect_memory"; }
-  bool supports(StageCostModelKind kind) const override {
-    return supportsAny(kind, {StageCostModelKind::IndirectScalarMemory,
-                              StageCostModelKind::IndirectGatherMemory});
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    return r.setup + iterations(context.stage) * serialBody(r) + r.epilogue;
-  }
-};
-
-class SIMTIndirectMemoryStageCostModel final : public SIMTStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simt_indirect_memory"; }
-  bool supports(StageCostModelKind kind) const override {
-    return supportsAny(kind, {StageCostModelKind::IndirectScalarMemory,
-                              StageCostModelKind::IndirectGatherMemory});
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    return r.setup + iterations(context.stage) * serialBody(r) + r.epilogue;
-  }
-};
-
-class SIMDIndependentStageCostModel final : public SIMDStageCostModel {
-public:
-  llvm::StringRef getName() const override {
-    return "simd_independent_pipeline";
-  }
-  bool supports(StageCostModelKind kind) const override {
-    return kind == StageCostModelKind::IndependentPipelinedLoop;
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    double body = serialBody(r);
-    if (permitsSimdOverlap(context.stage))
-      body = std::max({r.load, r.store, r.compute + r.dot + r.shuffle,
-                       r.scalar + r.predicate + controlBody(r), r.issue}) +
-             r.spill;
-    return r.setup + iterations(context.stage) * body + r.epilogue;
-  }
-};
-
-class SIMTIndependentStageCostModel final : public SIMTStageCostModel {
-public:
-  llvm::StringRef getName() const override {
-    return "simt_independent_pipeline";
-  }
-  bool supports(StageCostModelKind kind) const override {
-    return kind == StageCostModelKind::IndependentPipelinedLoop;
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    return r.setup + iterations(context.stage) * serialBody(r) + r.epilogue;
-  }
-};
-
-class SIMDRecurrenceStageCostModel final : public SIMDStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simd_recurrence"; }
-  bool supports(StageCostModelKind kind) const override {
-    return kind == StageCostModelKind::LoopCarriedRecurrence;
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
+  case StageCostModelKind::ContinuousTileMemory:
+  case StageCostModelKind::ContinuousTileStore:
+  case StageCostModelKind::ContinuousShortLoad:
+  case StageCostModelKind::CachePolicyStore:
+    if (mode == StageMode::SIMD && permitsSimdOverlap(stage))
+      return r.setup + count * (r.scalar + r.predicate + controlBody(r) +
+                                r.spill + std::max({r.load, r.store, r.issue}));
+    return serial;
+  case StageCostModelKind::IndependentPipelinedLoop:
+    if (mode == StageMode::SIMD && permitsSimdOverlap(stage))
+      return r.setup +
+             count *
+                 (std::max({r.load, r.store, r.compute + r.dot + r.shuffle,
+                            r.scalar + r.predicate + controlBody(r), r.issue}) +
+                  r.spill);
+    return serial;
+  case StageCostModelKind::LoopCarriedRecurrence: {
     const double critical = r.criticalPath > 0.0
                                 ? std::max(r.criticalPath + r.load + r.store +
                                                controlBody(r) + r.spill,
                                            r.issue)
                                 : serialBody(r);
-    return r.setup + iterations(context.stage) * critical + r.epilogue;
+    if (mode == StageMode::SIMD) {
+      // A loop-carried tensor is not ordinary embarrassingly-parallel vector
+      // work: the updated state must remain live until the next recurrence
+      // step.  The operation-throughput terms above account for arithmetic,
+      // but not this persistent register/stack traffic.  Charge the exact
+      // SSA live-out footprint once per Stage invocation using the target
+      // profile's persistent-state byte rate.
+      const double persistentState =
+          static_cast<double>(stage.liveOutBytes) /
+          profile.superblockPersistentStateBytesPerCycle;
+      return r.setup + count * critical + persistentState;
+    }
+    const int64_t groups = std::max<int64_t>(
+        1, std::min(stage.features.parallelRecurrenceGroupCount,
+                    profile.logicalWarpGroupCount));
+    return r.setup +
+           std::max(std::ceil(count / static_cast<double>(groups)) * critical,
+                    count * r.issue);
   }
-};
-
-class SIMTRecurrenceStageCostModel final : public SIMTStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simt_recurrence"; }
-  bool supports(StageCostModelKind kind) const override {
-    return kind == StageCostModelKind::LoopCarriedRecurrence;
+  case StageCostModelKind::RowwiseReduction:
+    return r.setup +
+           count * std::max(r.scalar + r.load + r.store + r.criticalPath +
+                                controlBody(r) + r.spill,
+                            r.issue);
+  case StageCostModelKind::PrefixScan: {
+    const double scanCritical =
+        r.compute + r.predicate +
+        r.shuffle * (mode == StageMode::SIMD
+                         ? profile.simd.prefixScanDependencyFactor
+                         : profile.simt.prefixScanDependencyFactor);
+    return r.setup +
+           count * std::max(r.scalar + r.load + r.store + scanCritical +
+                                controlBody(r) + r.spill,
+                            r.issue);
   }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    const double criticalPerIteration =
-        r.criticalPath > 0.0 ? std::max(r.criticalPath + r.load + r.store +
-                                            controlBody(r) + r.spill,
-                                        r.issue)
-                             : serialBody(r);
-    const int64_t independentGroups = std::max<int64_t>(
-        1, context.stage.features.parallelRecurrenceGroupCount);
-    const int64_t interleavedGroups = std::max<int64_t>(
-        1, std::min(independentGroups, context.profile.logicalWarpGroupCount));
-    // A carried dependency serializes iterations within one group, not
-    // sibling recurrences with disjoint state.  SIMT can interleave those
-    // groups, while the aggregate front-end issue stream remains a hard
-    // throughput floor over all iterations.
-    const double criticalIterations = std::ceil(
-        iterations(context.stage) / static_cast<double>(interleavedGroups));
-    const double criticalPath = criticalIterations * criticalPerIteration;
-    const double issueFloor = iterations(context.stage) * r.issue;
-    return r.setup + std::max(criticalPath, issueFloor) + r.epilogue;
+  case StageCostModelKind::CubeRoofline:
+  case StageCostModelKind::TinyCubeRoofline:
+    if (mode == StageMode::SIMD && permitsSimdOverlap(stage))
+      return r.setup +
+             count * (r.scalar + r.predicate + controlBody(r) + r.shuffle +
+                      r.spill +
+                      std::max({r.load, r.compute + r.dot, r.store, r.issue}));
+    return serial;
+  case StageCostModelKind::ConversionPack:
+    if (mode == StageMode::SIMD && permitsSimdOverlap(stage))
+      return r.setup + count * (r.predicate + controlBody(r) + r.spill +
+                                std::max({r.scalar + r.compute, r.load, r.store,
+                                          r.issue}));
+    return serial;
+  default:
+    return serial;
   }
-};
-
-class SIMDReductionStageCostModel final : public SIMDStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simd_reduction"; }
-  bool supports(StageCostModelKind kind) const override {
-    return kind == StageCostModelKind::RowwiseReduction;
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    // Tree/shuffle depth is a dependency chain, while the shared issue rate
-    // remains a lower bound over the complete instruction stream.
-    const double execution =
-        r.scalar + r.load + r.store + r.criticalPath + controlBody(r) + r.spill;
-    return r.setup + iterations(context.stage) * std::max(execution, r.issue) +
-           r.epilogue;
-  }
-};
-
-class SIMTReductionStageCostModel final : public SIMTStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simt_reduction"; }
-  bool supports(StageCostModelKind kind) const override {
-    return kind == StageCostModelKind::RowwiseReduction;
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    const double execution =
-        r.scalar + r.load + r.store + r.criticalPath + controlBody(r) + r.spill;
-    return r.setup + iterations(context.stage) * std::max(execution, r.issue) +
-           r.epilogue;
-  }
-};
-
-class SIMDCubeStageCostModel final : public SIMDStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simd_cube"; }
-  bool supports(StageCostModelKind kind) const override {
-    return supportsAny(kind, {StageCostModelKind::CubeRoofline,
-                              StageCostModelKind::TinyCubeRoofline});
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    double body = serialBody(r);
-    if (permitsSimdOverlap(context.stage))
-      body = r.scalar + r.predicate + controlBody(r) + r.shuffle + r.spill +
-             std::max({r.load, r.compute + r.dot, r.store, r.issue});
-    return r.setup + iterations(context.stage) * body + r.epilogue;
-  }
-};
-
-class SIMTCubeStageCostModel final : public SIMTStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simt_dot"; }
-  bool supports(StageCostModelKind kind) const override {
-    return supportsAny(kind, {StageCostModelKind::CubeRoofline,
-                              StageCostModelKind::TinyCubeRoofline});
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    return r.setup + iterations(context.stage) * serialBody(r) + r.epilogue;
-  }
-};
-
-class SIMDConversionPackStageCostModel final : public SIMDStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simd_conversion_pack"; }
-  bool supports(StageCostModelKind kind) const override {
-    return kind == StageCostModelKind::ConversionPack;
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    double body = serialBody(r);
-    if (permitsSimdOverlap(context.stage))
-      body = r.predicate + controlBody(r) + r.spill +
-             std::max({r.scalar + r.compute, r.load, r.store, r.issue});
-    return r.setup + iterations(context.stage) * body + r.epilogue;
-  }
-};
-
-class SIMTConversionPackStageCostModel final : public SIMTStageCostModel {
-public:
-  llvm::StringRef getName() const override { return "simt_conversion_pack"; }
-  bool supports(StageCostModelKind kind) const override {
-    return kind == StageCostModelKind::ConversionPack;
-  }
-  double estimate(const StageCostModelContext &context,
-                  const StageImplementation &implementation,
-                  const StageResourceCycles &resources) const override {
-    const StageResourceCycles &r = resources;
-    return r.setup + iterations(context.stage) * serialBody(r) + r.epilogue;
-  }
-};
-
+}
 static bool isDeclaredLegal(const LogicalStage &stage,
                             const StageImplementation &implementation) {
   if (!implementation.isValid())
     return false;
   if (implementation.mode == StageMode::SIMD)
-    return stage.simdLegal && implementation.superblockFactor == 1;
+    return stage.simdLegal && implementation.superblockFactor == 1 &&
+           !implementation.localScope;
   if (!stage.simtLegal)
     return false;
+  if (implementation.localScope)
+    return stage.localSimtMaterializable &&
+           llvm::is_contained(stage.localSimtFactors,
+                              implementation.superblockFactor);
   return llvm::is_contained(stage.legalSimtFactors,
                             implementation.superblockFactor);
 }
@@ -604,6 +346,8 @@ llvm::StringRef mlir::ascend::stringifyStageCostModel(StageCostModelKind kind) {
     return "loop_carried_recurrence";
   case StageCostModelKind::RowwiseReduction:
     return "rowwise_reduction";
+  case StageCostModelKind::PrefixScan:
+    return "prefix_scan";
   case StageCostModelKind::CubeRoofline:
     return "cube_roofline";
   case StageCostModelKind::TinyCubeRoofline:
@@ -612,34 +356,6 @@ llvm::StringRef mlir::ascend::stringifyStageCostModel(StageCostModelKind kind) {
     return "conversion_pack";
   }
   llvm_unreachable("unknown StageCostModelKind");
-}
-
-std::optional<StageCostModelKind>
-mlir::ascend::parseStageCostModel(llvm::StringRef name) {
-  return llvm::StringSwitch<std::optional<StageCostModelKind>>(name)
-      .Case("auto_blockify_dispatch", StageCostModelKind::AutoBlockifyDispatch)
-      .Case("auto_blockify_loop", StageCostModelKind::AutoBlockifyLoop)
-      .Case("scalar_issue", StageCostModelKind::ScalarIssue)
-      .Case("scalar_control", StageCostModelKind::ScalarControl)
-      .Case("scalar_math", StageCostModelKind::ScalarMath)
-      .Case("index_generation", StageCostModelKind::IndexGeneration)
-      .Case("predicate_mask", StageCostModelKind::PredicateMask)
-      .Case("loop_predicate", StageCostModelKind::LoopPredicate)
-      .Case("continuous_tile_memory", StageCostModelKind::ContinuousTileMemory)
-      .Case("continuous_tile_store", StageCostModelKind::ContinuousTileStore)
-      .Case("continuous_short_load", StageCostModelKind::ContinuousShortLoad)
-      .Case("cache_policy_store", StageCostModelKind::CachePolicyStore)
-      .Case("indirect_scalar_memory", StageCostModelKind::IndirectScalarMemory)
-      .Case("indirect_gather_memory", StageCostModelKind::IndirectGatherMemory)
-      .Case("independent_pipelined_loop",
-            StageCostModelKind::IndependentPipelinedLoop)
-      .Case("loop_carried_recurrence",
-            StageCostModelKind::LoopCarriedRecurrence)
-      .Case("rowwise_reduction", StageCostModelKind::RowwiseReduction)
-      .Case("cube_roofline", StageCostModelKind::CubeRoofline)
-      .Case("tiny_cube_roofline", StageCostModelKind::TinyCubeRoofline)
-      .Case("conversion_pack", StageCostModelKind::ConversionPack)
-      .Default(std::nullopt);
 }
 
 bool StageControlFlowRates::isFiniteAndNonNegative() const {
@@ -652,7 +368,7 @@ bool StageControlFlowRates::isFiniteAndNonNegative() const {
 }
 
 bool StageModeProfile::isValid(StageMode mode) const {
-  const std::array<double, 12> common = {setupCycles,
+  const std::array<double, 13> common = {setupCycles,
                                          predicateOperationsPerCycle,
                                          shuffleLanesPerCycle,
                                          dotSetupCycles,
@@ -662,6 +378,7 @@ bool StageModeProfile::isValid(StageMode mode) const {
                                          spillTransactionsPerCycle,
                                          indirectLoadTransactionsPerCycle,
                                          indirectStoreTransactionsPerCycle,
+                                         prefixScanDependencyFactor,
                                          static_cast<double>(vectorWidth),
                                          static_cast<double>(issueWidth)};
   if (!std::all_of(
@@ -697,219 +414,98 @@ bool HardwareProfile::isValid() const {
          transition.isValid();
 }
 
-ProfileProvider::ProfileProvider(HardwareProfile profile)
-    : profile(std::move(profile)) {}
-
-llvm::Expected<const HardwareProfile *>
-ProfileProvider::getSnapshot(llvm::StringRef target,
-                             llvm::StringRef profileVersion) const {
-  if (!profile.isValid())
-    return llvm::createStringError(std::errc::invalid_argument,
-                                   "hardware profile is invalid");
-  if (!target.empty() && target != profile.target)
-    return llvm::createStringError(
-        std::errc::invalid_argument,
-        "hardware profile target '%s' does not match requested target '%s'",
-        profile.target.c_str(), target.str().c_str());
-  if (!profileVersion.empty() && profileVersion != profile.profileVersion)
-    return llvm::createStringError(
-        std::errc::invalid_argument,
-        "hardware profile version '%s' does not match requested version '%s'",
-        profile.profileVersion.c_str(), profileVersion.str().c_str());
-  return &profile;
-}
-
-StageCostModelRegistry::StageCostModelRegistry() {
-  models.push_back(std::make_unique<SIMDDispatchStageCostModel>());
-  models.push_back(std::make_unique<SIMTDispatchStageCostModel>());
-  models.push_back(std::make_unique<SIMDScalarStageCostModel>());
-  models.push_back(std::make_unique<SIMTScalarStageCostModel>());
-  models.push_back(std::make_unique<SIMDContinuousMemoryStageCostModel>());
-  models.push_back(std::make_unique<SIMTContinuousMemoryStageCostModel>());
-  models.push_back(std::make_unique<SIMDIndirectMemoryStageCostModel>());
-  models.push_back(std::make_unique<SIMTIndirectMemoryStageCostModel>());
-  models.push_back(std::make_unique<SIMDIndependentStageCostModel>());
-  models.push_back(std::make_unique<SIMTIndependentStageCostModel>());
-  models.push_back(std::make_unique<SIMDRecurrenceStageCostModel>());
-  models.push_back(std::make_unique<SIMTRecurrenceStageCostModel>());
-  models.push_back(std::make_unique<SIMDReductionStageCostModel>());
-  models.push_back(std::make_unique<SIMTReductionStageCostModel>());
-  models.push_back(std::make_unique<SIMDCubeStageCostModel>());
-  models.push_back(std::make_unique<SIMTCubeStageCostModel>());
-  models.push_back(std::make_unique<SIMDConversionPackStageCostModel>());
-  models.push_back(std::make_unique<SIMTConversionPackStageCostModel>());
-}
-
-const StageCostModelRegistry &StageCostModelRegistry::get() {
-  static const StageCostModelRegistry registry;
-  return registry;
-}
-
-llvm::Expected<const StageCostModel *>
-StageCostModelRegistry::lookup(StageMode mode, StageCostModelKind kind) const {
-  const StageCostModel *match = nullptr;
-  for (const std::unique_ptr<StageCostModel> &model : models) {
-    if (model->getMode() != mode || !model->supports(kind))
-      continue;
-    if (match)
-      return llvm::createStringError(
-          std::errc::invalid_argument,
-          "multiple StageCostModels registered for (%s, %s)",
-          stringifyStageMode(mode).str().c_str(),
-          stringifyStageCostModel(kind).str().c_str());
-    match = model.get();
-  }
-  if (!match)
-    return llvm::createStringError(std::errc::invalid_argument,
-                                   "no StageCostModel registered for (%s, %s)",
-                                   stringifyStageMode(mode).str().c_str(),
-                                   stringifyStageCostModel(kind).str().c_str());
-  return match;
-}
-
-llvm::Error StageCostModelRegistry::verifyComplete() const {
-  constexpr std::array<StageCostModelKind, 20> kinds = {
-      StageCostModelKind::AutoBlockifyDispatch,
-      StageCostModelKind::AutoBlockifyLoop,
-      StageCostModelKind::ScalarIssue,
-      StageCostModelKind::ScalarControl,
-      StageCostModelKind::ScalarMath,
-      StageCostModelKind::IndexGeneration,
-      StageCostModelKind::PredicateMask,
-      StageCostModelKind::LoopPredicate,
-      StageCostModelKind::ContinuousTileMemory,
-      StageCostModelKind::ContinuousTileStore,
-      StageCostModelKind::ContinuousShortLoad,
-      StageCostModelKind::CachePolicyStore,
-      StageCostModelKind::IndirectScalarMemory,
-      StageCostModelKind::IndirectGatherMemory,
-      StageCostModelKind::IndependentPipelinedLoop,
-      StageCostModelKind::LoopCarriedRecurrence,
-      StageCostModelKind::RowwiseReduction,
-      StageCostModelKind::CubeRoofline,
-      StageCostModelKind::TinyCubeRoofline,
-      StageCostModelKind::ConversionPack};
-  for (StageMode mode : {StageMode::SIMD, StageMode::SIMT}) {
-    for (StageCostModelKind kind : kinds) {
-      auto model = lookup(mode, kind);
-      if (!model)
-        return model.takeError();
-    }
-  }
-  return llvm::Error::success();
-}
-
 llvm::Expected<StageCostTable>
 StageCostEvaluator::evaluate(const StagePartition &partition,
                              const HardwareProfile &profile) const {
-  if (partition.domain.empty() || partition.phases.empty())
+  if (partition.stages.empty())
     return llvm::createStringError(
         std::errc::invalid_argument,
-        "StagePartition requires a domain and at least one Phase");
+        "StagePartition requires at least one Stage");
   if (!profile.isValid())
     return llvm::createStringError(std::errc::invalid_argument,
                                    "HardwareProfile is invalid");
-  if (llvm::Error error = registry.verifyComplete())
-    return std::move(error);
-
   StageCostTable table;
-  table.domain = partition.domain;
-  table.boundarySource = partition.boundarySource;
   table.operationOwnershipComplete = partition.operationOwnershipComplete;
   table.modeledOperationCount = partition.modeledOperationCount;
   table.profileVersion = profile.profileVersion;
   llvm::StringSet<> stageIds;
 
-  for (const LogicalPhase &phase : partition.phases) {
-    if (phase.id.empty() || phase.stages.empty())
+  for (const LogicalStage &stage : partition.stages) {
+    if (stage.id.empty() || !stageIds.insert(stage.id).second)
+      return llvm::createStringError(
+          std::errc::invalid_argument,
+          "Stage ids must be non-empty and unique: '%s'", stage.id.c_str());
+    if (stage.iterationCount <= 0 || !stage.features.isValid() ||
+        !stage.workload.isFiniteAndNonNegative())
+      return llvm::createStringError(
+          std::errc::invalid_argument,
+          "Stage '%s' has invalid iteration/features", stage.id.c_str());
+    if (!stage.simdLegal && !stage.simtLegal)
       return llvm::createStringError(std::errc::invalid_argument,
-                                     "every Phase requires an id and Stage");
-    LogicalPhaseCost phaseCost;
-    phaseCost.id = phase.id;
-    phaseCost.description = phase.description;
+                                     "Stage '%s' has no legal StageMode",
+                                     stage.id.c_str());
+    if (stage.simtLegal && stage.legalSimtFactors.empty())
+      return llvm::createStringError(
+          std::errc::invalid_argument,
+          "SIMT Stage '%s' has no legal SuperBlock factor", stage.id.c_str());
 
-    for (const LogicalStage &stage : phase.stages) {
-      if (stage.id.empty() || !stageIds.insert(stage.id).second)
-        return llvm::createStringError(
-            std::errc::invalid_argument,
-            "Stage ids must be non-empty and unique: '%s'", stage.id.c_str());
-      if (stage.iterationCount <= 0 || !stage.features.isValid() ||
-          !stage.workload.isFiniteAndNonNegative())
-        return llvm::createStringError(
-            std::errc::invalid_argument,
-            "Stage '%s' has invalid iteration/features", stage.id.c_str());
-      if (!stage.simdLegal && !stage.simtLegal)
+    LogicalStageCost logicalCost;
+    logicalCost.id = stage.id;
+    logicalCost.model = stringifyStageCostModel(stage.costModelKind).str();
+    logicalCost.schedule = stage.scheduleKind;
+    logicalCost.iterationCount = stage.iterationCount;
+    logicalCost.features = stage.features;
+    logicalCost.workload = stage.workload;
+    logicalCost.ownedOperationCount =
+        static_cast<int64_t>(stage.operations.size());
+    logicalCost.sourceLocations = collectSourceLocations(stage);
+    logicalCost.liveInCount = static_cast<int64_t>(stage.liveIns.size());
+    logicalCost.liveOutCount = static_cast<int64_t>(stage.liveOuts.size());
+    logicalCost.liveInBytes = stage.liveInBytes;
+    logicalCost.liveOutBytes = stage.liveOutBytes;
+    logicalCost.localSimtScopeCount = stage.localSimtScopeCount;
+    logicalCost.scopeInputTensorBytes = stage.scopeInputTensorBytes;
+    logicalCost.scopeOutputTensorBytes = stage.scopeOutputTensorBytes;
+    logicalCost.simtAnchorIndices = stage.simtAnchorIndices;
+    logicalCost.localSimtMaterializable = stage.localSimtMaterializable;
+    logicalCost.localSuperblockMaterializable =
+        stage.localSuperblockMaterializable;
+    logicalCost.legalSimtFactors = stage.legalSimtFactors;
+    logicalCost.localSimtFactors = stage.localSimtFactors;
+
+    llvm::SmallVector<StageImplementation> implementations;
+    if (stage.simdLegal)
+      implementations.push_back({StageMode::SIMD, 1, false});
+    if (stage.simtLegal)
+      for (int64_t factor : stage.legalSimtFactors)
+        implementations.push_back({StageMode::SIMT, factor, false});
+    if (stage.simtLegal && stage.localSimtMaterializable)
+      for (int64_t factor : stage.localSimtFactors)
+        implementations.push_back({StageMode::SIMT, factor, true});
+
+    for (const StageImplementation &implementation : implementations) {
+      if (!isDeclaredLegal(stage, implementation))
         return llvm::createStringError(std::errc::invalid_argument,
-                                       "Stage '%s' has no legal StageMode",
+                                       "Stage '%s' has an illegal candidate",
                                        stage.id.c_str());
-      if (stage.simtLegal && stage.legalSimtFactors.empty())
-        return llvm::createStringError(
-            std::errc::invalid_argument,
-            "SIMT Stage '%s' has no legal SuperBlock factor", stage.id.c_str());
-
-      LogicalStageCost logicalCost;
-      logicalCost.id = stage.id;
-      logicalCost.description = stage.description;
-      logicalCost.model = stringifyStageCostModel(stage.costModelKind).str();
-      logicalCost.schedule = stage.scheduleKind;
-      logicalCost.iterationCount = stage.iterationCount;
-      logicalCost.features = stage.features;
-      logicalCost.workload = stage.workload;
-      logicalCost.ownedOperationCount =
-          static_cast<int64_t>(stage.operations.size());
-      logicalCost.liveInCount = static_cast<int64_t>(stage.liveIns.size());
-      logicalCost.liveOutCount = static_cast<int64_t>(stage.liveOuts.size());
-      logicalCost.liveInBytes = stage.liveInBytes;
-      logicalCost.liveOutBytes = stage.liveOutBytes;
-      logicalCost.localSimtScopeCount = stage.localSimtScopeCount;
-      logicalCost.scopeInputTensorBytes = stage.scopeInputTensorBytes;
-      logicalCost.scopeOutputTensorBytes = stage.scopeOutputTensorBytes;
-      logicalCost.simtAnchorIndices = stage.simtAnchorIndices;
-      logicalCost.localSimtMaterializable = stage.localSimtMaterializable;
-      logicalCost.localSimtFactors = stage.localSimtFactors;
-
-      llvm::SmallVector<StageImplementation> implementations;
-      if (stage.simdLegal)
-        implementations.push_back({StageMode::SIMD, 1});
-      if (stage.simtLegal)
-        for (int64_t factor : stage.legalSimtFactors)
-          implementations.push_back({StageMode::SIMT, factor});
-
-      for (const StageImplementation &implementation : implementations) {
-        if (!isDeclaredLegal(stage, implementation))
-          return llvm::createStringError(std::errc::invalid_argument,
-                                         "Stage '%s' has an illegal candidate",
-                                         stage.id.c_str());
-        auto model = registry.lookup(implementation.mode, stage.costModelKind);
-        if (!model)
-          return model.takeError();
-        StageResourceCycles resources =
-            implementation.mode == StageMode::SIMD
-                ? mapSIMDWorkload(stage, profile.simd)
-                : mapSIMTWorkload(stage, profile.simt);
-        const StageCostModelContext context{stage, profile};
-
-        StageImplementationCost cost;
-        cost.implementation = implementation;
-        cost.resources = resources;
-        cost.modelName = (*model)->getName().str();
-        cost.profileVersion = profile.profileVersion;
-        cost.source =
-            "post-transform TTIR StageWorkload + immutable HardwareProfile";
-        cost.totalCycles = applySuperBlock(
-            stage, resources, implementation, profile,
-            (*model)->estimate(context, implementation, resources));
-        if (!cost.isValid())
-          return llvm::createStringError(std::errc::invalid_argument,
-                                         "Stage '%s' produced an invalid cost",
-                                         stage.id.c_str());
-        logicalCost.implementations.push_back(std::move(cost));
-      }
-
-      phaseCost.stages.push_back(logicalCost);
-      table.stages.push_back(std::move(logicalCost));
+      StageResourceCycles resources = mapWorkload(
+          stage,
+          implementation.mode == StageMode::SIMD ? profile.simd : profile.simt,
+          implementation.mode);
+      StageImplementationCost cost;
+      cost.implementation = implementation;
+      cost.resources = resources;
+      cost.totalCycles = applySuperBlock(
+          stage, resources, implementation, profile,
+          estimateStage(stage, profile, implementation.mode, resources));
+      if (!cost.isValid())
+        return llvm::createStringError(std::errc::invalid_argument,
+                                       "Stage '%s' produced an invalid cost",
+                                       stage.id.c_str());
+      logicalCost.implementations.push_back(std::move(cost));
     }
-    table.phases.push_back(std::move(phaseCost));
+
+    table.stages.push_back(std::move(logicalCost));
   }
   return table;
 }
