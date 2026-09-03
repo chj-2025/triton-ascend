@@ -154,9 +154,6 @@ def HIVMAnalysisPass : Pass<"analyze-hivm", "ModuleOp"> {
   }];
 
   let options = [
-    Option<"schedulerMode", "scheduler", "std::string",
-           /*default=*/"\"static\"",
-           "Scheduler backend: static or des">,
     Option<"argBindingsStr", "arg-bindings", "std::string",
            /*default=*/"\"\"",
            "Bindings for dynamic HIVM values (e.g., 'arg10=128,arg11=64')">,
@@ -225,6 +222,15 @@ def SelectSimdSimtCostModelPass
     Option<"scopeSuperblockMaterializable", "scope-superblock-materializable", "bool",
            /*default=*/"false",
            "Whether backend integration can materialize mixed F2/F4 with AutoBlockify V1">,
+    Option<"logicalProgramCountHint", "logical-program-count-hint", "int64_t",
+           /*default=*/"0",
+           "Optional runtime logical-program count used to cost full SuperBlock groups and tails">,
+    Option<"analysisModulePath", "analysis-module-path", "std::string",
+           /*default=*/"\"\"",
+           "Optional post-layout/post-AutoBlockify TTIR used only for feature analysis and scoring">,
+    Option<"routeTransformCapabilityJSON", "route-transform-capability-json", "std::string",
+           /*default=*/"\"{}\"",
+           "Resolved layout/V1 capability shared by scoring, materialization, and reporting">,
     Option<"reportFile", "report-file", "std::string",
            /*default=*/"\"\"",
            "Optional JSONL path for the C++ selection report">

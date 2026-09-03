@@ -20,8 +20,7 @@
  * THE SOFTWARE.
  */
 
-#include "AscendModel/RouteModel/SimtSelection.h"
-#include "TritonToUnstructure/IndirectAtomicUtils.h"
+#include "AscendModel/Transforms/SimtSelection.h"
 #include "Utils/Utils.h"
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
 
@@ -261,6 +260,8 @@ static void markSyncBlockLockUnordered(Operation *op) {
   op->setAttr(hivm::SyncBlockLockUnorderedAttr::name,
               UnitAttr::get(op->getContext()));
 }
+static constexpr const char *routeDiscreteMaskToSimtAttrName =
+    "route_discrete_mask_to_simt";
 
 static bool traceUserToTargetOp(Value val) {
   llvm::SmallVector<Value, 32> worklist;

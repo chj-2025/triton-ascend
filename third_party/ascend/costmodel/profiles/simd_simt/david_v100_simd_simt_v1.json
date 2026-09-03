@@ -1,7 +1,7 @@
 {
   "$schema": "./simd_simt_profile_schema.json",
   "schema_version": 10,
-  "profile_version": "david-v100-simd-simt-20260820-v17",
+  "profile_version": "david-v100-simd-simt-20260903-v20",
   "target": "Ascend950PR/dav-c310",
   "description": "Stage Route Model hardware profile. Stage partitions and workloads are generated online from transformed TTIR; this file contains no workload-specific Stage template or route multiplier.",
   "microbenchmark_profile": "../microbench/ascend_davidv100_v1.json",
@@ -130,7 +130,7 @@
       "description": "All-SIMD dot setup and throughput seed used for every dot operation; current calibrated admission is narrower and covers only tiny irregular dot.",
       "startup_system_cycles": 128.0,
       "flops_per_system_cycle": 4096.0,
-      "source": "AscendModel cube startup/throughput seed; DES feedback is expected to refine scheduled lowering",
+      "source": "AscendModel cube startup/throughput seed; CaModel and profiler data refine scheduled lowering",
       "confidence": "low"
     },
     "stage_resources": {
@@ -138,6 +138,10 @@
       "scalar_operations_per_system_cycle": 1.0,
       "issue_instructions_per_system_cycle": 6.0,
       "spill_transactions_per_system_cycle": 1.0,
+      "prefix_scan": {
+        "dependency_factor": 17.35,
+        "description": "SIMD prefix-scan dependency factor calibrated from the identity-baseline-subtracted A5 batch-8, extent-16 scan sweep (143.398 us SIMD scan increment versus 8.267 us SIMT, ratio 17.345); unlike reduction throughput, successive scan levels remain dependent."
+      },
       "indirect_memory": {
         "load_transactions_per_system_cycle": 0.125,
         "store_transactions_per_system_cycle": 0.125,
@@ -272,6 +276,10 @@
       "scalar_operations_per_system_cycle": 4.0,
       "issue_instructions_per_system_cycle": 4.0,
       "spill_transactions_per_system_cycle": 1.0,
+      "prefix_scan": {
+        "dependency_factor": 1.0,
+        "description": "SIMT shuffle throughput already represents the lane dependency chain measured by the A5 scan sweep."
+      },
       "indirect_memory": {
         "load_transactions_per_system_cycle": 0.5,
         "store_transactions_per_system_cycle": 0.5,
@@ -287,15 +295,15 @@
         "useful_factor_limit": 4,
         "persistent_state_pressure_free_factor": 2,
         "persistent_state_bytes_per_system_cycle": 8.0,
-        "description": "Independent logical programs may continue hiding latency through F4. Loop-carried live state is pressure-free only through F2 and is charged above that point. Keeping the two limits separate lets straight-line FBGEMM-like work benefit from F4 without making recurrence-heavy solve_tril pressure-free."
+        "description": "Independent logical programs may continue hiding latency through F4. The 8 B/system-cycle persistent-state rate is shared by the generic SIMD loop-carried-state term and by the extra pressure of replicating that state in SIMT SuperBlock; state replication is pressure-free only through F2. The rule consumes SSA live-out bytes and contains no workload-name check."
       },
       "scope_handoff": {
-        "fixed_directional_system_cycles": 0.0,
+        "fixed_directional_system_cycles": 668.0,
         "simd_ub_load_bytes_per_system_cycle": 512.0,
         "simd_ub_store_bytes_per_system_cycle": 256.0,
         "simt_ub_load_bytes_per_thread_per_system_cycle": 4.0,
         "simt_ub_store_bytes_per_thread_per_system_cycle": 4.0,
-        "description": "Only exact tensor values captured by or returned from scope.scope are charged. A value crosses the distinct SIMD/SIMT register files through UB: producer store plus consumer load. SIMD rates reflect the 256-byte vector width with two load and one store issue slots; SIMT rates are explicitly per active thread and are aggregated over one logical warp."
+        "description": "Only exact tensor values captured by or returned from scope.scope are charged. A value crosses the distinct SIMD/SIMT register files through UB: producer store plus consumer load. SIMD rates reflect the 256-byte vector width with two load and one store issue slots; SIMT rates are explicitly per active thread and are aggregated over one logical warp. The provisional 668-cycle directional fixed term is half of the 1335-cycle scope-pair residual obtained from the A5 local-scope sweep. One scope-local SuperBlock group pays this fixed pair once, so the per-logical-program route score amortizes only the fixed term by factor; UB bytes and Stage work remain unscaled. This is a route-independent calibration seed, not a solve_tril name check, and must later be replaced by directional transition microbenchmarks."
       },
       "source": "Ascend950 SIMT issue limits plus provisional conservative dependency/reconvergence, SuperBlock state-pressure, and scope hand-off rates; replace numeric seeds only through versioned CaModel/microbenchmark evidence."
     },
@@ -325,7 +333,7 @@
         "measurement": "simt.setup.transition_harness_net.warps_32"
       },
       "confidence": "low",
-      "note": "These values are mode1(empty SIMT plus tail barrier) minus mode6(barrier only) in a branch-heavy harness. They contain no SIMD phase and are used only as conservative setup fallbacks. Directional SIMD-to-SIMT, SIMT-to-SIMD, and dependent UB hand-off costs remain unmeasured."
+      "note": "These values are mode1(empty SIMT plus tail barrier) minus mode6(barrier only) in a branch-heavy harness. They contain no SIMD Stage and are used only as conservative setup fallbacks. Directional SIMD-to-SIMT, SIMT-to-SIMD, and dependent UB hand-off costs remain unmeasured."
     }
   }
 }

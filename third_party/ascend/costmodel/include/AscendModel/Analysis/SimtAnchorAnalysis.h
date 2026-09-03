@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <variant>
 #include <vector>
 
 namespace mlir {
@@ -36,52 +35,10 @@ enum class SimtAnchorKind {
 
 llvm::StringRef stringifySimtAnchorKind(SimtAnchorKind kind);
 
-/// Whether one physical route is available for an anchor.  BackendConditional
-/// may be reported and scored offline, but it is not production-selectable.
-enum class CandidateLoweringStatus {
-  Unsupported,
-  Native,
-  BackendConditional,
-  AliasesMixed,
-};
-
-llvm::StringRef
-stringifyCandidateLoweringStatus(CandidateLoweringStatus status);
-
 struct CandidateLowerability {
-  CandidateLoweringStatus allSimd = CandidateLoweringStatus::Native;
-  CandidateLoweringStatus allSimtOnly = CandidateLoweringStatus::Native;
-  CandidateLoweringStatus mixed = CandidateLoweringStatus::Native;
-  std::vector<std::string> allSimdReasons;
-  std::vector<std::string> allSimtOnlyReasons;
-  std::vector<std::string> mixedReasons;
-};
-
-struct TensorAtomicFacts {
-  int64_t updateElements = 0;
-  int64_t addressRank = 0;
-  std::string valueType = "unknown";
-  std::string offsetType = "unknown";
-  std::string operation = "unknown";
-  bool hasMask = false;
-  std::optional<double> staticMaskActiveFraction;
-  bool resultUsed = false;
-  bool addressIsLaneVarying = false;
-  bool addressDependsOnLoadedIndex = false;
-  std::string contention = "unknown";
-};
-
-struct HistogramFacts {
-  int64_t inputElements = 0;
-  int64_t numBins = 0;
-  std::string inputType = "unknown";
-  std::string resultType = "unknown";
-};
-
-struct PlainCumsumFacts {
-  int64_t axisExtent = 0;
-  std::string elementType = "unknown";
-  bool reverse = false;
+  bool allSimd = true;
+  bool allSimtOnly = true;
+  bool mixed = true;
 };
 
 /// Structural facts for a blockwise triangular recurrence such as solve_tril.
@@ -98,10 +55,6 @@ struct TriangularSolveFacts {
   bool requiresCubeTailPartition = false;
 };
 
-using SimtAnchorFacts =
-    std::variant<std::monostate, TensorAtomicFacts, HistogramFacts,
-                 PlainCumsumFacts, TriangularSolveFacts>;
-
 struct SimtAnchorDescriptor {
   Operation *operation = nullptr;
   /// Exact top-level TTIR operations that will be moved into one local SIMT
@@ -116,7 +69,7 @@ struct SimtAnchorDescriptor {
   /// initial SIMD loads to reproduce the hand-written solve_tril scope.
   Operation *scopeInsertionPoint = nullptr;
   SimtAnchorKind kind = SimtAnchorKind::LoadedIndexDependentMemory;
-  SimtAnchorFacts facts;
+  std::optional<TriangularSolveFacts> triangularSolve;
   CandidateLowerability lowerability;
   /// True only when the current target/materializer contract can turn this
   /// descriptor into a local SIMT scope.
@@ -131,8 +84,17 @@ struct SimtAnchorPlan {
   CandidateLowerability kernelLowerability;
 
   llvm::SmallVector<Operation *> materializableRoots() const;
-  int64_t materializableCount() const;
 };
+
+/// Merge the materializable anchors owned by one LogicalStage into the exact
+/// compound scope that will be scored and materialized.  When several anchor
+/// operations share a block, every operation in the lexical interval between
+/// the first and last anchor is included so operands are never captured from
+/// after the new scope.  A failure means the Stage cannot be represented by
+/// one local SIMT scope.
+std::optional<SimtAnchorDescriptor>
+mergeSimtStageAnchors(const SimtAnchorPlan &plan,
+                      llvm::ArrayRef<unsigned> anchorIndices);
 
 /// Materialize exactly the local SIMT regions described by `plan`.
 ///
@@ -140,11 +102,8 @@ struct SimtAnchorPlan {
 /// does not rediscover anchors, recompute features, or read per-operation
 /// selection attributes.  The caller owns the final effective route decision.
 LogicalResult materializeSimtAnchorPlan(ModuleOp module,
-                                        const SimtAnchorPlan &plan);
-
-/// Classify a TTIR operation by SIMT mechanism, independently of whether the
-/// selected target can currently materialize it.
-std::optional<SimtAnchorKind> classifyMixedSimtAnchor(Operation *op);
+                                        const SimtAnchorPlan &plan,
+                                        int64_t superblockFactor = 1);
 
 /// True when a load/store pointer has an SSA backward slice that reaches a
 /// loaded/gathered index.  This is a real data-dependence test and must not be
@@ -153,15 +112,6 @@ bool isLoadedIndexDependentMemoryOp(Operation *op);
 
 /// Build the non-overlapping shared plan in pre-order.
 SimtAnchorPlan buildMixedSimtAnchorPlan(ModuleOp module, bool compileOn91095);
-
-/// Return true when `op` is a TTIR operation that the current local-scope
-/// materializer can move into a SIMT scope on 910_95-class targets.
-bool isMixedSimtAnchor(Operation *op, bool compileOn91095);
-
-/// Collect non-overlapping anchors in pre-order.  Nested operations are not
-/// returned when an enclosing operation already forms one materialized scope.
-llvm::SmallVector<Operation *> collectMixedSimtAnchors(ModuleOp module,
-                                                       bool compileOn91095);
 
 } // namespace ascend
 } // namespace mlir

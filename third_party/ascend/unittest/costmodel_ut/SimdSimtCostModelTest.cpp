@@ -1,6 +1,6 @@
 #include "AscendModel/RouteModel/SimdSimtCostModel.h"
+#include "AscendModel/Analysis/StagePartitioner.h"
 #include "AscendModel/RouteModel/StageCostModels.h"
-#include "AscendModel/RouteModel/StagePartitioner.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -9,19 +9,16 @@
 
 #include <gtest/gtest.h>
 
-using mlir::ascend::estimateSimdSimtCandidates;
 using mlir::ascend::HardwareProfile;
-using mlir::ascend::LogicalPhase;
 using mlir::ascend::LogicalStage;
-using mlir::ascend::SimdSimtCandidateKind;
-using mlir::ascend::SimdSimtCostModelOptions;
+using mlir::ascend::LogicalStageCost;
 using mlir::ascend::SimdSimtFeatureSummary;
 using mlir::ascend::solveStageRoutes;
 using mlir::ascend::StageCostEvaluator;
 using mlir::ascend::StageCostModelKind;
-using mlir::ascend::StageCostModelRegistry;
 using mlir::ascend::StageCostTable;
 using mlir::ascend::StageFeatureAnalysis;
+using mlir::ascend::StageImplementationCost;
 using mlir::ascend::StageMode;
 using mlir::ascend::StageModeLegalityAnalysis;
 using mlir::ascend::StagePartition;
@@ -35,249 +32,15 @@ using mlir::ascend::TriangularSolveFacts;
 
 namespace {
 
-SimdSimtCostModelOptions options(unsigned numWarps) {
-  SimdSimtCostModelOptions result;
-  result.profilePath = TRITON_ASCEND_SIMD_SIMT_TEST_PROFILE_PATH;
-  result.actualTarget = "Ascend950PR_9579";
-  result.numWarps = numWarps;
-  result.compileOn91095 = true;
-  return result;
-}
-
-SimdSimtFeatureSummary gatherDotFeatures() {
-  SimdSimtFeatureSummary f;
-  f.loadOps = 3;
-  f.storeOps = 1;
-  f.dotOps = 1;
-  f.broadcastOps = 5;
-  f.expandDimsOps = 4;
-  f.splatOps = 9;
-  f.addPtrOps = 7;
-  f.arithOps = 9;
-  f.addOps = 2;
-  f.mulOps = 5;
-  f.scalarOps = 7;
-  f.maxTensorRank = 2;
-  f.maxTensorNumel = 256;
-  f.maxElementBits = 32;
-  f.pointerTensorOps = 11;
-  f.pointerUnstructuredDims = 18;
-  f.laneDependentPointerOps = 9;
-  f.loadedIndexDependentMemoryOps = 2;
-  f.vectorPtrSplatOps = 4;
-  f.loadBytes = 1088;
-  f.storeBytes = 1024;
-  f.loadWarpInstructions = 17;
-  f.storeWarpInstructions = 8;
-  f.dotFlops = 8192;
-  f.dotOutputElements = 256;
-  f.dotMNK.push_back({16, 16, 16});
-  f.hasDot = true;
-  f.observedMixedKinds.push_back("conditional_indirect_memory");
-  f.simtAnchors.count = 2;
-  f.simtAnchors.recognizedCount = 2;
-  f.simtAnchors.loadedIndexDependentMemoryOps = 2;
-  f.simtAnchors.mechanismKinds.push_back("loaded_index_dependent_memory");
-
-  f.weightedOps["add"] = 2;
-  f.weightedOps["mul"] = 5;
-  f.weightedOps["load"] = 3;
-  f.weightedOps["store"] = 1;
-  f.opElements["add"] = 32;
-  f.opElements["mul"] = 50;
-  f.opElements["load"] = 528;
-  f.opElements["store"] = 256;
-  return f;
-}
-
-SimdSimtFeatureSummary fbgemmFeatures() {
-  SimdSimtFeatureSummary f;
-  f.loadOps = 7;
-  f.storeOps = 2;
-  f.reduceOps = 1;
-  f.broadcastOps = 6;
-  f.expandDimsOps = 6;
-  f.splatOps = 10;
-  f.addPtrOps = 12;
-  f.arithOps = 29;
-  f.mathOps = 2;
-  f.addOps = 1;
-  f.mulOps = 7;
-  f.divOps = 2;
-  f.maxOps = 2;
-  f.absOps = 2;
-  f.cmpOps = 1;
-  f.castOps = 2;
-  f.clampOps = 2;
-  f.scalarOps = 19;
-  f.maxTensorRank = 2;
-  f.maxTensorNumel = 64;
-  f.maxElementBits = 64;
-  f.maskTensorOps = 12;
-  f.maskRankSum = 25;
-  f.maskBroadcastOps = 4;
-  f.pointerTensorOps = 19;
-  f.pointerUnstructuredDims = 20;
-  f.laneDependentPointerOps = 10;
-  f.loadedIndexDependentMemoryOps = 3;
-  f.rowLocalReduceOps = 1;
-  f.scalarLoadOps = 2;
-  f.vectorPtrSplatOps = 6;
-  f.loadBytes = 4152;
-  f.storeBytes = 2064;
-  f.loadWarpInstructions = 37;
-  f.storeWarpInstructions = 17;
-  f.staticLoopCount = 2;
-  f.staticLoopTripCountSum = 16;
-  f.staticLoopTripCountMax = 8;
-  f.hasControlFlow = true;
-  f.observedMixedKinds.push_back("conditional_indirect_memory");
-  f.simtAnchors.count = 3;
-  f.simtAnchors.recognizedCount = 3;
-  f.simtAnchors.loadedIndexDependentMemoryOps = 3;
-  f.simtAnchors.mechanismKinds.push_back("loaded_index_dependent_memory");
-
-  f.weightedOps["abs"] = 9;
-  f.weightedOps["add"] = 1;
-  f.weightedOps["cast"] = 2;
-  f.weightedOps["clamp"] = 9;
-  f.weightedOps["cmp"] = 1;
-  f.weightedOps["div"] = 2;
-  f.weightedOps["load"] = 21;
-  f.weightedOps["max"] = 16;
-  f.weightedOps["mul"] = 14;
-  f.weightedOps["reduce"] = 8;
-  f.weightedOps["store"] = 9;
-  f.opElements["abs"] = 516;
-  f.opElements["add"] = 4;
-  f.opElements["cast"] = 8;
-  f.opElements["clamp"] = 516;
-  f.opElements["cmp"] = 4;
-  f.opElements["div"] = 8;
-  f.opElements["load"] = 1038;
-  f.opElements["max"] = 40;
-  f.opElements["mul"] = 533;
-  f.opElements["reduce"] = 512;
-  f.opElements["store"] = 516;
-  return f;
-}
-
-SimdSimtFeatureSummary outOfCoverageFeatures() {
-  SimdSimtFeatureSummary f = gatherDotFeatures();
-  // One FLOP above the profile's tiny-dot coverage ceiling.  Since dotFlops is
-  // non-zero, neither reduction-only coverage domain can admit this feature.
-  f.dotFlops = 16385;
-  return f;
-}
-
-SimdSimtFeatureSummary rank1IndirectVectorReductionFeatures() {
-  SimdSimtFeatureSummary f;
-  f.reduceOps = 1;
-  f.maxTensorRank = 1;
-  f.maxTensorNumel = 256;
-  f.maxElementBits = 32;
-  f.rank1IndirectVectorReduce = true;
-  f.weightedOps["reduce"] = 8;
-  return f;
-}
-
-SimdSimtFeatureSummary solveTrilBt16Features() {
-  SimdSimtFeatureSummary f;
-  f.reduceOps = 1;
-  f.maxTensorRank = 2;
-  f.maxTensorNumel = 256;
-  f.maxElementBits = 32;
-  f.maskRankSum = 20;
-  f.pointerTensorOps = 5;
-  f.laneDependentPointerOps = 2;
-  f.staticLoopCount = 1;
-  f.staticLoopTripCountSum = 1;
-  f.staticLoopTripCountMax = 1;
-  f.hasControlFlow = true;
-  f.weightedOps["reduce"] = 1;
-  return f;
-}
-
 SimdSimtFeatureSummary triangularBt16StageFeatures() {
-  SimdSimtFeatureSummary f = solveTrilBt16Features();
-  f.loadOps = 1;
-  f.storeOps = 1;
-  f.loadBytes = 16 * 16 * 4;
-  f.storeBytes = 16 * 16 * 4;
-  f.loadWarpInstructions = 8;
-  f.storeWarpInstructions = 8;
-  f.staticLoopCount = 1;
-  f.staticLoopTripCountSum = 14;
-  f.staticLoopTripCountMax = 14;
-  f.predicateElements = 16 * 16 * 14;
-  f.predicateLaneEvaluations = 16 * 16 * 14;
-  f.shuffleLaneSteps = 16 * 16 * 4 * 14;
+  SimdSimtFeatureSummary f;
   f.simtAnchors.count = 1;
-  f.simtAnchors.recognizedCount = 1;
-  f.simtAnchors.reduceOps = 1;
-  f.simtAnchors.predicateElements = f.predicateElements;
-  f.simtAnchors.predicateLaneEvaluations = f.predicateLaneEvaluations;
-  f.simtAnchors.shuffleLaneSteps = f.shuffleLaneSteps;
-  f.simtAnchors.mechanismKinds.push_back("triangular_solve_loop");
   TriangularSolveFacts triangular;
   triangular.blockRows = 16;
   triangular.blockColumns = 16;
   triangular.accumulatorType = "f32";
   triangular.recurrenceStartRow = 2;
   triangular.recurrenceLoopCount = 14;
-  f.simtAnchors.triangularSolves.push_back(triangular);
-  return f;
-}
-
-SimdSimtFeatureSummary triangularUnknownLoopFeatures() {
-  SimdSimtFeatureSummary f = solveTrilBt16Features();
-  // BT64 has four sibling 16x16 recurrences. Their TTIR upper bounds remain
-  // dynamic, but the full-tile structural estimate is 14 trips per loop.
-  f.staticLoopCount = 4;
-  f.staticLoopTripCountSum = 56;
-  f.staticLoopTripCountMax = 14;
-  f.modeledDynamicLoopCount = 4;
-  f.modeledDynamicLoopTripCountSum = 56;
-  f.hasUnknownTripCount = true;
-  f.maskRankSum = 62;
-  f.loadOps = 4;
-  f.storeOps = 1;
-  f.loadBytes = 4 * 16 * 16 * 4;
-  f.storeBytes = 64 * 64 * 4;
-  f.loadWarpInstructions = 32;
-  f.storeWarpInstructions = 128;
-  f.weightedOps["reduce"] = 56;
-  f.shuffleLaneSteps = 57344;
-  f.predicateLaneEvaluations = 35840;
-  // The BT64 merge tail contains 16 dense 16x16x16 dots.  They are outside
-  // the SIMT anchor and remain eligible for SIMD/Cube lowering.
-  f.dotOps = 16;
-  f.dotFlops = 16 * 2 * 16 * 16 * 16;
-  f.dotOutputElements = 16 * 16 * 16;
-  f.hasDot = true;
-  f.simtAnchors.count = 1;
-  f.simtAnchors.recognizedCount = 1;
-  f.simtAnchors.reduceOps = 4;
-  f.simtAnchors.maxTensorNumel = 256;
-  f.simtAnchors.maskRankSum = 62;
-  f.simtAnchors.staticLoopCount = 4;
-  f.simtAnchors.staticLoopTripCountSum = 56;
-  f.simtAnchors.modeledDynamicLoopCount = 4;
-  f.simtAnchors.modeledDynamicLoopTripCountSum = 56;
-  f.simtAnchors.weightedOps["reduce"] = 56;
-  f.simtAnchors.shuffleLaneSteps = 57344;
-  f.simtAnchors.predicateLaneEvaluations = 35840;
-  f.simtAnchors.mechanismKinds.push_back("triangular_solve_loop");
-  f.simtAnchors.kernelLowerability.allSimtOnly =
-      mlir::ascend::CandidateLoweringStatus::BackendConditional;
-  TriangularSolveFacts triangular;
-  triangular.blockRows = 16;
-  triangular.blockColumns = 16;
-  triangular.accumulatorType = "f32";
-  triangular.recurrenceStartRow = 2;
-  triangular.recurrenceLoopCount = 4;
-  triangular.denseDotTailOps = 16;
-  triangular.requiresCubeTailPartition = true;
   f.simtAnchors.triangularSolves.push_back(triangular);
   return f;
 }
@@ -331,14 +94,12 @@ logicalStage(llvm::StringRef id, StageCostModelKind kind,
              int64_t iterations = 1) {
   LogicalStage stage;
   stage.id = id.str();
-  stage.description = id.str();
   stage.costModelKind = kind;
   stage.scheduleKind = schedule;
   stage.iterationCount = iterations;
   stage.simdLegal = true;
   stage.simtLegal = true;
   stage.legalSimtFactors = {1};
-  stage.features.source = "unit_test_stage_analysis";
   stage.workload.paysKernelSetup = true;
   stage.workload.operationElements["f32.add"] = 64.0;
   stage.workload.issueElements = 4.0;
@@ -348,133 +109,12 @@ logicalStage(llvm::StringRef id, StageCostModelKind kind,
 llvm::Expected<StageCostTable>
 evaluateOneStage(LogicalStage stage,
                  HardwareProfile profile = hardwareProfile()) {
-  LogicalPhase phase;
-  phase.id = "phase";
-  phase.description = "phase";
-  phase.stages.push_back(std::move(stage));
   StagePartition partition;
-  partition.domain = "unit_test";
-  partition.phases.push_back(std::move(phase));
+  partition.stages.push_back(std::move(stage));
   return StageCostEvaluator().evaluate(partition, profile);
 }
 
 } // namespace
-
-TEST(SimdSimtCostModelTest, GatherDotUsesStageCostEvaluator) {
-  auto report = estimateSimdSimtCandidates(gatherDotFeatures(), options(32));
-  if (!report)
-    FAIL() << llvm::toString(report.takeError());
-
-  EXPECT_TRUE(report->stageModel.applied);
-  EXPECT_EQ(report->stageModel.domain, "indirect_underfilled_dot");
-  EXPECT_GT(report->candidateCosts.allSimd, 0.0);
-  EXPECT_GT(report->candidateCosts.allSimtOnly, 0.0);
-  EXPECT_GT(report->candidateCosts.mixedSimdSimt, 0.0);
-  for (const auto &stage : report->stageModel.stages)
-    for (const auto &cost : stage.implementations) {
-      EXPECT_TRUE(cost.implementation.mode == StageMode::SIMD ||
-                  cost.implementation.mode == StageMode::SIMT);
-      EXPECT_GT(cost.totalCycles, 0.0) << stage.id;
-      EXPECT_FALSE(cost.modelName.empty());
-      EXPECT_EQ(cost.profileVersion, report->profileVersion);
-    }
-}
-
-TEST(SimdSimtCostModelTest, FbgemmWithoutAutoBlockifyExposesOnlySuperBlockF1) {
-  auto report = estimateSimdSimtCandidates(fbgemmFeatures(), options(4));
-  if (!report)
-    FAIL() << llvm::toString(report.takeError());
-
-  EXPECT_TRUE(report->stageModel.applied);
-  EXPECT_EQ(report->stageModel.domain, "loaded_index_rowwise_reduction");
-  EXPECT_TRUE(report->stageModel.allSimd.legal);
-  EXPECT_TRUE(report->stageModel.allSimt.legal);
-  EXPECT_TRUE(report->stageModel.mixed.legal);
-  EXPECT_EQ(report->breakdown.mixedCostSource,
-            "stage_cost_evaluator_route_sum");
-  auto reduction =
-      llvm::find_if(report->stageModel.stages, [](const auto &stage) {
-        return stage.model == "rowwise_reduction";
-      });
-  ASSERT_NE(reduction, report->stageModel.stages.end());
-  ASSERT_EQ(reduction->implementations.size(), 2u);
-  EXPECT_EQ(reduction->implementations[0].modelName, "simd_reduction");
-  EXPECT_EQ(reduction->implementations[1].modelName, "simt_reduction");
-  EXPECT_EQ(reduction->implementations[1].implementation.superblockFactor, 1);
-  EXPECT_GT(reduction->implementations[0].resources.criticalPath, 0.0);
-}
-
-TEST(SimdSimtCostModelTest, TriangularSolveUsesStageCostEvaluator) {
-  auto report =
-      estimateSimdSimtCandidates(triangularUnknownLoopFeatures(), options(32));
-  if (!report)
-    FAIL() << llvm::toString(report.takeError());
-
-  EXPECT_TRUE(report->stageModel.applied);
-  EXPECT_EQ(report->stageModel.domain, "triangular_recurrence");
-  ASSERT_EQ(report->stageModel.phases.size(), 4u);
-  ASSERT_EQ(report->stageModel.stages.size(), 5u);
-  ASSERT_EQ(report->stageModel.mixed.implementations.size(), 5u);
-  bool hasSimd = false;
-  bool hasSimt = false;
-  for (const auto &implementation : report->stageModel.mixed.implementations) {
-    hasSimd |= implementation.mode == StageMode::SIMD;
-    hasSimt |= implementation.mode == StageMode::SIMT;
-  }
-  EXPECT_TRUE(hasSimd);
-  EXPECT_TRUE(hasSimt);
-  EXPECT_EQ(report->stageModel.mixed.routeSuperblockFactor, 1);
-  EXPECT_EQ(report->breakdown.mixedCostSource,
-            "stage_cost_evaluator_route_sum");
-}
-
-TEST(SimdSimtCostModelTest, Bt16RecurrenceEvaluatesF2AndF4Pressure) {
-  auto features = triangularBt16StageFeatures();
-  features.autoBlockifyV1Applied = true;
-  auto report = estimateSimdSimtCandidates(features, options(4));
-  if (!report)
-    FAIL() << llvm::toString(report.takeError());
-  ASSERT_TRUE(report->stageModel.applied);
-  EXPECT_EQ(report->stageModel.domain, "triangular_recurrence");
-  auto recurrence =
-      llvm::find_if(report->stageModel.stages, [](const auto &stage) {
-        return stage.model == "loop_carried_recurrence";
-      });
-  ASSERT_NE(recurrence, report->stageModel.stages.end());
-  ASSERT_EQ(recurrence->iterationCount, 14);
-  auto findFactor = [&](int64_t factor) {
-    return llvm::find_if(
-        recurrence->implementations, [&](const auto &implementation) {
-          return implementation.implementation.mode == StageMode::SIMT &&
-                 implementation.implementation.superblockFactor == factor;
-        });
-  };
-  const auto f2 = findFactor(2);
-  const auto f4 = findFactor(4);
-  ASSERT_NE(f2, recurrence->implementations.end());
-  ASSERT_NE(f4, recurrence->implementations.end());
-  // Feature-summary fallback has no exact SSA live-out byte count, so it can
-  // model F4 latency hiding but cannot invent recurrence-state pressure.  The
-  // operation-graph test below supplies liveOutBytes and verifies F4 > F2.
-  EXPECT_LE(f4->totalCycles, f2->totalCycles);
-}
-
-TEST(SimdSimtCostModelTest, UnknownPatternUsesAggregateFallback) {
-  auto features = triangularUnknownLoopFeatures();
-  features.simtAnchors.mechanismKinds.clear();
-  features.simtAnchors.triangularSolves.clear();
-  features.simtAnchors.count = 0;
-  auto report = estimateSimdSimtCandidates(features, options(32));
-  if (!report)
-    FAIL() << llvm::toString(report.takeError());
-  EXPECT_FALSE(report->stageModel.applied);
-  EXPECT_GT(report->candidateCosts.allSimd, 0.0);
-}
-
-TEST(SimdSimtCostModelTest, RegistryCoversEveryModeAndKind) {
-  if (llvm::Error error = StageCostModelRegistry::get().verifyComplete())
-    FAIL() << llvm::toString(std::move(error));
-}
 
 TEST(SimdSimtCostModelTest, StageHasOnlySimdOrSimtImplementations) {
   LogicalStage stage = logicalStage("scalar", StageCostModelKind::ScalarIssue);
@@ -489,65 +129,101 @@ TEST(SimdSimtCostModelTest, StageHasOnlySimdOrSimtImplementations) {
 }
 
 TEST(SimdSimtCostModelTest,
-     ScopeSuperBlockLegalityOpensOnlyWithBackendMaterializer) {
-  auto makePartition = [] {
+     ScopeSuperBlockLegalityRequiresBackendAndResourceMaximum) {
+  auto makePartition = [](int64_t independentGroups) {
     StagePartition partition;
-    partition.domain = "unit_test";
-    mlir::ascend::LogicalPhase phase;
-    phase.id = "phase";
     LogicalStage stage =
-        logicalStage("payload", StageCostModelKind::ScalarIssue);
+        logicalStage("payload", StageCostModelKind::LoopCarriedRecurrence,
+                     StageScheduleKind::LoopCarriedSerial, /*iterations=*/16);
+    stage.features.hasLoop = true;
+    stage.features.hasLoopCarriedDataDependency = true;
+    stage.features.parallelRecurrenceGroupCount = independentGroups;
     stage.localSimtMaterializable = true;
+    stage.localSuperblockMaterializable = true;
     stage.localSimtFactors = {1};
-    phase.stages.push_back(std::move(stage));
-    partition.phases.push_back(std::move(phase));
+    partition.stages.push_back(std::move(stage));
     return partition;
   };
 
-  StagePartition f1Only = makePartition();
+  StagePartition f1Only = makePartition(/*independentGroups=*/4);
   if (llvm::Error error = StageModeLegalityAnalysis().analyze(f1Only, 4, false))
     FAIL() << llvm::toString(std::move(error));
-  EXPECT_EQ(f1Only.phases[0].stages[0].localSimtFactors,
-            (std::vector<int64_t>{1}));
+  EXPECT_EQ(f1Only.stages[0].localSimtFactors, (std::vector<int64_t>{1}));
 
-  StagePartition scopeSuperblock = makePartition();
+  StagePartition scopeSuperblock = makePartition(/*independentGroups=*/4);
   if (llvm::Error error =
           StageModeLegalityAnalysis().analyze(scopeSuperblock, 4, true))
     FAIL() << llvm::toString(std::move(error));
-  EXPECT_EQ(scopeSuperblock.phases[0].stages[0].localSimtFactors,
+  EXPECT_EQ(scopeSuperblock.stages[0].localSimtFactors,
             (std::vector<int64_t>{1, 2, 4}));
+
+  // ABI-v2 creates an F1 V1 scheduling loop and refines only the selected
+  // scope after bufferization, but local and whole-kernel factors still share
+  // the same target/runtime warp-resource maximum.
+  StagePartition mixedOnly = makePartition(/*independentGroups=*/4);
+  if (llvm::Error error =
+          StageModeLegalityAnalysis().analyze(mixedOnly, 1, true))
+    FAIL() << llvm::toString(std::move(error));
+  EXPECT_EQ(mixedOnly.stages[0].legalSimtFactors, (std::vector<int64_t>{1}));
+  EXPECT_EQ(mixedOnly.stages[0].localSimtFactors, (std::vector<int64_t>{1}));
+  auto mixedOnlyCosts = evaluateOneStage(mixedOnly.stages[0]);
+  if (!mixedOnlyCosts)
+    FAIL() << llvm::toString(mixedOnlyCosts.takeError());
+  ASSERT_EQ(mixedOnlyCosts->stages[0].implementations.size(), 3u);
+  EXPECT_EQ(mixedOnlyCosts->stages[0].legalSimtFactors,
+            (std::vector<int64_t>{1}));
+  EXPECT_EQ(mixedOnlyCosts->stages[0].localSimtFactors,
+            (std::vector<int64_t>{1}));
+
+  StagePartition oneWorkGroup = makePartition(/*independentGroups=*/1);
+  if (llvm::Error error =
+          StageModeLegalityAnalysis().analyze(oneWorkGroup, 4, true))
+    FAIL() << llvm::toString(std::move(error));
+  EXPECT_EQ(oneWorkGroup.stages[0].localSimtFactors,
+            (std::vector<int64_t>{1, 2, 4}));
+}
+
+TEST(SimdSimtCostModelTest, LocalScopeFactorsHonorKernelResourceMaximum) {
+  StagePartition partition;
+  LogicalStage stage;
+  stage.id = "indirect_tile_gather";
+  stage.costModelKind = StageCostModelKind::IndirectGatherMemory;
+  stage.scheduleKind = StageScheduleKind::PartiallyDependent;
+  stage.iterationCount = 1;
+  stage.localSimtMaterializable = true;
+  stage.localSuperblockMaterializable = true;
+  partition.stages.push_back(std::move(stage));
+
+  ASSERT_FALSE(StageModeLegalityAnalysis().analyze(
+      partition, /*maximumSuperblockFactor=*/2,
+      /*scopeSuperblockMaterializable=*/true));
+  const LogicalStage &result = partition.stages.front();
+  EXPECT_EQ(result.legalSimtFactors, (std::vector<int64_t>{1, 2}));
+  EXPECT_EQ(result.localSimtFactors, (std::vector<int64_t>{1, 2}));
 }
 
 TEST(SimdSimtCostModelTest, KernelMixedRouteComesFromAdjacentStageModes) {
   StageCostTable table;
-  table.domain = "unit_test";
   table.profileVersion = "unit-test-profile-v1";
   auto addStage = [&](llvm::StringRef id, double simd, double simt) {
     mlir::ascend::LogicalStageCost stage;
     stage.id = id.str();
-    stage.description = id.str();
     stage.localSimtMaterializable = true;
     stage.localSimtFactors = {1};
-    auto cost = [&](StageMode mode, double cycles) {
+    auto cost = [&](StageMode mode, double cycles, bool localScope = false) {
       mlir::ascend::StageImplementationCost result;
-      result.implementation = {mode, 1};
+      result.implementation = {mode, 1, localScope};
       result.totalCycles = cycles;
-      result.modelName = "unit_test";
-      result.profileVersion = table.profileVersion;
-      result.source = "unit_test";
       return result;
     };
     stage.implementations = {cost(StageMode::SIMD, simd),
-                             cost(StageMode::SIMT, simt)};
+                             cost(StageMode::SIMT, simt),
+                             cost(StageMode::SIMT, simt, true)};
     table.stages.push_back(stage);
   };
   addStage("head", 10.0, 20.0);
   addStage("payload", 100.0, 50.0);
   addStage("store", 30.0, 45.0);
-  mlir::ascend::LogicalPhaseCost phase;
-  phase.id = "kernel";
-  phase.stages = table.stages;
-  table.phases.push_back(std::move(phase));
 
   StageTransitionCost transition;
   transition.simdToSimtCycles = 5.0;
@@ -562,44 +238,36 @@ TEST(SimdSimtCostModelTest, KernelMixedRouteComesFromAdjacentStageModes) {
   EXPECT_EQ(result->mixed.implementations[0].mode, StageMode::SIMD);
   EXPECT_EQ(result->mixed.implementations[1].mode, StageMode::SIMT);
   EXPECT_EQ(result->mixed.implementations[2].mode, StageMode::SIMD);
+  ASSERT_EQ(result->mixed.entryTransitionCycles.size(), 3u);
+  EXPECT_DOUBLE_EQ(result->mixed.entryTransitionCycles[1], 12.0);
 }
 
 TEST(SimdSimtCostModelTest, MixedScopePaysExactBidirectionalUbHandoffCost) {
   StageCostTable table;
-  table.domain = "scope_handoff";
   table.profileVersion = "unit-test-profile-v1";
-  auto makeCost = [&](StageMode mode, double cycles) {
+  auto makeCost = [&](StageMode mode, double cycles, bool localScope = false) {
     mlir::ascend::StageImplementationCost cost;
-    cost.implementation = {mode, 1};
+    cost.implementation = {mode, 1, localScope};
     cost.totalCycles = cycles;
-    cost.modelName = "unit_test";
-    cost.profileVersion = table.profileVersion;
-    cost.source = "unit_test";
     return cost;
   };
   mlir::ascend::LogicalStageCost head;
   head.id = "head";
-  head.description = head.id;
   head.implementations = {makeCost(StageMode::SIMD, 10.0),
                           makeCost(StageMode::SIMT, 20.0)};
   mlir::ascend::LogicalStageCost payload;
   payload.id = "large_result_payload";
-  payload.description = payload.id;
   payload.localSimtMaterializable = true;
   payload.localSimtFactors = {1};
   payload.localSimtScopeCount = 2;
   payload.scopeInputTensorBytes = 4096;
   payload.scopeOutputTensorBytes = 16384;
   payload.implementations = {makeCost(StageMode::SIMD, 100.0),
-                             makeCost(StageMode::SIMT, 10.0)};
+                             makeCost(StageMode::SIMT, 10.0),
+                             makeCost(StageMode::SIMT, 10.0, true)};
   mlir::ascend::LogicalStageCost tail = head;
   tail.id = "tail";
-  tail.description = tail.id;
   table.stages = {head, payload, tail};
-  mlir::ascend::LogicalPhaseCost phase;
-  phase.id = "phase";
-  phase.stages = table.stages;
-  table.phases.push_back(std::move(phase));
 
   StageTransitionCost transition;
   transition.simdUbLoadBytesPerCycle = 512.0;
@@ -615,7 +283,88 @@ TEST(SimdSimtCostModelTest, MixedScopePaysExactBidirectionalUbHandoffCost) {
   // Output: 16384/(4*32) + 16384/512 = 160 cycles.
   // Head/payload/tail: 10 + (10 + 208) + 10 = 238 cycles.
   EXPECT_DOUBLE_EQ(routes->mixed.totalCycles, 238.0);
+  ASSERT_EQ(routes->mixed.entryTransitionCycles.size(), 3u);
+  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[0], 0.0);
+  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[1], 208.0);
+  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[2], 0.0);
   EXPECT_GT(routes->mixed.totalCycles, routes->allSimd.totalCycles);
+}
+
+TEST(SimdSimtCostModelTest, MixedScopeSuperBlockAmortizesOnlyFixedTransitions) {
+  StageCostTable table;
+  table.profileVersion = "unit-test-profile-v1";
+  auto makeCost = [&](StageMode mode, int64_t factor, double cycles,
+                      bool localScope = false) {
+    StageImplementationCost cost;
+    cost.implementation = {mode, factor, localScope};
+    cost.totalCycles = cycles;
+    return cost;
+  };
+
+  LogicalStageCost head;
+  head.id = "head";
+  head.implementations = {makeCost(StageMode::SIMD, 1, 10.0),
+                          makeCost(StageMode::SIMT, 1, 100.0)};
+
+  LogicalStageCost payload;
+  payload.id = "payload";
+  payload.localSimtMaterializable = true;
+  payload.localSimtFactors = {1, 2, 4};
+  payload.localSimtScopeCount = 1;
+  payload.scopeInputTensorBytes = 4096;
+  payload.scopeOutputTensorBytes = 4096;
+  payload.implementations = {makeCost(StageMode::SIMD, 1, 1000.0),
+                             makeCost(StageMode::SIMT, 1, 100.0),
+                             makeCost(StageMode::SIMT, 1, 100.0, true),
+                             makeCost(StageMode::SIMT, 2, 100.0, true),
+                             makeCost(StageMode::SIMT, 4, 100.0, true)};
+
+  LogicalStageCost tail = head;
+  tail.id = "tail";
+  table.stages = {head, payload, tail};
+
+  StageTransitionCost transition;
+  transition.simdToSimtCycles = 40.0;
+  transition.simtToSimdCycles = 40.0;
+  transition.simdUbLoadBytesPerCycle = 512.0;
+  transition.simdUbStoreBytesPerCycle = 256.0;
+  transition.simtUbLoadBytesPerThreadPerCycle = 4.0;
+  transition.simtUbStoreBytesPerThreadPerCycle = 4.0;
+  transition.simtWarpSize = 32;
+  auto routes = solveStageRoutes(table, transition);
+  if (!routes)
+    FAIL() << llvm::toString(routes.takeError());
+
+  ASSERT_TRUE(routes->mixed.legal);
+  EXPECT_EQ(routes->mixed.routeSuperblockFactor, 4);
+  // The 80-cycle fixed transition pair is amortized to 20 cycles.  The
+  // 4096-byte input/output handoff remains 48 + 40 cycles per program.
+  EXPECT_DOUBLE_EQ(routes->mixed.totalCycles,
+                   10.0 + 100.0 + 20.0 + 48.0 + 40.0 + 10.0);
+  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[1], 108.0);
+}
+
+TEST(SimdSimtCostModelTest, PrefixScanUsesModeSpecificDependencyFactor) {
+  LogicalStage stage = logicalStage("scan", StageCostModelKind::PrefixScan);
+  stage.features.hasReduction = true;
+  stage.features.hasPrefixScan = true;
+  stage.workload.operationElements.clear();
+  stage.workload.scalarOperations = 0.0;
+  stage.workload.issueElements = 64.0;
+  stage.workload.shuffleLaneSteps = 320.0;
+
+  HardwareProfile profile = hardwareProfile();
+  profile.simd.prefixScanDependencyFactor = 2.5;
+  profile.simt.prefixScanDependencyFactor = 1.0;
+  auto table = evaluateOneStage(std::move(stage), profile);
+  if (!table)
+    FAIL() << llvm::toString(table.takeError());
+
+  const auto &implementations = table->stages.front().implementations;
+  ASSERT_EQ(implementations.size(), 2u);
+  EXPECT_EQ(implementations[0].implementation.mode, StageMode::SIMD);
+  EXPECT_EQ(implementations[1].implementation.mode, StageMode::SIMT);
+  EXPECT_GT(implementations[0].totalCycles, implementations[1].totalCycles);
 }
 
 TEST(SimdSimtCostModelTest, IndependentLoopUsesSimdRooflineAndSerialSimtCost) {
@@ -636,6 +385,34 @@ TEST(SimdSimtCostModelTest, IndependentLoopUsesSimdRooflineAndSerialSimtCost) {
   EXPECT_TRUE(stage.features.permitsSimdRoofline());
   EXPECT_LT(table->stages[0].implementations[0].totalCycles,
             table->stages[0].implementations[1].totalCycles);
+}
+
+TEST(SimdSimtCostModelTest, SimdCubeStageUsesCvPipelineCriticalPath) {
+  LogicalStage stage =
+      logicalStage("cube", StageCostModelKind::TinyCubeRoofline,
+                   StageScheduleKind::IndependentPipelined, 4);
+  stage.features.hasDot = true;
+  stage.features.hasContiguousMemory = true;
+  stage.workload.operationElements.clear();
+  stage.workload.scalarOperations = 16.0;
+  stage.workload.loadBytes = 2048.0;
+  stage.workload.storeBytes = 512.0;
+  stage.workload.dotFlops = 8192.0;
+  stage.workload.issueElements = 128.0;
+
+  auto table = evaluateOneStage(stage);
+  if (!table)
+    FAIL() << llvm::toString(table.takeError());
+
+  const StageImplementationCost &simd = table->stages[0].implementations[0];
+  ASSERT_EQ(simd.implementation.mode, StageMode::SIMD);
+  EXPECT_DOUBLE_EQ(simd.resources.setup, 18.0);
+  EXPECT_DOUBLE_EQ(simd.resources.load, 64.0);
+  EXPECT_DOUBLE_EQ(simd.resources.store, 32.0);
+  EXPECT_DOUBLE_EQ(simd.resources.dot, 128.0);
+  // SIMD/Cube CV resources overlap inside one Stage.  The model charges the
+  // critical resource (MMAD here), rather than serializing load+MMAD+store.
+  EXPECT_DOUBLE_EQ(simd.totalCycles, 18.0 + 4.0 * (16.0 + 128.0));
 }
 
 TEST(SimdSimtCostModelTest, TrueLoopCarriedDependencyDisablesSimdRoofline) {
@@ -702,6 +479,28 @@ TEST(SimdSimtCostModelTest, RecurrenceAccumulatesCriticalPathAndTraffic) {
   EXPECT_GT(table->stages[0].implementations[0].resources.criticalPath, 0.0);
 }
 
+TEST(SimdSimtCostModelTest, SimdRecurrenceChargesPersistentLiveStateBytes) {
+  LogicalStage baseline = logicalStage(
+      "baseline_recurrence", StageCostModelKind::LoopCarriedRecurrence,
+      StageScheduleKind::LoopCarriedSerial);
+  baseline.features.hasLoop = true;
+  baseline.features.hasLoopCarriedDataDependency = true;
+  LogicalStage withState = baseline;
+  withState.id = "stateful_recurrence";
+  withState.liveOutBytes = 800;
+
+  auto baselineTable = evaluateOneStage(baseline);
+  auto stateTable = evaluateOneStage(withState);
+  if (!baselineTable)
+    FAIL() << llvm::toString(baselineTable.takeError());
+  if (!stateTable)
+    FAIL() << llvm::toString(stateTable.takeError());
+  const double baselineSimd =
+      baselineTable->stages[0].implementations[0].totalCycles;
+  const double stateSimd = stateTable->stages[0].implementations[0].totalCycles;
+  EXPECT_DOUBLE_EQ(stateSimd - baselineSimd, 800.0 / 8.0);
+}
+
 TEST(SimdSimtCostModelTest,
      SimtRecurrenceInterleavesIndependentGroupsButKeepsIssueFloor) {
   LogicalStage serial = logicalStage("serial_recurrence",
@@ -731,12 +530,11 @@ TEST(SimdSimtCostModelTest,
       groupedTable->stages[0].implementations[0].totalCycles;
   EXPECT_LT(groupedCycles, serialCycles);
   const auto &resources = groupedTable->stages[0].implementations[0].resources;
-  EXPECT_GE(groupedCycles,
-            resources.setup + 16.0 * resources.issue + resources.epilogue);
+  EXPECT_GE(groupedCycles, resources.setup + 16.0 * resources.issue);
 }
 
 TEST(SimdSimtCostModelTest,
-     SuperBlockF4ChargesReplicatedPersistentRecurrenceState) {
+     SuperBlockRecurrenceContentionStartsAbovePressureFreeFactor) {
   LogicalStage stage = logicalStage("stateful_recurrence",
                                     StageCostModelKind::LoopCarriedRecurrence,
                                     StageScheduleKind::LoopCarriedSerial, 16);
@@ -748,6 +546,7 @@ TEST(SimdSimtCostModelTest,
   stage.liveOutBytes = 4096;
   stage.workload.loadWarpInstructions = 16.0;
   stage.workload.shuffleLaneSteps = 128.0;
+  stage.workload.issueElements = 64.0;
 
   HardwareProfile profile = hardwareProfile();
   profile.logicalWarpGroupCount = 4;
@@ -756,8 +555,48 @@ TEST(SimdSimtCostModelTest,
     FAIL() << llvm::toString(table.takeError());
   const auto &costs = table->stages.front().implementations;
   ASSERT_EQ(costs.size(), 3u);
-  EXPECT_LT(costs[1].totalCycles, costs[0].totalCycles);
-  EXPECT_GT(costs[2].totalCycles, costs[1].totalCycles);
+  EXPECT_LE(costs[1].totalCycles, costs[0].totalCycles);
+  EXPECT_LE(costs[2].totalCycles, costs[1].totalCycles);
+  EXPECT_GE(costs[2].totalCycles,
+            costs[2].resources.setup + 16.0 * costs[2].resources.issue);
+
+  stage.workload.estimatedSpillTransactions = 32.0;
+  auto spillingTable = evaluateOneStage(stage, profile);
+  if (!spillingTable)
+    FAIL() << llvm::toString(spillingTable.takeError());
+  const auto &spillingCosts = spillingTable->stages.front().implementations;
+  ASSERT_EQ(spillingCosts.size(), 3u);
+  EXPECT_GT(spillingCosts[2].totalCycles, spillingCosts[1].totalCycles);
+}
+
+TEST(SimdSimtCostModelTest,
+     MixedLocalStageSuperBlockHidesRecurrenceLatencyButKeepsIssueFloor) {
+  LogicalStage stage = logicalStage(
+      "mixed_recurrence", StageCostModelKind::LoopCarriedRecurrence,
+      StageScheduleKind::LoopCarriedSerial, /*iterations=*/16);
+  stage.simdLegal = false;
+  stage.legalSimtFactors = {1};
+  stage.localSimtMaterializable = true;
+  stage.localSimtFactors = {1, 2, 4};
+  stage.features.hasLoop = true;
+  stage.features.hasLoopCarriedDataDependency = true;
+  stage.workload.loadWarpInstructions = 16.0;
+  stage.workload.shuffleLaneSteps = 128.0;
+  stage.workload.issueElements = 64.0;
+
+  auto table = evaluateOneStage(stage, hardwareProfile());
+  if (!table)
+    FAIL() << llvm::toString(table.takeError());
+  const auto &costs = table->stages.front().implementations;
+  ASSERT_EQ(costs.size(), 4u);
+  EXPECT_FALSE(costs[0].implementation.localScope);
+  EXPECT_TRUE(costs[1].implementation.localScope);
+  EXPECT_TRUE(costs[2].implementation.localScope);
+  EXPECT_TRUE(costs[3].implementation.localScope);
+  EXPECT_LE(costs[2].totalCycles, costs[1].totalCycles);
+  EXPECT_LE(costs[3].totalCycles, costs[2].totalCycles);
+  EXPECT_GE(costs[3].totalCycles,
+            costs[3].resources.setup + 16.0 * costs[3].resources.issue);
 }
 
 TEST(SimdSimtCostModelTest, IndirectMemoryUsesDependencyProfile) {
@@ -785,34 +624,24 @@ TEST(SimdSimtCostModelTest, IndirectMemoryUsesDependencyProfile) {
 
 TEST(SimdSimtCostModelTest, MixedRouteRejectsUnmaterializableSimtStage) {
   StageCostTable table;
-  table.domain = "unit_test";
   table.profileVersion = "unit-test-profile-v1";
-  auto makeCost = [&](StageMode mode, double cycles) {
+  auto makeCost = [&](StageMode mode, double cycles, bool localScope = false) {
     mlir::ascend::StageImplementationCost cost;
-    cost.implementation = {mode, 1};
+    cost.implementation = {mode, 1, localScope};
     cost.totalCycles = cycles;
-    cost.modelName = "unit_test";
-    cost.profileVersion = table.profileVersion;
-    cost.source = "unit_test";
     return cost;
   };
   mlir::ascend::LogicalStageCost head;
   head.id = "head";
-  head.description = head.id;
   head.localSimtMaterializable = false;
   head.implementations = {makeCost(StageMode::SIMD, 1.0),
                           makeCost(StageMode::SIMT, 100.0)};
   mlir::ascend::LogicalStageCost payload;
   payload.id = "unmaterializable_payload";
-  payload.description = payload.id;
   payload.localSimtMaterializable = false;
   payload.implementations = {makeCost(StageMode::SIMD, 100.0),
                              makeCost(StageMode::SIMT, 1.0)};
   table.stages = {head, payload};
-  mlir::ascend::LogicalPhaseCost phase;
-  phase.id = "phase";
-  phase.stages = table.stages;
-  table.phases.push_back(std::move(phase));
   auto routes = solveStageRoutes(table, StageTransitionCost{});
   if (!routes)
     FAIL() << llvm::toString(routes.takeError());
@@ -820,40 +649,102 @@ TEST(SimdSimtCostModelTest, MixedRouteRejectsUnmaterializableSimtStage) {
   EXPECT_FALSE(routes->mixed.legal);
 }
 
-TEST(SimdSimtCostModelTest, MixedRouteChargesEveryMaterializedScope) {
+TEST(SimdSimtCostModelTest,
+     MixedRouteReportsCheapestConstrainedRouteWhenLocalScopeLoses) {
   StageCostTable table;
-  table.domain = "scope_count";
+  table.profileVersion = "unit-test-profile-v1";
+  auto makeCost = [&](StageMode mode, double cycles, bool localScope = false) {
+    mlir::ascend::StageImplementationCost cost;
+    cost.implementation = {mode, 1, localScope};
+    cost.totalCycles = cycles;
+    return cost;
+  };
+
+  mlir::ascend::LogicalStageCost gather;
+  gather.id = "indirect_tile_gather";
+  gather.localSimtMaterializable = true;
+  gather.localSimtScopeCount = 1;
+  gather.implementations = {makeCost(StageMode::SIMD, 100.0),
+                            makeCost(StageMode::SIMT, 130.0),
+                            makeCost(StageMode::SIMT, 130.0, true)};
+  mlir::ascend::LogicalStageCost dot;
+  dot.id = "tiny_cube_dot";
+  dot.implementations = {makeCost(StageMode::SIMD, 40.0),
+                         makeCost(StageMode::SIMT, 90.0)};
+  table.stages = {gather, dot};
+
+  StageTransitionCost transition;
+  transition.simdToSimtCycles = 10.0;
+  transition.simtToSimdCycles = 10.0;
+  auto routes = solveStageRoutes(table, transition);
+  if (!routes)
+    FAIL() << llvm::toString(routes.takeError());
+  ASSERT_TRUE(routes->mixed.legal);
+  ASSERT_EQ(routes->mixed.implementations.size(), 2u);
+  EXPECT_EQ(routes->mixed.implementations[0].mode, StageMode::SIMT);
+  EXPECT_TRUE(routes->mixed.implementations[0].localScope);
+  EXPECT_EQ(routes->mixed.implementations[1].mode, StageMode::SIMD);
+  EXPECT_DOUBLE_EQ(routes->mixed.totalCycles, 190.0);
+}
+
+TEST(SimdSimtCostModelTest, AllSimdDoesNotPayRouteConditionalAutoBlockify) {
+  StageCostTable table;
   table.profileVersion = "unit-test-profile-v1";
   auto makeCost = [&](StageMode mode, double cycles) {
     mlir::ascend::StageImplementationCost cost;
-    cost.implementation = {mode, 1};
+    cost.implementation = {mode, 1, false};
     cost.totalCycles = cycles;
-    cost.modelName = "unit_test";
-    cost.profileVersion = table.profileVersion;
-    cost.source = "unit_test";
+    return cost;
+  };
+
+  mlir::ascend::LogicalStageCost dispatch;
+  dispatch.id = "physical_program_dispatch";
+  dispatch.model = "auto_blockify_dispatch";
+  dispatch.implementations = {makeCost(StageMode::SIMD, 40.0),
+                              makeCost(StageMode::SIMT, 30.0)};
+  mlir::ascend::LogicalStageCost payload;
+  payload.id = "payload";
+  payload.model = "scalar_issue";
+  payload.implementations = {makeCost(StageMode::SIMD, 100.0),
+                             makeCost(StageMode::SIMT, 80.0)};
+  table.stages = {dispatch, payload};
+
+  auto routes = solveStageRoutes(table, StageTransitionCost{});
+  if (!routes)
+    FAIL() << llvm::toString(routes.takeError());
+  ASSERT_TRUE(routes->allSimd.legal);
+  ASSERT_EQ(routes->allSimd.logicalStageCycles.size(), 2u);
+  EXPECT_DOUBLE_EQ(routes->allSimd.logicalStageCycles[0], 0.0);
+  EXPECT_DOUBLE_EQ(routes->allSimd.logicalStageCycles[1], 100.0);
+  EXPECT_DOUBLE_EQ(routes->allSimd.totalCycles, 100.0);
+  ASSERT_TRUE(routes->allSimt.legal);
+  EXPECT_DOUBLE_EQ(routes->allSimt.totalCycles, 110.0);
+}
+
+TEST(SimdSimtCostModelTest, MixedRouteChargesEveryMaterializedScope) {
+  StageCostTable table;
+  table.profileVersion = "unit-test-profile-v1";
+  auto makeCost = [&](StageMode mode, double cycles, bool localScope = false) {
+    mlir::ascend::StageImplementationCost cost;
+    cost.implementation = {mode, 1, localScope};
+    cost.totalCycles = cycles;
     return cost;
   };
   mlir::ascend::LogicalStageCost head;
   head.id = "head";
-  head.description = head.id;
   head.implementations = {makeCost(StageMode::SIMD, 1.0),
                           makeCost(StageMode::SIMT, 100.0)};
   mlir::ascend::LogicalStageCost gather;
   gather.id = "two_anchor_gather";
-  gather.description = gather.id;
   gather.localSimtMaterializable = true;
   gather.localSimtFactors = {1};
   gather.localSimtScopeCount = 2;
   gather.implementations = {makeCost(StageMode::SIMD, 100.0),
-                            makeCost(StageMode::SIMT, 1.0)};
+                            makeCost(StageMode::SIMT, 1.0),
+                            makeCost(StageMode::SIMT, 1.0, true)};
   mlir::ascend::LogicalStageCost tail = head;
   tail.id = "tail";
-  tail.description = tail.id;
   table.stages = {head, gather, tail};
-  mlir::ascend::LogicalPhaseCost phase;
-  phase.id = "phase";
-  phase.stages = table.stages;
-  table.phases.push_back(std::move(phase));
 
   StageTransitionCost transition;
   transition.simdToSimtCycles = 10.0;
@@ -865,6 +756,8 @@ TEST(SimdSimtCostModelTest, MixedRouteChargesEveryMaterializedScope) {
   // 1 SIMD head + (10 enter + 1 payload + 20 extra scope pair) +
   // (10 leave + 1 SIMD tail).
   EXPECT_DOUBLE_EQ(routes->mixed.totalCycles, 43.0);
+  ASSERT_EQ(routes->mixed.entryTransitionCycles.size(), 3u);
+  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[1], 40.0);
 }
 
 TEST(SimdSimtCostModelTest, SuperBlockLatencyHidingStopsAtUsefulFactorLimit) {
@@ -879,43 +772,35 @@ TEST(SimdSimtCostModelTest, SuperBlockLatencyHidingStopsAtUsefulFactorLimit) {
   auto table = evaluateOneStage(stage, cappedProfile);
   if (!table)
     FAIL() << llvm::toString(table.takeError());
+  table->logicalProgramCountHint = 64;
+  table->physicalCoreCountHint = 32;
   auto routes = solveStageRoutes(*table, cappedProfile.transition);
   if (!routes)
     FAIL() << llvm::toString(routes.takeError());
   EXPECT_TRUE(routes->allSimt.legal);
   EXPECT_EQ(routes->allSimt.routeSuperblockFactor, 2);
   EXPECT_LT(routes->allSimt.totalCycles,
-            table->stages[0].implementations[0].totalCycles);
+            2.0 * table->stages[0].implementations[0].totalCycles);
 }
 
 TEST(SimdSimtCostModelTest, PureSimtRouteUsesOneUniformSuperBlockFactor) {
   StageCostTable table;
-  table.domain = "uniform_superblock";
   table.profileVersion = "unit-test-profile-v1";
   auto makeCost = [&](int64_t factor, double cycles) {
     mlir::ascend::StageImplementationCost cost;
     cost.implementation = {StageMode::SIMT, factor};
     cost.totalCycles = cycles;
-    cost.modelName = "unit_test";
-    cost.profileVersion = table.profileVersion;
-    cost.source = "unit_test";
     return cost;
   };
   mlir::ascend::LogicalStageCost first;
   first.id = "first";
-  first.description = first.id;
   first.implementations = {makeCost(1, 5.0), makeCost(2, 1.0),
                            makeCost(4, 3.0)};
   mlir::ascend::LogicalStageCost second;
   second.id = "second";
-  second.description = second.id;
   second.implementations = {makeCost(1, 5.0), makeCost(2, 4.0),
                             makeCost(4, 1.0)};
   table.stages = {first, second};
-  mlir::ascend::LogicalPhaseCost phase;
-  phase.id = "phase";
-  phase.stages = table.stages;
-  table.phases.push_back(std::move(phase));
 
   auto routes = solveStageRoutes(table, StageTransitionCost{});
   if (!routes)
@@ -930,39 +815,38 @@ TEST(SimdSimtCostModelTest, PureSimtRouteUsesOneUniformSuperBlockFactor) {
 
 TEST(SimdSimtCostModelTest, MixedScopeSuperBlockUsesSelectedFactorCost) {
   StageCostTable table;
-  table.domain = "mixed_scope_superblock";
   table.profileVersion = "unit-test-profile-v1";
-  auto makeCost = [&](StageMode mode, int64_t factor, double cycles) {
+  auto makeCost = [&](StageMode mode, int64_t factor, double cycles,
+                      bool localScope = false) {
     mlir::ascend::StageImplementationCost cost;
-    cost.implementation = {mode, factor};
+    cost.implementation = {mode, factor, localScope};
     cost.totalCycles = cycles;
-    cost.modelName = "unit_test";
-    cost.profileVersion = table.profileVersion;
-    cost.source = "unit_test";
     return cost;
   };
   mlir::ascend::LogicalStageCost prefix;
   prefix.id = "simd_prefix";
-  prefix.description = prefix.id;
-  prefix.implementations = {
-      makeCost(StageMode::SIMD, 1, 5.0), makeCost(StageMode::SIMT, 1, 50.0),
-      makeCost(StageMode::SIMT, 2, 25.0), makeCost(StageMode::SIMT, 4, 12.5)};
+  prefix.implementations = {makeCost(StageMode::SIMD, 1, 5.0),
+                            makeCost(StageMode::SIMT, 1, 50.0),
+                            makeCost(StageMode::SIMT, 2, 25.0),
+                            makeCost(StageMode::SIMT, 4, 12.5),
+                            makeCost(StageMode::SIMT, 1, 50.0, true),
+                            makeCost(StageMode::SIMT, 2, 25.0, true),
+                            makeCost(StageMode::SIMT, 4, 12.5, true)};
   prefix.localSimtMaterializable = true;
   prefix.localSimtFactors = {1, 2, 4};
 
   mlir::ascend::LogicalStageCost payload;
   payload.id = "local_simt_payload";
-  payload.description = payload.id;
-  payload.implementations = {
-      makeCost(StageMode::SIMD, 1, 100.0), makeCost(StageMode::SIMT, 1, 10.0),
-      makeCost(StageMode::SIMT, 2, 1.0), makeCost(StageMode::SIMT, 4, 0.5)};
+  payload.implementations = {makeCost(StageMode::SIMD, 1, 100.0),
+                             makeCost(StageMode::SIMT, 1, 10.0),
+                             makeCost(StageMode::SIMT, 2, 1.0),
+                             makeCost(StageMode::SIMT, 4, 0.5),
+                             makeCost(StageMode::SIMT, 1, 10.0, true),
+                             makeCost(StageMode::SIMT, 2, 1.0, true),
+                             makeCost(StageMode::SIMT, 4, 0.5, true)};
   payload.localSimtMaterializable = true;
   payload.localSimtFactors = {1, 2, 4};
   table.stages = {prefix, payload};
-  mlir::ascend::LogicalPhaseCost phase;
-  phase.id = "phase";
-  phase.stages = table.stages;
-  table.phases.push_back(std::move(phase));
 
   auto routes = solveStageRoutes(table, StageTransitionCost{});
   if (!routes)
@@ -972,29 +856,49 @@ TEST(SimdSimtCostModelTest, MixedScopeSuperBlockUsesSelectedFactorCost) {
   EXPECT_DOUBLE_EQ(routes->mixed.totalCycles, 5.5);
 }
 
-TEST(SimdSimtCostModelTest, StageWorkloadAnalysisConservesKernelWork) {
-  const SimdSimtFeatureSummary features = gatherDotFeatures();
-  auto result =
-      StagePartitioner().partition(features, StagePartitionerOptions{});
-  if (!result)
-    FAIL() << llvm::toString(result.takeError());
-  ASSERT_TRUE(*result);
-  const StagePartition &partition = **result;
-  double operations = 0.0, bytes = 0.0, warps = 0.0, flops = 0.0, issue = 0.0;
-  for (const auto &phase : partition.phases)
-    for (const auto &stage : phase.stages) {
-      for (const auto &entry : stage.workload.operationElements)
-        operations += entry.second * stage.iterationCount;
-      bytes += stage.workload.loadBytes * stage.iterationCount;
-      warps += stage.workload.loadWarpInstructions * stage.iterationCount;
-      flops += stage.workload.dotFlops * stage.iterationCount;
-      issue += stage.workload.issueElements * stage.iterationCount;
-    }
-  EXPECT_DOUBLE_EQ(operations, 82.0);
-  EXPECT_DOUBLE_EQ(bytes, 1088.0);
-  EXPECT_DOUBLE_EQ(warps, 17.0);
-  EXPECT_DOUBLE_EQ(flops, 8192.0);
-  EXPECT_GT(issue, 0.0);
+TEST(SimdSimtCostModelTest,
+     FactoredMixedRouteUsesOneBackendMaterializableLocalScope) {
+  StageCostTable table;
+  table.profileVersion = "unit-test-profile-v1";
+  auto makeCost = [&](StageMode mode, int64_t factor, double cycles,
+                      bool localScope = false) {
+    StageImplementationCost cost;
+    cost.implementation = {mode, factor, localScope};
+    cost.totalCycles = cycles;
+    return cost;
+  };
+
+  LogicalStageCost first;
+  first.id = "first_local_candidate";
+  first.features.replicatedByLocalSuperBlock = true;
+  first.localSimtMaterializable = true;
+  first.localSimtScopeCount = 1;
+  first.implementations = {makeCost(StageMode::SIMD, 1, 100.0),
+                           makeCost(StageMode::SIMT, 4, 1.0, true)};
+  LogicalStageCost second = first;
+  second.id = "second_local_candidate";
+  LogicalStageCost tail;
+  tail.id = "simd_tail";
+  tail.implementations = {makeCost(StageMode::SIMD, 1, 1.0)};
+  table.stages = {first, second, tail};
+
+  auto routes = solveStageRoutes(table, StageTransitionCost{});
+  if (!routes)
+    FAIL() << llvm::toString(routes.takeError());
+  ASSERT_TRUE(routes->mixed.legal);
+  EXPECT_EQ(routes->mixed.routeSuperblockFactor, 4);
+  EXPECT_EQ(llvm::count_if(
+                routes->mixed.implementations,
+                [](const mlir::ascend::StageImplementation &implementation) {
+                  return implementation.localScope;
+                }),
+            1);
+  // One scope is SIMT (1 cycle); the other Stage remains SIMD and is cloned
+  // once per grouped logical program (100 * F4); the outside tail is not.
+  EXPECT_DOUBLE_EQ(routes->mixed.totalCycles, 402.0);
+  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[0], 0.0);
+  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[1], 0.0);
+  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[2], 0.0);
 }
 
 TEST(SimdSimtCostModelTest,
@@ -1033,42 +937,32 @@ TEST(SimdSimtCostModelTest,
   anchor.scopeOperations.push_back(recurrence);
   anchor.scopeInsertionPoint = recurrence;
   anchor.kind = mlir::ascend::SimtAnchorKind::TriangularSolveLoop;
-  anchor.facts =
+  anchor.triangularSolve =
       triangularBt16StageFeatures().simtAnchors.triangularSolves.front();
-  anchor.lowerability.mixed = mlir::ascend::CandidateLoweringStatus::Native;
+  anchor.lowerability.mixed = true;
   anchor.materializable = true;
   mlir::ascend::SimtAnchorPlan anchorPlan;
   anchorPlan.anchors.push_back(std::move(anchor));
 
-  SimdSimtFeatureSummary features = triangularBt16StageFeatures();
-  auto phasePlan = mlir::ascend::PhaseBoundaryAnalysis().analyze(
-      *module, anchorPlan, features, StagePartitionerOptions{});
-  if (!phasePlan)
-    FAIL() << llvm::toString(phasePlan.takeError());
-  ASSERT_TRUE(*phasePlan);
-  EXPECT_EQ((*phasePlan)->rootOperations.size(),
-            (*phasePlan)->rootPhaseIds.size());
-  EXPECT_EQ((*phasePlan)->rootPhaseIds,
-            std::vector<std::string>({"head", "head", "head", "diagonal_load",
-                                      "diagonal_inverse", "merge_store"}));
+  auto structure =
+      mlir::ascend::ProgramStructureAnalysis().analyze(*module, anchorPlan);
+  if (!structure)
+    FAIL() << llvm::toString(structure.takeError());
+  EXPECT_EQ(structure->rootOperations.size(), 6u);
 
-  auto result = StagePartitioner().partition(*module, anchorPlan, features,
+  auto result = StagePartitioner().partition(*module, anchorPlan,
                                              StagePartitionerOptions{});
   if (!result)
     FAIL() << llvm::toString(result.takeError());
-  ASSERT_TRUE(*result);
-  const StagePartition &partition = **result;
-  EXPECT_EQ(partition.boundarySource, "operation_graph");
+  const StagePartition &partition = *result;
   EXPECT_TRUE(partition.operationOwnershipComplete);
 
   int64_t ownedRootCount = 0;
   const LogicalStage *recurrenceStage = nullptr;
-  for (const LogicalPhase &phase : partition.phases) {
-    for (const LogicalStage &stage : phase.stages) {
-      ownedRootCount += static_cast<int64_t>(stage.operations.size());
-      if (stage.id == "diagonal_inverse_recurrence")
-        recurrenceStage = &stage;
-    }
+  for (const LogicalStage &stage : partition.stages) {
+    ownedRootCount += static_cast<int64_t>(stage.operations.size());
+    if (llvm::is_contained(stage.operations, recurrence))
+      recurrenceStage = &stage;
   }
   EXPECT_EQ(ownedRootCount, partition.modeledOperationCount);
   ASSERT_NE(recurrenceStage, nullptr);
@@ -1086,7 +980,53 @@ TEST(SimdSimtCostModelTest,
 }
 
 TEST(SimdSimtCostModelTest,
-     CompoundScopeOrderIsNormalizedBeforePhasePartitioning) {
+     SameStatementSupportOperationsJoinTheDominantResourceStage) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::arith::ArithDialect>();
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.allowUnregisteredDialects();
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(R"mlir(
+    module {
+      func.func @kernel(%pointer: i64) {
+        %index = arith.constant 0 : i64
+        %mask = arith.cmpi eq, %index, %index : i64
+        %value = "tt.load"(%pointer, %mask) : (i64, i1) -> f32
+        %tail = arith.constant 1 : i64
+        return
+      }
+    }
+  )mlir",
+                                                        &context);
+  ASSERT_TRUE(module);
+
+  llvm::SmallVector<mlir::Operation *> roots;
+  module->walk([&](mlir::func::FuncOp function) {
+    for (mlir::Operation &operation : function.getBody().front())
+      if (!operation.hasTrait<mlir::OpTrait::IsTerminator>())
+        roots.push_back(&operation);
+  });
+  ASSERT_EQ(roots.size(), 4u);
+  auto statement = mlir::FileLineColLoc::get(&context, "kernel.py", 10, 1);
+  for (mlir::Operation *operation : llvm::ArrayRef(roots).take_front(3))
+    operation->setLoc(statement);
+  roots.back()->setLoc(mlir::FileLineColLoc::get(&context, "kernel.py", 11, 1));
+
+  mlir::ascend::ProgramStructure structure;
+  structure.rootOperations.assign(roots.begin(), roots.end());
+  auto result = mlir::ascend::StageBoundaryAnalysis().analyze(
+      structure, mlir::ascend::SimtAnchorPlan{});
+  if (!result)
+    FAIL() << llvm::toString(result.takeError());
+  ASSERT_EQ(result->stages.size(), 2u);
+  EXPECT_EQ(result->stages.front().operations.size(), 3u);
+  EXPECT_EQ(result->stages.front().costModelKind,
+            StageCostModelKind::ContinuousTileMemory);
+  ASSERT_EQ(result->stages.back().operations.size(), 1u);
+  EXPECT_EQ(result->stages.back().operations.front(), roots.back());
+}
+
+TEST(SimdSimtCostModelTest,
+     CompoundScopeOrderIsNormalizedBeforeStagePartitioning) {
   mlir::MLIRContext context;
   context.getOrLoadDialect<mlir::arith::ArithDialect>();
   context.getOrLoadDialect<mlir::func::FuncDialect>();
@@ -1131,44 +1071,252 @@ TEST(SimdSimtCostModelTest,
   anchor.scopeOperations = {setup, recurrence};
   anchor.scopeInsertionPoint = recurrence;
   anchor.kind = mlir::ascend::SimtAnchorKind::TriangularSolveLoop;
-  anchor.facts =
+  anchor.triangularSolve =
       triangularBt16StageFeatures().simtAnchors.triangularSolves.front();
-  anchor.lowerability.mixed = mlir::ascend::CandidateLoweringStatus::Native;
+  anchor.lowerability.mixed = true;
   anchor.materializable = true;
   mlir::ascend::SimtAnchorPlan anchorPlan;
   anchorPlan.anchors.push_back(std::move(anchor));
 
-  auto phasePlan = mlir::ascend::PhaseBoundaryAnalysis().analyze(
-      *module, anchorPlan, triangularBt16StageFeatures(),
-      StagePartitionerOptions{});
-  if (!phasePlan)
-    FAIL() << llvm::toString(phasePlan.takeError());
-  ASSERT_TRUE(*phasePlan);
-  EXPECT_EQ((*phasePlan)->rootPhaseIds,
-            std::vector<std::string>({"head", "head", "head", "diagonal_load",
-                                      "diagonal_inverse", "diagonal_inverse",
-                                      "merge_store"}));
+  auto structure =
+      mlir::ascend::ProgramStructureAnalysis().analyze(*module, anchorPlan);
+  if (!structure)
+    FAIL() << llvm::toString(structure.takeError());
+  auto setupPosition = llvm::find(structure->rootOperations, setup);
+  auto recurrencePosition = llvm::find(structure->rootOperations, recurrence);
+  ASSERT_NE(setupPosition, structure->rootOperations.end());
+  ASSERT_NE(recurrencePosition, structure->rootOperations.end());
+  EXPECT_EQ(recurrencePosition - setupPosition, 1);
 
   auto partition = StagePartitioner().partition(*module, anchorPlan,
-                                                triangularBt16StageFeatures(),
                                                 StagePartitionerOptions{});
   if (!partition)
     FAIL() << llvm::toString(partition.takeError());
-  ASSERT_TRUE(*partition);
   const LogicalStage *loadStage = nullptr;
   const LogicalStage *recurrenceStage = nullptr;
-  for (const LogicalPhase &phase : (**partition).phases)
-    for (const LogicalStage &stage : phase.stages) {
-      if (stage.id == "load_diagonal_tiles")
-        loadStage = &stage;
-      if (stage.id == "diagonal_inverse_recurrence")
-        recurrenceStage = &stage;
-    }
+  for (const LogicalStage &stage : partition->stages) {
+    if (llvm::any_of(stage.operations, [&](mlir::Operation *operation) {
+          return operation->getName().getStringRef() == "tt.load";
+        }))
+      loadStage = &stage;
+    if (llvm::is_contained(stage.operations, recurrence))
+      recurrenceStage = &stage;
+  }
   ASSERT_NE(loadStage, nullptr);
   ASSERT_NE(recurrenceStage, nullptr);
   EXPECT_EQ(loadStage->operations.size(), 1u);
   EXPECT_EQ(recurrenceStage->operations.size(), 2u);
   EXPECT_EQ(recurrenceStage->simtAnchorIndices, std::vector<unsigned>({0}));
+}
+
+TEST(SimdSimtCostModelTest,
+     NestedLocalScopeDoesNotAdvertiseUnsupportedSuperBlockFactors) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::arith::ArithDialect>();
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::scf::SCFDialect>();
+  context.allowUnregisteredDialects();
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(R"mlir(
+    module {
+      func.func @kernel(%pointer: i64, %condition: i1) {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c4 = arith.constant 4 : index
+        scf.for %i = %c0 to %c4 step %c1 {
+          scf.if %condition {
+            %value = "tt.load"(%pointer) : (i64) -> tensor<16xf32>
+          }
+        }
+        return
+      }
+    }
+  )mlir",
+                                                        &context);
+  ASSERT_TRUE(module);
+
+  mlir::scf::ForOp v1Loop;
+  mlir::Operation *nestedLoad = nullptr;
+  module->walk([&](mlir::Operation *operation) {
+    if (auto loop = llvm::dyn_cast<mlir::scf::ForOp>(operation))
+      v1Loop = loop;
+    if (operation->getName().getStringRef() == "tt.load")
+      nestedLoad = operation;
+  });
+  ASSERT_TRUE(v1Loop);
+  ASSERT_NE(nestedLoad, nullptr);
+  v1Loop->setAttr("ta.auto_blockify_v1.loop", mlir::UnitAttr::get(&context));
+
+  mlir::ascend::SimtAnchorDescriptor anchor;
+  anchor.operation = nestedLoad;
+  anchor.scopeOperations.push_back(nestedLoad);
+  anchor.scopeInsertionPoint = nestedLoad;
+  anchor.kind = mlir::ascend::SimtAnchorKind::DirectGather;
+  anchor.lowerability.mixed = true;
+  anchor.materializable = true;
+  mlir::ascend::SimtAnchorPlan anchorPlan;
+  anchorPlan.anchors.push_back(std::move(anchor));
+
+  StagePartitionerOptions options;
+  options.maximumSuperblockFactor = 4;
+  options.scopeSuperblockMaterializable = true;
+  auto result = StagePartitioner().partition(*module, anchorPlan, options);
+  if (!result)
+    FAIL() << llvm::toString(result.takeError());
+
+  const LogicalStage *nestedStage = nullptr;
+  for (const LogicalStage &stage : result->stages)
+    if (!stage.simtAnchorIndices.empty())
+      nestedStage = &stage;
+  ASSERT_NE(nestedStage, nullptr);
+  EXPECT_TRUE(nestedStage->localSimtMaterializable);
+  EXPECT_FALSE(nestedStage->localSuperblockMaterializable);
+  EXPECT_FALSE(nestedStage->operations.empty());
+  EXPECT_EQ(nestedStage->localSimtFactors, (std::vector<int64_t>{1}));
+
+  auto costs = StageCostEvaluator().evaluate(*result, hardwareProfile());
+  if (!costs)
+    FAIL() << llvm::toString(costs.takeError());
+  auto nestedCost = llvm::find_if(costs->stages, [&](const auto &stage) {
+    return stage.id == nestedStage->id;
+  });
+  ASSERT_NE(nestedCost, costs->stages.end());
+  EXPECT_FALSE(nestedCost->sourceLocations.empty());
+}
+
+TEST(SimdSimtCostModelTest, GenericSemanticStagesDoNotRequireAWorkloadDomain) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::arith::ArithDialect>();
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.allowUnregisteredDialects();
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(R"mlir(
+    module {
+      func.func @unrelated_kernel(%pointer: i64) {
+        %zero = arith.constant dense<0.0> : tensor<16xf32>
+        %loaded = "tt.load"(%pointer) : (i64) -> tensor<16xf32>
+        %mask = arith.cmpf ogt, %loaded, %zero : tensor<16xf32>
+        "tt.store"(%pointer, %loaded) : (i64, tensor<16xf32>) -> ()
+        return
+      }
+    }
+  )mlir",
+                                                        &context);
+  ASSERT_TRUE(module);
+
+  mlir::ascend::SimtAnchorPlan anchorPlan;
+  auto partition = StagePartitioner().partition(*module, anchorPlan,
+                                                StagePartitionerOptions{});
+  if (!partition)
+    FAIL() << llvm::toString(partition.takeError());
+
+  ASSERT_TRUE(partition->operationOwnershipComplete);
+  EXPECT_EQ(partition->modeledOperationCount, 4);
+  ASSERT_EQ(partition->stages.size(), 4u);
+  EXPECT_EQ(partition->stages[0].costModelKind,
+            StageCostModelKind::ScalarIssue);
+  EXPECT_EQ(partition->stages[1].costModelKind,
+            StageCostModelKind::ContinuousTileMemory);
+  EXPECT_EQ(partition->stages[2].costModelKind,
+            StageCostModelKind::PredicateMask);
+  EXPECT_EQ(partition->stages[3].costModelKind,
+            StageCostModelKind::ContinuousTileStore);
+}
+
+TEST(SimdSimtCostModelTest, AdjacentStructuredLoopsRemainSerialStages) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::arith::ArithDialect>();
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::scf::SCFDialect>();
+  context.allowUnregisteredDialects();
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(R"mlir(
+    module {
+      func.func @two_serial_loops(%pointer: i64) {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c4 = arith.constant 4 : index
+        scf.for %i = %c0 to %c4 step %c1 {
+          %first = "tt.load"(%pointer) : (i64) -> f32
+        }
+        scf.for %i = %c0 to %c4 step %c1 {
+          %second = "tt.load"(%pointer) : (i64) -> f32
+        }
+        return
+      }
+    }
+  )mlir",
+                                                        &context);
+  ASSERT_TRUE(module);
+
+  mlir::ascend::SimtAnchorPlan anchorPlan;
+  auto partition = StagePartitioner().partition(*module, anchorPlan,
+                                                StagePartitionerOptions{});
+  if (!partition)
+    FAIL() << llvm::toString(partition.takeError());
+
+  llvm::SmallVector<const LogicalStage *> loopStages;
+  for (const LogicalStage &stage : partition->stages)
+    if (stage.costModelKind == StageCostModelKind::IndependentPipelinedLoop)
+      loopStages.push_back(&stage);
+  ASSERT_EQ(loopStages.size(), 2u);
+  EXPECT_NE(loopStages[0]->operations.front(),
+            loopStages[1]->operations.front());
+}
+
+TEST(SimdSimtCostModelTest,
+     LocalScopeReturningPointerTensorIsRejectedBeforeScoring) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::arith::ArithDialect>();
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.allowUnregisteredDialects();
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(R"mlir(
+    module {
+      func.func @kernel(%base: !tt.ptr<f16>) {
+        %indices = arith.constant dense<0> : tensor<16xi32>
+        %ptrs = "tt.addptr"(%base, %indices)
+            : (!tt.ptr<f16>, tensor<16xi32>) -> tensor<16x!tt.ptr<f16>>
+        %values = "tt.load"(%ptrs)
+            : (tensor<16x!tt.ptr<f16>>) -> tensor<16xf16>
+        %reduced = "tt.reduce"(%values) : (tensor<16xf16>) -> f16
+        "tt.store"(%base, %reduced) : (!tt.ptr<f16>, f16) -> ()
+        return
+      }
+    }
+  )mlir",
+                                                        &context);
+  ASSERT_TRUE(module);
+
+  llvm::SmallVector<mlir::Operation *> roots;
+  module->walk([&](mlir::func::FuncOp function) {
+    for (mlir::Operation &operation : function.getBody().front())
+      if (!operation.hasTrait<mlir::OpTrait::IsTerminator>())
+        roots.push_back(&operation);
+  });
+  ASSERT_EQ(roots.size(), 5u);
+
+  mlir::ascend::SimtAnchorDescriptor anchor;
+  anchor.operation = roots[1];
+  anchor.scopeOperations = {roots[1]};
+  anchor.scopeInsertionPoint = roots[1];
+  anchor.kind = mlir::ascend::SimtAnchorKind::DirectGather;
+  anchor.lowerability.mixed = true;
+  anchor.materializable = true;
+  mlir::ascend::SimtAnchorPlan anchorPlan;
+  anchorPlan.anchors.push_back(std::move(anchor));
+
+  mlir::ascend::ProgramStructure structure;
+  structure.rootOperations.assign(roots.begin(), roots.end());
+  auto result =
+      mlir::ascend::StageBoundaryAnalysis().analyze(structure, anchorPlan);
+  if (!result)
+    FAIL() << llvm::toString(result.takeError());
+
+  const LogicalStage *gather = nullptr;
+  for (const LogicalStage &stage : result->stages)
+    if (llvm::is_contained(stage.operations, roots[1]))
+      gather = &stage;
+  ASSERT_NE(gather, nullptr);
+  EXPECT_FALSE(gather->localSimtMaterializable);
+  EXPECT_TRUE(gather->localSimtFactors.empty());
+  EXPECT_TRUE(gather->simtAnchorIndices.empty());
 }
 
 TEST(SimdSimtCostModelTest, PointerInductionLoopIsNotADataRecurrence) {
@@ -1202,21 +1350,18 @@ TEST(SimdSimtCostModelTest, PointerInductionLoopIsNotADataRecurrence) {
 
   StagePartition partition;
   partition.operationOwnershipComplete = true;
-  LogicalPhase phase;
-  phase.id = "convert_store";
   LogicalStage stage =
       logicalStage("pointer_loop", StageCostModelKind::ConversionPack,
                    StageScheduleKind::IndependentPipelined, 8);
   stage.operations.push_back(loop);
-  phase.stages.push_back(std::move(stage));
-  partition.phases.push_back(std::move(phase));
+  partition.stages.push_back(std::move(stage));
 
   if (llvm::Error error = StageFeatureAnalysis().analyze(partition))
     FAIL() << llvm::toString(std::move(error));
   if (llvm::Error error =
           mlir::ascend::StageKindClassifier().analyze(partition, 8192))
     FAIL() << llvm::toString(std::move(error));
-  const LogicalStage &classified = partition.phases.front().stages.front();
+  const LogicalStage &classified = partition.stages.front();
   EXPECT_TRUE(classified.features.hasLoop);
   EXPECT_TRUE(classified.features.hasPointerInduction);
   EXPECT_FALSE(classified.features.hasLoopCarriedDataDependency);
@@ -1227,30 +1372,16 @@ TEST(SimdSimtCostModelTest, PointerInductionLoopIsNotADataRecurrence) {
 TEST(SimdSimtCostModelTest, IncompatibleDominantStructuresRequireStageSplit) {
   StagePartition partition;
   partition.operationOwnershipComplete = true;
-  LogicalPhase phase;
-  phase.id = "compound";
   LogicalStage stage =
       logicalStage("gather_dot", StageCostModelKind::TinyCubeRoofline,
                    StageScheduleKind::PartiallyDependent, 1);
   stage.features.hasDot = true;
   stage.features.hasIndirectMemory = true;
-  phase.stages.push_back(std::move(stage));
-  partition.phases.push_back(std::move(phase));
+  partition.stages.push_back(std::move(stage));
 
   llvm::Error error =
       mlir::ascend::StageKindClassifier().analyze(partition, 16384);
   ASSERT_TRUE(static_cast<bool>(error));
   EXPECT_NE(llvm::toString(std::move(error)).find("requires_split"),
             std::string::npos);
-}
-
-TEST(SimdSimtCostModelTest, FeatureSummaryPartitionIsExplicitFallback) {
-  auto result = StagePartitioner().partition(triangularBt16StageFeatures(),
-                                             StagePartitionerOptions{});
-  if (!result)
-    FAIL() << llvm::toString(result.takeError());
-  ASSERT_TRUE(*result);
-  EXPECT_EQ((**result).boundarySource, "feature_summary_fallback");
-  EXPECT_FALSE((**result).operationOwnershipComplete);
-  EXPECT_EQ((**result).modeledOperationCount, 0);
 }
