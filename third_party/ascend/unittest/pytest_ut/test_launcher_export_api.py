@@ -104,7 +104,7 @@ def test_make_launcher_shrinks_coalesced_grid_for_both_launch_paths(
 @patch.object(driver, "is_ffts_supported", return_value=True)
 @patch.object(driver, "get_ascend_arch_from_env", return_value="Ascend910B")
 @patch.object(driver, "get_backend_func", side_effect=_mock_backend_func)
-def test_make_launcher_ceil_divides_row_coalesced_grid(
+def test_make_launcher_ceil_divides_layout_coalesced_grid(
     _mock_backend_func_patch,
     _mock_arch,
     _mock_ffts,

@@ -467,6 +467,24 @@
           "type": "number",
           "exclusiveMinimum": 0
         },
+        "prefix_scan": {
+          "type": "object",
+          "required": [
+            "dependency_factor",
+            "description"
+          ],
+          "properties": {
+            "dependency_factor": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "description": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
         "indirect_memory": {
           "type": "object",
           "required": [
@@ -1049,7 +1067,7 @@
     },
     "mixed_setup_fallbacks": {
       "type": "object",
-      "description": "Map from warp count to low-confidence mixed setup fallback. The referenced probes contain no SIMD phase and are not directional transition measurements.",
+      "description": "Map from warp count to low-confidence mixed setup fallback. The referenced probes contain no SIMD Stage and are not directional transition measurements.",
       "required": [
         "1",
         "2",

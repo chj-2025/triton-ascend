@@ -22,14 +22,6 @@ namespace ascend {
 
 namespace {
 
-static FailureOr<HIVMSchedulerMode> parseSchedulerMode(llvm::StringRef mode) {
-  if (mode.empty() || mode == "static")
-    return HIVMSchedulerMode::Static;
-  if (mode == "des")
-    return HIVMSchedulerMode::DES;
-  return failure();
-}
-
 struct HIVMAnalysisPass : public impl::HIVMAnalysisPassBase<HIVMAnalysisPass> {
   using HIVMAnalysisPassBase::HIVMAnalysisPassBase;
 
@@ -45,14 +37,7 @@ struct HIVMAnalysisPass : public impl::HIVMAnalysisPassBase<HIVMAnalysisPass> {
       return;
     }
     const HardwareConfig &config = *hardwareConfig;
-    auto schedulerOr = parseSchedulerMode(schedulerMode);
-    if (failed(schedulerOr)) {
-      module.emitError() << "invalid HIVM scheduler mode `" << schedulerMode
-                         << "`; expected `static` or `des`";
-      signalPassFailure();
-      return;
-    }
-    HIVMAnalyzer analyzer(config, argBindingsStr, *schedulerOr);
+    HIVMAnalyzer analyzer(config, argBindingsStr);
     HIVMAnalysisReport report;
     std::string error;
     if (!analyzer.analyzeModule(module, report, error)) {

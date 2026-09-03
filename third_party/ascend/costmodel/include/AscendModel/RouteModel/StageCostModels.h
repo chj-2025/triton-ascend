@@ -17,8 +17,6 @@
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
-#include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -42,13 +40,13 @@ enum class StageCostModelKind {
   IndependentPipelinedLoop,
   LoopCarriedRecurrence,
   RowwiseReduction,
+  PrefixScan,
   CubeRoofline,
   TinyCubeRoofline,
   ConversionPack,
 };
 
 llvm::StringRef stringifyStageCostModel(StageCostModelKind kind);
-std::optional<StageCostModelKind> parseStageCostModel(llvm::StringRef name);
 
 struct StageControlFlowRates {
   double loopBackedgeCycles = 0.0;
@@ -61,7 +59,6 @@ struct StageControlFlowRates {
 
 struct LogicalStage {
   std::string id;
-  std::string description;
   StageCostModelKind costModelKind = StageCostModelKind::ScalarIssue;
   StageScheduleKind scheduleKind = StageScheduleKind::StraightLine;
   int64_t iterationCount = 1;
@@ -93,24 +90,18 @@ struct LogicalStage {
   /// True when this Stage has exact operation ownership/live-in/live-out and
   /// can therefore become a local SIMT scope inside a mixed kernel.
   bool localSimtMaterializable = false;
+  /// True when the one selected local scope will be a direct operation of an
+  /// AutoBlockify V1 loop body.  NPUIR's current scope-SuperBlock ABI requires
+  /// this stronger condition for F2/F4; nested scopes remain legal at F1.
+  bool localSuperblockMaterializable = false;
   std::vector<int64_t> legalSimtFactors;
   std::vector<int64_t> localSimtFactors;
 };
 
-struct LogicalPhase {
-  std::string id;
-  std::string description;
-  std::vector<LogicalStage> stages;
-};
-
 struct StagePartition {
-  std::string domain;
-  /// "operation_graph" for exact post-transform TTIR ownership, otherwise
-  /// "feature_summary_fallback" for the temporary aggregate implementation.
-  std::string boundarySource = "feature_summary_fallback";
   bool operationOwnershipComplete = false;
   int64_t modeledOperationCount = 0;
-  std::vector<LogicalPhase> phases;
+  std::vector<LogicalStage> stages;
 };
 
 struct StageOperationRate {
@@ -129,6 +120,7 @@ struct StageModeProfile {
   double storeWarpInstructionsPerCycle = 0.0;
   double predicateOperationsPerCycle = 0.0;
   double shuffleLanesPerCycle = 0.0;
+  double prefixScanDependencyFactor = 1.0;
   double dotSetupCycles = 0.0;
   double dotFlopsPerCycle = 0.0;
   double scalarOperationsPerCycle = 0.0;
@@ -152,9 +144,10 @@ struct HardwareProfile {
   /// option, not a hardware constant, and bounds cross-group interleaving in
   /// recurrence Stage models.
   int64_t logicalWarpGroupCount = 1;
-  /// SuperBlock hides latency, but large factors also replicate long-lived
-  /// recurrence state.  These target-profile values model the resulting
-  /// register/stack pressure without naming a workload.
+  /// Long-lived recurrence state consumes finite register/stack bandwidth.
+  /// The byte rate is shared by the SIMD recurrence-state term and the extra
+  /// pressure created when a SIMT SuperBlock replicates that state; neither
+  /// formula depends on a workload name.
   /// Largest factor that still gives proportional latency-hiding benefit.
   int64_t superblockUsefulFactorLimit = 1;
   /// Largest factor that may replicate loop-carried live state without an
@@ -170,67 +163,10 @@ struct HardwareProfile {
   bool isValid() const;
 };
 
-class ProfileProvider {
-public:
-  explicit ProfileProvider(HardwareProfile profile);
-
-  llvm::Expected<const HardwareProfile *>
-  getSnapshot(llvm::StringRef target, llvm::StringRef profileVersion) const;
-
-private:
-  HardwareProfile profile;
-};
-
-struct StageCostModelContext {
-  const LogicalStage &stage;
-  const HardwareProfile &profile;
-};
-
-class StageCostModel {
-public:
-  virtual ~StageCostModel() = default;
-  virtual StageMode getMode() const = 0;
-  virtual llvm::StringRef getName() const = 0;
-  virtual bool supports(StageCostModelKind kind) const = 0;
-  virtual double estimate(const StageCostModelContext &context,
-                          const StageImplementation &implementation,
-                          const StageResourceCycles &resources) const = 0;
-};
-
-class SIMDStageCostModel : public StageCostModel {
-public:
-  StageMode getMode() const final { return StageMode::SIMD; }
-};
-
-class SIMTStageCostModel : public StageCostModel {
-public:
-  StageMode getMode() const final { return StageMode::SIMT; }
-};
-
-class StageCostModelRegistry {
-public:
-  static const StageCostModelRegistry &get();
-
-  llvm::Expected<const StageCostModel *> lookup(StageMode mode,
-                                                StageCostModelKind kind) const;
-  llvm::Error verifyComplete() const;
-
-private:
-  StageCostModelRegistry();
-  std::vector<std::unique_ptr<StageCostModel>> models;
-};
-
 class StageCostEvaluator {
 public:
-  explicit StageCostEvaluator(
-      const StageCostModelRegistry &registry = StageCostModelRegistry::get())
-      : registry(registry) {}
-
   llvm::Expected<StageCostTable> evaluate(const StagePartition &partition,
                                           const HardwareProfile &profile) const;
-
-private:
-  const StageCostModelRegistry &registry;
 };
 
 } // namespace mlir::ascend

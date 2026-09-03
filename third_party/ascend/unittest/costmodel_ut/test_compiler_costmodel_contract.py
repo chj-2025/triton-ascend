@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import sys
 import tempfile
 import types
@@ -10,6 +11,20 @@ class CompilerCostmodelContractTest(unittest.TestCase):
 
     @staticmethod
     def _load_compiler_module():
+        stubbed_modules = [
+            "ctypes",
+            "triton",
+            "triton._C",
+            "triton._C.libtriton",
+            "triton._C.libtriton.ascend",
+            "triton.backends.ascend",
+            "triton.backends.ascend.utils",
+            "triton.backends.ascend.driver",
+            "triton.backends.compiler",
+            "triton.runtime",
+            "triton.runtime.cache",
+        ]
+        saved_modules = {name: sys.modules.get(name) for name in stubbed_modules}
         ctypes_stub = types.ModuleType("ctypes")
         ctypes_stub.c_int64 = int
         sys.modules["ctypes"] = ctypes_stub
@@ -123,6 +138,11 @@ class CompilerCostmodelContractTest(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         assert spec and spec.loader
         spec.loader.exec_module(module)
+        for name, saved in saved_modules.items():
+            if saved is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = saved
         return module, dump_mgr, GPUTarget
 
     def test_parse_options_costmodel_forces_no_bytecode(self):
@@ -187,13 +207,42 @@ class CompilerCostmodelContractTest(unittest.TestCase):
 
     def test_mixed_decision_preserves_route_request_and_factor(self):
         cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
-        metadata = {"compile_mode": "simd_simt"}
+        metadata = {
+            "compile_mode": "simd_simt",
+            "route_transform_v1_materializable": True,
+        }
 
-        cmplr._apply_cpp_simd_simt_decision(metadata, "mixed_simd_simt", 4, "{\"decision\":\"mixed\"}")
+        cmplr._apply_cpp_simd_simt_decision(metadata, "mixed_simd_simt", 4, "{\"decision\":\"mixed\"}", 2)
 
         self.assertEqual(metadata["compile_mode"], "simd_simt")
         self.assertEqual(metadata["auto_simt_superblock_factor"], 4)
         self.assertEqual(metadata["auto_simt_requested_kind"], "mixed_simd_simt")
+        self.assertTrue(metadata["auto_blockify_v1_enabled"])
+        self.assertTrue(metadata["auto_blockify_v1_runtime_cap"])
+        self.assertEqual(metadata["auto_simt_scope_superblock_factor"], 4)
+        self.assertNotIn("auto_simt_scope_num_warps", metadata)
+        self.assertNotIn("num_warps", metadata)
+        self.assertNotIn("scope_superblock_backend_abi_version", metadata)
+
+    def test_mixed_compile_keeps_delayed_cross_core_gss_enabled(self):
+        cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
+
+        source = inspect.getsource(cmplr.linalg_to_bin_enable_npu_compile_910_95)
+        self.assertNotIn("--enable-hivm-delayed-cross-core-gss=false", source)
+
+    def test_all_bishengir_entries_share_debug_info_option(self):
+        cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
+
+        options = []
+        cmplr._append_debug_info_option(options)
+        self.assertEqual(options, ["--enable-debug-info=true"])
+        source = inspect.getsource(cmplr.ttir_to_npubin)
+        self.assertIn("_append_debug_info_option(_compile_option_list)", source)
+
+        cmplr._is_debug_line_info_disabled = lambda: True
+        options = []
+        cmplr._append_debug_info_option(options)
+        self.assertEqual(options, [])
 
 
 if __name__ == "__main__":

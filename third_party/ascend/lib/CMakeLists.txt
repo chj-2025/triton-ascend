@@ -6,6 +6,7 @@ add_subdirectory(TritonToHFusion)
 add_subdirectory(TritonToHIVM)
 add_subdirectory(TritonToGraph)
 add_subdirectory(TritonToLinalg)
+add_subdirectory(TTIRLayoutMerge)
 add_subdirectory(Utils)
 add_subdirectory(TritonControlFlowOpt)
 add_subdirectory(DiscreteMaskAccessConversion)
@@ -22,6 +23,7 @@ if(TRITON_ENABLE_COVERAGE_HITEST)
       TritonToHFusion
       TritonToHIVM
       TritonToLinalg
+      TTIRLayoutMerge
       TritonControlFlowOpt
       TritonToLLVM
       TritonToStructured

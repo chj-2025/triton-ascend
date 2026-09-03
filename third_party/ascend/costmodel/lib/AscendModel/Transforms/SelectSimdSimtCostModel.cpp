@@ -7,15 +7,16 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "AscendModel/Analysis/SimtAnchorAnalysis.h"
 #include "AscendModel/RouteModel/SimdSimtCostModel.h"
-#include "AscendModel/RouteModel/SimtAnchorAnalysis.h"
-#include "AscendModel/RouteModel/SimtSelection.h"
 #include "AscendModel/Transforms/Passes.h"
+#include "AscendModel/Transforms/SimtSelection.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -95,14 +96,30 @@ buildSelectedMixedAnchorPlan(const StageCostModelSummary &stageModel,
     if (implementation.mode != StageMode::SIMT)
       continue;
 
-    for (unsigned index : stage.simtAnchorIndices) {
-      if (index >= completePlan.anchors.size() ||
-          !included.insert(index).second)
-        continue;
-      selected.anchors.push_back(completePlan.anchors[index]);
-    }
+    llvm::SmallVector<unsigned> stageAnchorIndices;
+    for (unsigned index : stage.simtAnchorIndices)
+      if (index < completePlan.anchors.size() && included.insert(index).second)
+        stageAnchorIndices.push_back(index);
+    auto merged = mergeSimtStageAnchors(completePlan, stageAnchorIndices);
+    if (!stageAnchorIndices.empty() && !merged)
+      return SimtAnchorPlan{};
+    if (merged)
+      selected.anchors.push_back(std::move(*merged));
   }
   return selected;
+}
+
+static bool
+anchorPlansHaveCompatibleIndices(const SimtAnchorPlan &analysis,
+                                 const SimtAnchorPlan &materialization) {
+  if (analysis.anchors.size() != materialization.anchors.size())
+    return false;
+  for (auto [analysisAnchor, materializationAnchor] :
+       llvm::zip_equal(analysis.anchors, materialization.anchors))
+    if (analysisAnchor.kind != materializationAnchor.kind ||
+        analysisAnchor.materializable != materializationAnchor.materializable)
+      return false;
+  return true;
 }
 
 static LogicalResult appendJSONLine(llvm::StringRef path,
@@ -127,6 +144,24 @@ struct SelectSimdSimtCostModelPass
     clearPreviousSelection(module);
     const bool autoMode = mode.getValue() == "auto";
 
+    // Selection may inspect a transformed analysis view while materializing
+    // the chosen route on the route-neutral module owned by this pass.  This
+    // is how AutoBlockify V1 dispatch/loop cost becomes visible without
+    // forcing an all-SIMD result to retain SIMT scheduling IR.
+    OwningOpRef<ModuleOp> parsedAnalysisModule;
+    ModuleOp analysisModule = module;
+    if (!analysisModulePath.getValue().empty()) {
+      parsedAnalysisModule = parseSourceFile<ModuleOp>(
+          analysisModulePath.getValue(), module.getContext());
+      if (!parsedAnalysisModule) {
+        module.emitError("failed to parse SIMD/SIMT analysis module: ")
+            << analysisModulePath.getValue();
+        signalPassFailure();
+        return;
+      }
+      analysisModule = *parsedAnalysisModule;
+    }
+
     SimdSimtCostModelOptions options;
     options.profilePath = profilePath.getValue();
     options.actualTarget = actualTarget.getValue();
@@ -138,10 +173,20 @@ struct SelectSimdSimtCostModelPass
         wholeKernelSuperblockMaterializable.getValue();
     options.scopeSuperblockMaterializable =
         scopeSuperblockMaterializable.getValue();
+    options.logicalProgramCountHint =
+        std::max<int64_t>(0, logicalProgramCountHint.getValue());
+    if (auto capability =
+            llvm::json::parse(routeTransformCapabilityJSON.getValue()))
+      if (auto *object = capability->getAsObject())
+        if (auto count = object->getInteger("physical_vector_core_count_hint"))
+          options.physicalVectorCoreCountHint = std::max<int64_t>(0, *count);
 
     SimtAnchorPlan anchorPlan =
         buildMixedSimtAnchorPlan(module, options.compileOn91095);
-    auto reportOr = analyzeSimdSimtCandidates(module, anchorPlan, options);
+    SimtAnchorPlan analysisAnchorPlan =
+        buildMixedSimtAnchorPlan(analysisModule, options.compileOn91095);
+    auto reportOr =
+        analyzeSimdSimtCandidates(analysisModule, analysisAnchorPlan, options);
     if (!reportOr) {
       module.emitError("C++ SIMD/SIMT cost model failed: ")
           << llvm::toString(reportOr.takeError());
@@ -157,17 +202,14 @@ struct SelectSimdSimtCostModelPass
     SmallVector<Operation *> mixedAnchors;
     SimtAnchorPlan selectedMixedAnchorPlan;
     int64_t selectedSuperblockFactor = 1;
-    if (report.stageModel.applied) {
-      if (report.decision == SimdSimtCandidateKind::AllSIMD)
-        selectedSuperblockFactor =
-            report.stageModel.allSimd.routeSuperblockFactor;
-      else if (report.decision == SimdSimtCandidateKind::AllSIMTOnly)
-        selectedSuperblockFactor =
-            report.stageModel.allSimt.routeSuperblockFactor;
-      else
-        selectedSuperblockFactor =
-            report.stageModel.mixed.routeSuperblockFactor;
-    }
+    if (report.decision == SimdSimtCandidateKind::AllSIMD)
+      selectedSuperblockFactor =
+          report.stageModel.allSimd.routeSuperblockFactor;
+    else if (report.decision == SimdSimtCandidateKind::AllSIMTOnly)
+      selectedSuperblockFactor =
+          report.stageModel.allSimt.routeSuperblockFactor;
+    else
+      selectedSuperblockFactor = report.stageModel.mixed.routeSuperblockFactor;
 
     bool actionSupported = true;
     bool hasExplicitScope = containsExplicitVectorScope(module);
@@ -175,6 +217,10 @@ struct SelectSimdSimtCostModelPass
       if (hasExplicitScope) {
         actionSupported = false;
         applicationReason = "explicit_scope_present";
+      } else if (!anchorPlansHaveCompatibleIndices(analysisAnchorPlan,
+                                                   anchorPlan)) {
+        actionSupported = false;
+        applicationReason = "analysis_materialization_anchor_mismatch";
       } else {
         selectedMixedAnchorPlan =
             buildSelectedMixedAnchorPlan(report.stageModel, anchorPlan);
@@ -185,7 +231,7 @@ struct SelectSimdSimtCostModelPass
         }
       }
       // A factor>1 mixed route needs batching of the surrounding SIMD
-      // producer/consumer phases, not just a scope attribute.  Keep the
+      // producer/consumer Stages, not just a scope attribute.  Keep the
       // recommendation visible but do not apply it until ScopeSuperBlockPass
       // implements that exact materialization.
       if (selectedSuperblockFactor > 1 &&
@@ -199,8 +245,12 @@ struct SelectSimdSimtCostModelPass
       actionSupported = false;
       applicationReason = "explicit_scope_present";
     }
-    if (selectedSuperblockFactor > 1 &&
-        selectedSuperblockFactor * options.numWarps > 64) {
+    // Both whole-kernel and mixed-kernel V1 schedules launch
+    // numWarps * factor logical warp groups.  Treating a mixed factor as the
+    // total warp count understated the resource limit by numWarps.
+    const int64_t selectedWarpCount =
+        selectedSuperblockFactor * options.numWarps;
+    if (selectedSuperblockFactor > 1 && selectedWarpCount > 64) {
       actionSupported = false;
       applicationReason = "superblock_warp_limit_exceeded";
     }
@@ -239,7 +289,8 @@ struct SelectSimdSimtCostModelPass
     // Selector and Materializer consume the same immutable anchor plan in one
     // pass invocation.  No per-operation marker is persisted in TTIR.
     if (effective == kMixedSimdSimt &&
-        failed(materializeSimtAnchorPlan(module, selectedMixedAnchorPlan))) {
+        failed(materializeSimtAnchorPlan(module, selectedMixedAnchorPlan,
+                                         selectedSuperblockFactor))) {
       signalPassFailure();
       return;
     }
@@ -251,9 +302,29 @@ struct SelectSimdSimtCostModelPass
     reportJSON["selection_source"] = selectionSource;
     reportJSON["application_reason"] = applicationReason;
     reportJSON["action_supported"] = actionSupported;
+    reportJSON["analysis_ir_source"] = analysisModule == module
+                                           ? "route_neutral_ttir"
+                                           : "post_auto_blockify_v1_ttir";
+    if (auto capability =
+            llvm::json::parse(routeTransformCapabilityJSON.getValue())) {
+      reportJSON["route_transform_capability"] = std::move(*capability);
+    } else {
+      module.emitError("invalid route-transform-capability-json");
+      signalPassFailure();
+      return;
+    }
     reportJSON["materialized_simt_anchor_count"] =
         static_cast<int64_t>(mixedAnchors.size());
     reportJSON["selected_superblock_factor"] = selectedSuperblockFactor;
+    reportJSON["logical_program_count_hint"] = options.logicalProgramCountHint;
+    if (options.logicalProgramCountHint > 0) {
+      reportJSON["effective_runtime_factor"] = std::min<int64_t>(
+          selectedSuperblockFactor, options.logicalProgramCountHint);
+      reportJSON["full_group_count"] =
+          options.logicalProgramCountHint / selectedSuperblockFactor;
+      reportJSON["tail_count"] =
+          options.logicalProgramCountHint % selectedSuperblockFactor;
+    }
     std::string json =
         llvm::formatv("{0}", llvm::json::Value(std::move(reportJSON))).str();
     module->setAttr(kReportJSONAttr, builder.getStringAttr(json));

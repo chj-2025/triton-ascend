@@ -13,7 +13,7 @@
 #include "mlir/Pass/Pass.h"
 
 #define GEN_PASS_DEF_TTIRLAYOUTMERGE
-#include "ascend/include/TritonToLinalg/Passes.h.inc"
+#include "ascend/include/TTIRLayoutMerge/Passes.h.inc"
 
 namespace mlir::triton {
 
