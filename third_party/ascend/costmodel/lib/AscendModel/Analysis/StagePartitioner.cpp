@@ -1,6 +1,7 @@
 //===- StagePartitioner.cpp - Build semantic Stage IR -------------------===//
 
 #include "AscendModel/Analysis/StagePartitioner.h"
+#include "AscendModel/Support/CostModelLogger.h"
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/DenseSet.h"
@@ -740,6 +741,7 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
 llvm::Expected<ProgramStructure>
 ProgramStructureAnalysis::analyze(ModuleOp module,
                                   const SimtAnchorPlan &anchorPlan) const {
+  COSTMODEL_TRACE("ProgramStructureAnalysis::analyze");
   if (!module)
     return llvm::createStringError(
         std::errc::invalid_argument,
@@ -941,6 +943,7 @@ buildAnchorGroups(const ProgramStructure &structure,
 llvm::Expected<StagePartition>
 StageBoundaryAnalysis::analyze(const ProgramStructure &structure,
                                const SimtAnchorPlan &anchorPlan) const {
+  COSTMODEL_TRACE("StageBoundaryAnalysis::analyze");
   if (structure.rootOperations.empty())
     return llvm::createStringError(
         std::errc::invalid_argument,
@@ -1108,6 +1111,7 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
 
 llvm::Error StageKindClassifier::analyze(StagePartition &partition,
                                          int64_t tinyDotFlopsMax) const {
+  COSTMODEL_TRACE("StageKindClassifier::analyze");
   if (!partition.operationOwnershipComplete)
     return llvm::Error::success();
   auto compatible = [](StageCostModelKind kind,
@@ -1286,6 +1290,7 @@ llvm::Error
 StageModeLegalityAnalysis::analyze(StagePartition &partition,
                                    int64_t maximumSuperblockFactor,
                                    bool scopeSuperblockMaterializable) const {
+  COSTMODEL_TRACE("StageModeLegalityAnalysis::analyze");
   const int64_t maximum = std::clamp<int64_t>(maximumSuperblockFactor, 1, 4);
   // Local and whole-kernel SuperBlock candidates consume the same SIMT warp
   // resources.  Do not regenerate F4 here after evaluateStageModel has
@@ -1329,15 +1334,86 @@ StageModeLegalityAnalysis::analyze(StagePartition &partition,
   return llvm::Error::success();
 }
 
+static llvm::StringRef stringifyScheduleKind(StageScheduleKind kind) {
+  switch (kind) {
+  case StageScheduleKind::StraightLine:
+    return "straight_line";
+  case StageScheduleKind::IndependentPipelined:
+    return "independent_pipelined";
+  case StageScheduleKind::LoopCarriedSerial:
+    return "loop_carried_serial";
+  case StageScheduleKind::PartiallyDependent:
+    return "partially_dependent";
+  }
+  return "unknown";
+}
+
+static std::string joinFactors(const std::vector<int64_t> &factors) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  llvm::interleave(factors, stream, ",");
+  stream.flush();
+  return text;
+}
+
+/// Print the final Stage partition: one summary block per logical Stage with
+/// its kind, schedule, ownership, legality, features, and workload.
+static void logStagePartition(const StagePartition &partition) {
+  for (const LogicalStage &stage : partition.stages) {
+    costModelLog()
+        << "stage '" << stage.id << "': model="
+        << stringifyStageCostModel(stage.costModelKind)
+        << " schedule=" << stringifyScheduleKind(stage.scheduleKind)
+        << " iterations=" << stage.iterationCount
+        << " ops=" << stage.operations.size()
+        << " liveIn=" << stage.liveIns.size() << "(" << stage.liveInBytes
+        << "B)"
+        << " liveOut=" << stage.liveOuts.size() << "(" << stage.liveOutBytes
+        << "B)"
+        << " simdLegal=" << stage.simdLegal
+        << " simtLegal=" << stage.simtLegal
+        << " simtFactors=[" << joinFactors(stage.legalSimtFactors) << "]"
+        << " localFactors=[" << joinFactors(stage.localSimtFactors) << "]"
+        << (stage.localSimtMaterializable ? " localSimtMaterializable" : "")
+        << "\n";
+    costModelLog()
+        << "  features: loop=" << stage.features.hasLoop
+        << " loopCarriedDep=" << stage.features.hasLoopCarriedDataDependency
+        << " pointerInduction=" << stage.features.hasPointerInduction
+        << " contiguousMem=" << stage.features.hasContiguousMemory
+        << " indirectMem=" << stage.features.hasIndirectMemory
+        << " reduction=" << stage.features.hasReduction
+        << " prefixScan=" << stage.features.hasPrefixScan
+        << " dot=" << stage.features.hasDot
+        << " conversionPack=" << stage.features.hasConversionPack
+        << " activeLaneRatio=" << stage.features.activeLaneRatio << "\n";
+    costModelLog()
+        << "  workload: scalarOps=" << stage.workload.scalarOperations
+        << " loadBytes=" << stage.workload.loadBytes
+        << " storeBytes=" << stage.workload.storeBytes
+        << " loadWarps=" << stage.workload.loadWarpInstructions
+        << " storeWarps=" << stage.workload.storeWarpInstructions
+        << " predElems=" << stage.workload.predicateElements
+        << " shuffleSteps=" << stage.workload.shuffleLaneSteps
+        << " dotFlops=" << stage.workload.dotFlops
+        << " issueElems=" << stage.workload.issueElements
+        << " spillTxns=" << stage.workload.estimatedSpillTransactions
+        << " paysKernelSetup=" << stage.workload.paysKernelSetup << "\n";
+  }
+}
+
 llvm::Expected<StagePartition>
 StagePartitioner::partition(ModuleOp module, const SimtAnchorPlan &anchorPlan,
                             const StagePartitionerOptions &options) const {
+  COSTMODEL_TRACE("StagePartitioner::partition");
   auto structure = ProgramStructureAnalysis().analyze(module, anchorPlan);
   if (!structure)
     return structure.takeError();
   auto result = StageBoundaryAnalysis().analyze(*structure, anchorPlan);
   if (!result)
     return result.takeError();
+  costModelLog() << "output: roots=" << structure->rootOperations.size()
+                 << " stages=" << result->stages.size() << "\n";
   StageWorkloadAnalysis workloadAnalysis;
   if (llvm::Error error = workloadAnalysis.analyze(*result))
     return std::move(error);
@@ -1354,5 +1430,6 @@ StagePartitioner::partition(ModuleOp module, const SimtAnchorPlan &anchorPlan,
     return std::move(error);
   if (llvm::Error error = StagePartitionVerifier().verify(*result))
     return std::move(error);
+  logStagePartition(*result);
   return std::move(*result);
 }
