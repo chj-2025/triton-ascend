@@ -243,6 +243,9 @@ static void readStageResources(ProfileJSONReader &reader,
       reader.number(*resources, "issue_instructions_per_system_cycle", prefix);
   profile.spillTransactionsPerCycle =
       reader.number(*resources, "spill_transactions_per_system_cycle", prefix);
+  if (const auto *scan = resources->getObject("prefix_scan"))
+    profile.prefixScanDependencyFactor =
+        reader.number(*scan, "dependency_factor", prefix + ".prefix_scan");
   if (const auto *indirect =
           reader.object(*resources, "indirect_memory", prefix)) {
     const std::string path = prefix + ".indirect_memory";
@@ -469,11 +472,11 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
     return llvm::createStringError(
         std::errc::invalid_argument, "invalid SIMD/SIMT profile '%s': %s",
         path.c_str(), reader.getError().str().c_str());
-  if (hardware.profileVersion != "david-v100-simd-simt-20260824-v19")
+  if (hardware.profileVersion != "david-v100-simd-simt-20260903-v20")
     return llvm::createStringError(
         std::errc::invalid_argument,
         "unsupported SIMD/SIMT profile version '%s' "
-        "(expected david-v100-simd-simt-20260824-v19)",
+        "(expected david-v100-simd-simt-20260903-v20)",
         hardware.profileVersion.c_str());
   if (!microbench)
     return llvm::createStringError(std::errc::invalid_argument,

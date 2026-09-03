@@ -509,7 +509,9 @@ static StageCostModelKind classifySemanticRoot(Operation *root) {
     return StageCostModelKind::AutoBlockifyDispatch;
   if (operationTreeHasTrueLoopCarriedDependency(root))
     return StageCostModelKind::LoopCarriedRecurrence;
-  if (operationTreeHasAnyName(root, {"tt.reduce", "tt.scan", "linalg.reduce"}))
+  if (operationTreeHasAnyName(root, {"tt.scan"}))
+    return StageCostModelKind::PrefixScan;
+  if (operationTreeHasAnyName(root, {"tt.reduce", "linalg.reduce"}))
     return StageCostModelKind::RowwiseReduction;
   if (operationTreeHasAnyName(root, {"tt.dot"}))
     return StageCostModelKind::CubeRoofline;
@@ -804,6 +806,7 @@ static int semanticKindPriority(StageCostModelKind kind) {
   case StageCostModelKind::LoopCarriedRecurrence:
     return 90;
   case StageCostModelKind::RowwiseReduction:
+  case StageCostModelKind::PrefixScan:
     return 80;
   case StageCostModelKind::CubeRoofline:
   case StageCostModelKind::TinyCubeRoofline:
@@ -1073,6 +1076,7 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
       }
       facts.hasReduction |=
           name == "tt.reduce" || name == "tt.scan" || name == "linalg.reduce";
+      facts.hasPrefixScan |= name == "tt.scan";
       facts.hasDot |=
           name == "tt.dot" || name.contains("matmul") || name.contains("mmad");
       facts.hasConversionPack |=
@@ -1115,6 +1119,8 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
       return facts.hasLoop && !facts.hasLoopCarriedDataDependency;
     case StageCostModelKind::RowwiseReduction:
       return facts.hasReduction;
+    case StageCostModelKind::PrefixScan:
+      return facts.hasPrefixScan;
     case StageCostModelKind::CubeRoofline:
     case StageCostModelKind::TinyCubeRoofline:
       return facts.hasDot;
@@ -1147,6 +1153,8 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
     auto derive = [&]() {
       if (facts.hasLoopCarriedDataDependency)
         return StageCostModelKind::LoopCarriedRecurrence;
+      if (facts.hasPrefixScan)
+        return StageCostModelKind::PrefixScan;
       if (facts.hasReduction)
         return StageCostModelKind::RowwiseReduction;
       if (facts.hasDot)

@@ -1,7 +1,7 @@
 {
   "$schema": "./simd_simt_profile_schema.json",
   "schema_version": 10,
-  "profile_version": "david-v100-simd-simt-20260824-v19",
+  "profile_version": "david-v100-simd-simt-20260903-v20",
   "target": "Ascend950PR/dav-c310",
   "description": "Stage Route Model hardware profile. Stage partitions and workloads are generated online from transformed TTIR; this file contains no workload-specific Stage template or route multiplier.",
   "microbenchmark_profile": "../microbench/ascend_davidv100_v1.json",
@@ -138,6 +138,10 @@
       "scalar_operations_per_system_cycle": 1.0,
       "issue_instructions_per_system_cycle": 6.0,
       "spill_transactions_per_system_cycle": 1.0,
+      "prefix_scan": {
+        "dependency_factor": 17.35,
+        "description": "SIMD prefix-scan dependency factor calibrated from the identity-baseline-subtracted A5 batch-8, extent-16 scan sweep (143.398 us SIMD scan increment versus 8.267 us SIMT, ratio 17.345); unlike reduction throughput, successive scan levels remain dependent."
+      },
       "indirect_memory": {
         "load_transactions_per_system_cycle": 0.125,
         "store_transactions_per_system_cycle": 0.125,
@@ -272,6 +276,10 @@
       "scalar_operations_per_system_cycle": 4.0,
       "issue_instructions_per_system_cycle": 4.0,
       "spill_transactions_per_system_cycle": 1.0,
+      "prefix_scan": {
+        "dependency_factor": 1.0,
+        "description": "SIMT shuffle throughput already represents the lane dependency chain measured by the A5 scan sweep."
+      },
       "indirect_memory": {
         "load_transactions_per_system_cycle": 0.5,
         "store_transactions_per_system_cycle": 0.5,

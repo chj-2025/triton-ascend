@@ -708,7 +708,7 @@ static void release_npu_tensor_handle(void* handle) {{
     # along that axis, so the host shrinks the matching grid dim by H here (the
     # equivalent of what bishengir AutoBlockify used to do via hacc.coalesce_factor;
     # bishengir no longer touches it). Tile/strided merges require exact
-    # divisibility; independent-row coalescing carries a runtime tail predicate
+    # divisibility; layout coalescing carries a runtime tail predicate
     # and therefore explicitly requests ceil-div.
     coalesce_factor = int(getattr(metadata, "coalesce_factor", 1) or 1)
     coalesce_axis = int(getattr(metadata, "coalesce_axis", -1))

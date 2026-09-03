@@ -55,6 +55,7 @@ struct StageModelFeatures {
   bool hasContiguousMemory = false;
   bool hasIndirectMemory = false;
   bool hasReduction = false;
+  bool hasPrefixScan = false;
   bool hasDot = false;
   bool hasConversionPack = false;
   /// True when the Stage is part of the logical-program body created by

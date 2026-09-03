@@ -262,6 +262,17 @@ static double estimateStage(const LogicalStage &stage,
            count * std::max(r.scalar + r.load + r.store + r.criticalPath +
                                 controlBody(r) + r.spill,
                             r.issue);
+  case StageCostModelKind::PrefixScan: {
+    const double scanCritical =
+        r.compute + r.predicate +
+        r.shuffle * (mode == StageMode::SIMD
+                         ? profile.simd.prefixScanDependencyFactor
+                         : profile.simt.prefixScanDependencyFactor);
+    return r.setup +
+           count * std::max(r.scalar + r.load + r.store + scanCritical +
+                                controlBody(r) + r.spill,
+                            r.issue);
+  }
   case StageCostModelKind::CubeRoofline:
   case StageCostModelKind::TinyCubeRoofline:
     if (mode == StageMode::SIMD && permitsSimdOverlap(stage))
@@ -335,6 +346,8 @@ llvm::StringRef mlir::ascend::stringifyStageCostModel(StageCostModelKind kind) {
     return "loop_carried_recurrence";
   case StageCostModelKind::RowwiseReduction:
     return "rowwise_reduction";
+  case StageCostModelKind::PrefixScan:
+    return "prefix_scan";
   case StageCostModelKind::CubeRoofline:
     return "cube_roofline";
   case StageCostModelKind::TinyCubeRoofline:
@@ -355,7 +368,7 @@ bool StageControlFlowRates::isFiniteAndNonNegative() const {
 }
 
 bool StageModeProfile::isValid(StageMode mode) const {
-  const std::array<double, 12> common = {setupCycles,
+  const std::array<double, 13> common = {setupCycles,
                                          predicateOperationsPerCycle,
                                          shuffleLanesPerCycle,
                                          dotSetupCycles,
@@ -365,6 +378,7 @@ bool StageModeProfile::isValid(StageMode mode) const {
                                          spillTransactionsPerCycle,
                                          indirectLoadTransactionsPerCycle,
                                          indirectStoreTransactionsPerCycle,
+                                         prefixScanDependencyFactor,
                                          static_cast<double>(vectorWidth),
                                          static_cast<double>(issueWidth)};
   if (!std::all_of(

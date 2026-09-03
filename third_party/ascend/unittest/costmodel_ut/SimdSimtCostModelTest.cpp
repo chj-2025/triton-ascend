@@ -344,6 +344,29 @@ TEST(SimdSimtCostModelTest, MixedScopeSuperBlockAmortizesOnlyFixedTransitions) {
   EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[1], 108.0);
 }
 
+TEST(SimdSimtCostModelTest, PrefixScanUsesModeSpecificDependencyFactor) {
+  LogicalStage stage = logicalStage("scan", StageCostModelKind::PrefixScan);
+  stage.features.hasReduction = true;
+  stage.features.hasPrefixScan = true;
+  stage.workload.operationElements.clear();
+  stage.workload.scalarOperations = 0.0;
+  stage.workload.issueElements = 64.0;
+  stage.workload.shuffleLaneSteps = 320.0;
+
+  HardwareProfile profile = hardwareProfile();
+  profile.simd.prefixScanDependencyFactor = 2.5;
+  profile.simt.prefixScanDependencyFactor = 1.0;
+  auto table = evaluateOneStage(std::move(stage), profile);
+  if (!table)
+    FAIL() << llvm::toString(table.takeError());
+
+  const auto &implementations = table->stages.front().implementations;
+  ASSERT_EQ(implementations.size(), 2u);
+  EXPECT_EQ(implementations[0].implementation.mode, StageMode::SIMD);
+  EXPECT_EQ(implementations[1].implementation.mode, StageMode::SIMT);
+  EXPECT_GT(implementations[0].totalCycles, implementations[1].totalCycles);
+}
+
 TEST(SimdSimtCostModelTest, IndependentLoopUsesSimdRooflineAndSerialSimtCost) {
   LogicalStage stage =
       logicalStage("independent", StageCostModelKind::IndependentPipelinedLoop,

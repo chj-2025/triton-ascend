@@ -61,10 +61,6 @@ analyzePlainOneDimensionalCumsum(Operation *op) {
   int64_t axisValue = axis.getInt();
   if (axisValue < 0 || axisValue >= sourceType.getRank())
     return std::nullopt;
-  for (auto [index, extent] : llvm::enumerate(sourceType.getShape()))
-    if (static_cast<int64_t>(index) != axisValue && extent != 1)
-      return std::nullopt;
-
   int64_t realCombineOps = 0;
   bool isAdd = false;
   if (op->getNumRegions() != 1 || op->getRegion(0).empty())
@@ -505,7 +501,6 @@ static std::optional<SimtAnchorDescriptor> analyzeAnchor(Operation *op,
     if (!facts)
       return std::nullopt;
     descriptor.kind = SimtAnchorKind::PlainOneDimensionalCumsum;
-    descriptor.lowerability.allSimd = false;
     if (facts->axisExtent <= 0 || !isSupportedCumsumType(facts->elementType))
       descriptor.lowerability.mixed = false;
   } else if (name == "tt.atomic_rmw" || name == "tt.atomic_cas") {

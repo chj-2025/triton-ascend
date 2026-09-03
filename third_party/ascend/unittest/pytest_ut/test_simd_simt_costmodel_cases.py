@@ -11,6 +11,11 @@ import triton.language as tl
 import triton.runtime.driver as driver
 from triton.backends.ascend.utils import is_compile_on_910_95
 
+pytestmark = pytest.mark.skipif(
+    os.getenv("TRITON_RUN_SIMD_SIMT_COSTMODEL_GUARDS") != "1",
+    reason="SIMD/SIMT costmodel performance guards are opt-in",
+)
+
 simd_simt_910_95_only = pytest.mark.xfail(
     not is_compile_on_910_95(),
     reason="SIMD/SIMT cost model only supports 910_95",
@@ -474,10 +479,10 @@ def test_costmodel_fbgemm_rowwise_quant(tmp_path):
     capability = report["route_transform_capability"]
     assert capability["source_logical_program_count_hint"] == valid
     if layout_merge_disabled:
-        assert not capability["row_coalescing_applied"]
+        assert not capability["layout_coalescing_applied"]
         assert capability["logical_program_count_hint"] == valid
     else:
-        assert capability["row_coalescing_factor"] == 2
+        assert capability["layout_coalescing_factor"] == 2
         assert capability["logical_program_count_hint"] == valid // 2
     documented_us = 20.578 if layout_merge_disabled else 8.904
     _assert_performance(

@@ -467,6 +467,24 @@
           "type": "number",
           "exclusiveMinimum": 0
         },
+        "prefix_scan": {
+          "type": "object",
+          "required": [
+            "dependency_factor",
+            "description"
+          ],
+          "properties": {
+            "dependency_factor": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "description": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
         "indirect_memory": {
           "type": "object",
           "required": [

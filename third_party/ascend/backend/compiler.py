@@ -288,9 +288,9 @@ def _publish_route_transform_capability(metadata, opt) -> str:
     capability = {
         "schema_version": 1,
         "layout_merge_applied": bool(metadata.get("ttir_layout_merge_applied", False)),
-        "row_coalescing_applied": coalesce_factor > 1,
-        "row_coalescing_factor": coalesce_factor,
-        "row_coalescing_axis": coalesce_axis,
+        "layout_coalescing_applied": coalesce_factor > 1,
+        "layout_coalescing_factor": coalesce_factor,
+        "layout_coalescing_axis": coalesce_axis,
         "auto_blockify_v1_requested": bool(metadata.get("auto_blockify_v1_requested", False)),
         "auto_blockify_v1_materializable": v1_materializable,
         "auto_blockify_v1_disable_reasons": sorted(set(disable_reasons)),

@@ -89,7 +89,31 @@ static bool isLiftable(Operation *op) {
   }
   return isa<triton::SplatOp, triton::AddPtrOp, triton::BroadcastOp,
              triton::ExpandDimsOp, triton::LoadOp, triton::StoreOp,
-             triton::ScanOp, triton::ReduceOp>(op);
+             triton::ScanOp, triton::ReduceOp, triton::AssertOp>(op);
+}
+
+// Integer overflow checks emitted by the Triton frontend form predicate-only
+// chains such as cmp + cmp -> and -> tt.assert.  They constrain no memory
+// access and remain valid when lifted to the added coalescing dimension.
+static bool isAssertOnlyPredicate(Value value,
+                                  DenseSet<Value> &visitedPredicates) {
+  if (!visitedPredicates.insert(value).second)
+    return true;
+  if (value.use_empty())
+    return false;
+  for (Operation *user : value.getUsers()) {
+    if (isa<triton::AssertOp>(user))
+      continue;
+    auto andOp = dyn_cast<arith::AndIOp>(user);
+    if (!andOp || !isAssertOnlyPredicate(andOp.getResult(), visitedPredicates))
+      return false;
+  }
+  return true;
+}
+
+static bool isAssertOnlyPredicate(Value value) {
+  DenseSet<Value> visitedPredicates;
+  return isAssertOnlyPredicate(value, visitedPredicates);
 }
 
 // Detect tile-index signature:
@@ -175,6 +199,8 @@ static std::optional<TileSeed> findSeed(ModuleOp moduleOp) {
                   mask = cmp.getResult();
                   continue;
                 }
+                if (isAssertOnlyPredicate(cmp.getResult()))
+                  continue;
                 unsafe = true;
                 break;
               }

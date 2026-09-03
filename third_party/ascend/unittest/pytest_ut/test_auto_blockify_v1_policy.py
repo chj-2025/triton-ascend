@@ -91,8 +91,8 @@ def test_route_transform_capability_is_single_resolved_fact():
     }
     opt = SimpleNamespace(compile_on_910_95=True, num_warps=4, logical_program_count_hint=9)
     capability = __import__("json").loads(_publish_route_transform_capability(metadata, opt))
-    assert capability["row_coalescing_applied"]
-    assert capability["row_coalescing_factor"] == 8
+    assert capability["layout_coalescing_applied"]
+    assert capability["layout_coalescing_factor"] == 8
     assert capability["auto_blockify_v1_materializable"]
     assert capability["whole_kernel_superblock_factors"] == [1, 2, 4]
     assert capability["scope_superblock_factors"] == [1, 2, 4]

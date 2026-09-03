@@ -40,6 +40,7 @@ enum class StageCostModelKind {
   IndependentPipelinedLoop,
   LoopCarriedRecurrence,
   RowwiseReduction,
+  PrefixScan,
   CubeRoofline,
   TinyCubeRoofline,
   ConversionPack,
@@ -119,6 +120,7 @@ struct StageModeProfile {
   double storeWarpInstructionsPerCycle = 0.0;
   double predicateOperationsPerCycle = 0.0;
   double shuffleLanesPerCycle = 0.0;
+  double prefixScanDependencyFactor = 1.0;
   double dotSetupCycles = 0.0;
   double dotFlopsPerCycle = 0.0;
   double scalarOperationsPerCycle = 0.0;

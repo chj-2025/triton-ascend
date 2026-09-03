@@ -205,6 +205,7 @@ llvm::json::Object StageModelFeatures::toJSON() const {
   result["has_contiguous_memory"] = hasContiguousMemory;
   result["has_indirect_memory"] = hasIndirectMemory;
   result["has_reduction"] = hasReduction;
+  result["has_prefix_scan"] = hasPrefixScan;
   result["has_dot"] = hasDot;
   result["has_conversion_pack"] = hasConversionPack;
   result["replicated_by_local_superblock"] = replicatedByLocalSuperBlock;
