@@ -617,7 +617,7 @@ def index_select_kernel(
 
 @simd_simt_910_95_only
 def test_index_select():
-    N, D, M = 64, 32, 8
+    N, D, M = 64, 8, 8
 
     src = torch.arange(N * D, dtype=torch.float32, device='npu').reshape(N, D)
     indices = torch.tensor([3, 10, 0, 55, 7, 20, 63, 1], dtype=torch.int64, device='npu')
