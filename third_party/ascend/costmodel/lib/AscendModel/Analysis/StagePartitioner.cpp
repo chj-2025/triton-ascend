@@ -748,6 +748,12 @@ ProgramStructureAnalysis::analyze(ModuleOp module,
         "ProgramStructureAnalysis requires ModuleOp");
   ProgramStructure structure;
   structure.rootOperations = collectTopLevelSemanticRoots(module);
+  costModelLog() << "semantic roots: " << structure.rootOperations.size()
+                 << " (StageBoundaryAnalysis will group these into stages)\n";
+  for (auto [index, root] : llvm::enumerate(structure.rootOperations))
+    costModelLog() << "  root[" << index << "]: "
+                   << root->getName().getStringRef() << " " << root->getLoc()
+                   << "\n";
   if (structure.rootOperations.empty())
     return llvm::createStringError(
         std::errc::invalid_argument,
@@ -1006,6 +1012,21 @@ StageBoundaryAnalysis::analyze(const ProgramStructure &structure,
     stage.costModelKind = kind;
     stage.scheduleKind = schedule;
     stage.id = makeStageId(partition.stages.size(), kind);
+    {
+      const char *reason = "single root";
+      if (stage.operations.size() > 1)
+        reason = anchorGroup >= 0 ? "compound SIMT anchor group"
+                                  : "merged plain roots (same kind/schedule "
+                                    "or same source statement)";
+      costModelLog() << "boundary: stage '" << stage.id << "' roots="
+                     << (next - index) << " reason=" << reason << "\n";
+      for (size_t rootIndex = index; rootIndex < next; ++rootIndex) {
+        Operation *rootOp = structure.rootOperations[rootIndex];
+        costModelLog() << "  root[" << rootIndex << "]: "
+                       << rootOp->getName().getStringRef() << " "
+                       << rootOp->getLoc() << "\n";
+      }
+    }
     partition.stages.push_back(std::move(stage));
     index = next;
   }
@@ -1356,6 +1377,18 @@ static std::string joinFactors(const std::vector<int64_t> &factors) {
   return text;
 }
 
+/// Print one operation and its nested regions as an indented tree.  Every
+/// TTIR operation owned by a Stage appears here, including loop bodies.
+static void logOperationTree(Operation *operation, int depth) {
+  std::string indent(static_cast<size_t>(depth) * 2, ' ');
+  costModelLog() << indent << operation->getName().getStringRef() << " "
+                 << operation->getLoc() << "\n";
+  for (Region &region : operation->getRegions())
+    for (Block &block : region)
+      for (Operation &nested : block)
+        logOperationTree(&nested, depth + 1);
+}
+
 /// Print the final Stage partition: one summary block per logical Stage with
 /// its kind, schedule, ownership, legality, features, and workload.
 static void logStagePartition(const StagePartition &partition) {
@@ -1399,6 +1432,10 @@ static void logStagePartition(const StagePartition &partition) {
         << " issueElems=" << stage.workload.issueElements
         << " spillTxns=" << stage.workload.estimatedSpillTransactions
         << " paysKernelSetup=" << stage.workload.paysKernelSetup << "\n";
+    costModelLog() << "  operation tree (" << stage.operations.size()
+                   << " roots):\n";
+    for (Operation *root : stage.operations)
+      logOperationTree(root, 2);
   }
 }
 
