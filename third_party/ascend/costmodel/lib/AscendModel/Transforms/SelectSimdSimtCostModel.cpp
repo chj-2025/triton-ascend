@@ -388,9 +388,34 @@ struct SelectSimdSimtCostModelPass
     auto reportOr =
         analyzeSimdSimtCandidates(analysisModule, analysisAnchorPlan, options);
     if (!reportOr) {
-      module.emitError("C++ SIMD/SIMT cost model failed: ")
-          << llvm::toString(reportOr.takeError());
-      signalPassFailure();
+      // Downstream analysis failures (requires_split from
+      // StageKindClassifier, non-continuous stage ownership, verifier
+      // rejection) mean this kernel is not modelable as-is, not that it must
+      // not compile.  The cost model is an optimizer, never a gate: fall
+      // back to the legacy backend routing and publish the minimal report
+      // contract the Python driver requires.
+      std::string reason = llvm::toString(reportOr.takeError());
+      module.emitWarning("C++ SIMD/SIMT cost model fell back to "
+                         "backend_default: ")
+          << reason;
+      Builder builder(module.getContext());
+      module->setAttr(kEffectiveExecutionAttr,
+                      builder.getStringAttr(kBackendDefault));
+      module->setAttr(kSelectionSourceAttr,
+                      builder.getStringAttr("backend_default"));
+      llvm::json::Object reportJSON;
+      reportJSON["mode"] = mode.getValue();
+      reportJSON["recommended_decision_kind"] = kBackendDefault.str();
+      reportJSON["effective_decision_kind"] = kBackendDefault.str();
+      reportJSON["selection_source"] = "backend_default";
+      reportJSON["application_reason"] = reason;
+      reportJSON["action_supported"] = false;
+      std::string json =
+          llvm::formatv("{0}", llvm::json::Value(std::move(reportJSON))).str();
+      module->setAttr(kReportJSONAttr, builder.getStringAttr(json));
+      if (failed(appendJSONLine(reportFile.getValue(), json)))
+        module.emitWarning("failed to append C++ SIMD/SIMT report to ")
+            << reportFile.getValue();
       return;
     }
     SimdSimtCostReport report = std::move(*reportOr);

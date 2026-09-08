@@ -1383,12 +1383,24 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
     if (stage.costModelKind == StageCostModelKind::AutoBlockifyDispatch ||
         stage.costModelKind == StageCostModelKind::AutoBlockifyLoop)
       continue;
+    // A Stage mixing tt.dot with another dominant structure (reduction,
+    // indirect memory, loop-carried recurrence) cannot always be split: the
+    // dot may sit inside the serial chain itself (e.g. a chunked-scan state
+    // update whose per-iteration body contains dots), so the partitioner has
+    // no boundary at which to separate it.  Model such hybrid Stages with
+    // the dominant structure's kind instead of failing: the workload
+    // accounting already charges the dot on the same critical path
+    // (StageCostModels mapWorkload/estimateStage), and the SIMT profile's
+    // scalar-FMA dot rate keeps a hybrid Stage honestly expensive in SIMT.
     if (facts.hasDot && (facts.hasReduction || facts.hasIndirectMemory ||
                          facts.hasLoopCarriedDataDependency))
-      return llvm::createStringError(
-          std::errc::invalid_argument,
-          "requires_split: Stage '%s' owns incompatible dominant structures",
-          stage.id.c_str());
+      costModelLog()
+          << "hybrid dominant structures accepted: Stage '" << stage.id
+          << "' combines tt.dot with "
+          << (facts.hasLoopCarriedDataDependency
+                  ? "loop-carried recurrence"
+                  : facts.hasReduction ? "reduction" : "indirect memory")
+          << "; modeling as the dominant structure\n";
 
     auto derive = [&]() {
       if (facts.hasLoopCarriedDataDependency)

@@ -513,6 +513,15 @@ static std::optional<SimtAnchorDescriptor> analyzeAnchor(Operation *op,
     if (!facts)
       return std::nullopt;
     descriptor.kind = SimtAnchorKind::PlainOneDimensionalCumsum;
+    // On 91095 the backend lowers a plain 1-D cumsum through the SIMT
+    // (Sklansky) template: TritonToLinalgPass::isSIMTOp claims every such
+    // scan unless the Route Model itself disables the template, and the SIMD
+    // fallback (ScanConverter's triton_cumsum library call) is not a working
+    // executable on that target (device aicore error).  An all-SIMD
+    // selection would force the scan onto that broken path, so the candidate
+    // must be illegal whenever this anchor exists.  Other targets keep the
+    // SIMD scan lowering as their normal route and stay all-SIMD legal.
+    descriptor.lowerability.allSimd = !compileOn91095;
     if (facts->axisExtent <= 0 || !isSupportedCumsumType(facts->elementType))
       descriptor.lowerability.mixed = false;
   } else if (name == "tt.atomic_rmw" || name == "tt.atomic_cas") {
