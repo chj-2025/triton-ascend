@@ -4,7 +4,6 @@ add_mlir_library(AscendModelTransforms
   InsertDataTransfers.cpp
   AssignOpIDs.cpp
   EstimateCycles.cpp
-  HIVMAnalysisPass.cpp
   PipelineAnalysisPass.cpp
   PerfReportPass.cpp
   PassRegistration.cpp
