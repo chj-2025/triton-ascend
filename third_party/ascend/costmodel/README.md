@@ -1,6 +1,7 @@
 # Ascend Cost Model architecture
 
-This directory contains two cost models and one shared evidence layer.
+This directory contains a TTIR performance model, a SIMD/SIMT route model,
+and one shared evidence layer.
 
 ```text
 profiles/microbench
@@ -10,7 +11,7 @@ AscendModelProfile
    |             |
    v             v
 AscendModelAnalysis      AscendModelRouteModel
-(absolute/HIVM)          (SIMD/SIMT routing)
+(TTIR performance)       (SIMD/SIMT routing)
           \               /
            v             v
            AscendModelTransforms / backend integration
@@ -19,8 +20,8 @@ AscendModelAnalysis      AscendModelRouteModel
 The two models share measurements, not objectives or scoring formulas:
 
 - `configs/`, `include/AscendModel/Analysis`, `lib/AscendModel/Analysis`,
-  `IR`, and the original transforms implement the absolute/autotune and HIVM
-  model.
+  `IR`, and the original transforms implement the TTIR performance model used
+  by the in-process autotune path.
 - `profiles/microbench`, `include/AscendModel/Profile`, and
   `lib/AscendModel/Profile` own model-neutral measurements plus their loader,
   units, clock domains, target checks, and provenance.
