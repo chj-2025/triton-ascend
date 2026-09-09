@@ -425,6 +425,8 @@ static void attachExactAnchorOwnership(StagePartition &partition,
     if (!stage.localSimtMaterializable)
       continue;
     stage.simtAnchorIndices.clear();
+    stage.localSimtOperations.clear();
+    stage.allAnchorsSimdLowerable = true;
     stage.localSuperblockMaterializable = false;
     bool allAnchorsDirectlyOwnedByV1Loop = true;
     for (auto indexedAnchor : llvm::enumerate(anchorPlan.anchors)) {
@@ -433,6 +435,7 @@ static void attachExactAnchorOwnership(StagePartition &partition,
           stageOwnsAnchor(stage, anchor, splitLoopBody)) {
         stage.simtAnchorIndices.push_back(
             static_cast<unsigned>(indexedAnchor.index()));
+        stage.allAnchorsSimdLowerable &= anchor.lowerability.allSimd;
         Operation *insertionPoint = anchor.scopeOperations.size() > 1
                                         ? anchor.scopeInsertionPoint
                                         : anchor.operation;
@@ -647,17 +650,21 @@ static bool isIndependentStructuredLoop(Operation *operation) {
 }
 
 /// Trip count of the independent structured loops enclosing `root` when
-/// loop-body splitting is active.  Nested split loops take the maximum
-/// enclosing trip count, mirroring semanticRootIterationCount's max-based
-/// nesting approximation; the common single-loop case is exact.
+/// loop-body splitting is active.  Nested loop bodies execute by the product
+/// of their enclosing trip counts, not the maximum.
 static int64_t enclosingSplitLoopTripCount(Operation *root) {
   int64_t trips = 1;
   if (!root)
     return trips;
   for (Operation *parent = root->getParentOp(); parent;
-       parent = parent->getParentOp())
-    if (isIndependentStructuredLoop(parent))
-      trips = std::max(trips, getLoopTripCount(parent, 1));
+       parent = parent->getParentOp()) {
+    if (!isIndependentStructuredLoop(parent))
+      continue;
+    const int64_t factor = std::max<int64_t>(1, getLoopTripCount(parent, 1));
+    if (trips > std::numeric_limits<int64_t>::max() / factor)
+      return std::numeric_limits<int64_t>::max();
+    trips *= factor;
+  }
   return trips;
 }
 
@@ -863,6 +870,7 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
     stage.localSimtScopeCount = 0;
     stage.scopeInputTensorBytes = 0;
     stage.scopeOutputTensorBytes = 0;
+    stage.localSimtOperations.clear();
     llvm::SmallVector<Operation *> roots;
     bool isRange = false;
     if (stage.simtAnchorIndices.empty()) {
@@ -882,6 +890,7 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
         roots.push_back(anchor.operation);
     }
     {
+      stage.localSimtOperations.assign(roots.begin(), roots.end());
 
       llvm::DenseSet<Operation *> inside;
       for (Operation *root : roots) {
@@ -1474,6 +1483,44 @@ llvm::Error StageWorkloadAnalysis::analyze(StagePartition &partition) const {
     recomputeIssueElements(work);
     stage.workload = std::move(work);
     makePerIteration(stage);
+
+    stage.localSimtWorkload = StageWorkload{};
+    if (!stage.localSimtOperations.empty()) {
+      llvm::DenseSet<Operation *> selected;
+      for (Operation *localRoot : stage.localSimtOperations) {
+        selected.insert(localRoot);
+        localRoot->walk(
+            [&](Operation *nested) { selected.insert(nested); });
+      }
+      auto accumulateSelected = [&](auto &&self, Operation *operation,
+                                    double multiplicity) -> void {
+        if (!operation)
+          return;
+        if (selected.contains(operation)) {
+          StageWorkload local;
+          accumulateOneOperation(operation, local);
+          scaleWorkload(local, multiplicity);
+          mergeWorkload(stage.localSimtWorkload, std::move(local));
+        }
+        if (operation->hasAttr("ta.auto_blockify_v1.loop"))
+          return;
+        const double childMultiplicity =
+            multiplicity * static_cast<double>(
+                               getLoopTripCount(operation,
+                                                fallbackLoopTripCount));
+        for (Region &region : operation->getRegions())
+          for (Block &block : region)
+            for (Operation &nested : block.getOperations())
+              self(self, &nested, childMultiplicity);
+      };
+      for (Operation *root : stage.operations)
+        accumulateSelected(accumulateSelected, root,
+                           semanticRootEntryMultiplicity(root, splitLoopBody));
+      scaleWorkload(stage.localSimtWorkload,
+                    1.0 / static_cast<double>(
+                              std::max<int64_t>(1, stage.iterationCount)));
+      recomputeIssueElements(stage.localSimtWorkload);
+    }
     if (!stage.workload.isFiniteAndNonNegative())
       return llvm::createStringError(
           std::errc::invalid_argument,
@@ -1547,7 +1594,7 @@ StageModeLegalityAnalysis::analyze(StagePartition &partition,
   // a smaller runtime grid).
   const int64_t localMaximum = scopeSuperblockMaterializable ? maximum : 1;
   for (LogicalStage &stage : partition.stages) {
-    stage.simdLegal = true;
+    stage.simdLegal = stage.allAnchorsSimdLowerable;
     stage.simtLegal = true;
     stage.legalSimtFactors = {1};
     // A pure-SIMT SuperBlock factor is a whole-kernel schedule, not a
