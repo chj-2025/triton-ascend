@@ -136,6 +136,7 @@ add_triton_plugin(TritonAscend
   LINK_LIBS
   AutoBlockifyV1
   TTIRLayoutMerge
+  TritonToGraph
   TritonToLinalg
   BiShengIRScopeDialect
   BiShengIRHIVMDialect
