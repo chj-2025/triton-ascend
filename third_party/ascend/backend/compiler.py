@@ -265,12 +265,11 @@ def _apply_cpp_simd_simt_decision(metadata, effective: str, superblock_factor: i
         # stages add mixed-runtime flags even though no SIMT scope exists.
         metadata["compile_mode"] = "simd"
         metadata["parallel_mode"] = "simd"
-        # SIMT AutoBlockify V1 uses the SIMT block/thread execution contract.
-        # It may be present on the analysis copy so StagePartitioner can see
-        # its scheduling loop, but an all-SIMD executable must launch the
-        # original logical grid and must not request the NPUIR V1 pass.
-        metadata["auto_blockify_v1_enabled"] = False
-        metadata["auto_blockify_v1_runtime_cap"] = False
+        # All-SIMD can still execute AutoBlockify V1 as a logical-program loop.
+        # Keep the policy resolved before the cost model instead of disabling it.
+        v1_materializable = bool(metadata.get("route_transform_v1_materializable", False))
+        metadata["auto_blockify_v1_enabled"] = v1_materializable
+        metadata["auto_blockify_v1_runtime_cap"] = v1_materializable
     elif effective == "mixed_simd_simt":
         metadata["auto_simt_requested_kind"] = effective
         # Mixed execution still needs V1 at factor one: its persistent
@@ -300,7 +299,8 @@ def _selected_npuir_superblock_factor(metadata, opt) -> int:
     unconditionally made an old/default F1 value shadow explicit F2/F4.
     """
     effective = metadata.get("auto_simt_effective_kind")
-    if effective == "mixed_simd_simt" or (effective is None and metadata.get("compile_mode") == "simd_simt"):
+    if (effective in ("all_simd", "mixed_simd_simt")
+            or (effective is None and metadata.get("compile_mode") == "simd_simt")):
         # The process-wide factor owns the surrounding SIMD/AIC scheduling
         # graph and must stay F1. The selected F2/F4 value is carried on the
         # scope itself and restored only in its outlined SIMT module.
@@ -1325,8 +1325,11 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
 
         if metadata["auto_blockify_enabled"]:
             _compile_option_list += ["--enable-auto-blockify-loop"]
-            selected_factor = _selected_npuir_superblock_factor(metadata, opt)
-            _compile_option_list += [f"--super-block-factor={selected_factor}"]
+            # Only mixed/local-scope routes carry a SuperBlock factor; all-SIMD
+            # and ordinary SIMD keep the historical F1 autoblockify behavior.
+            if metadata.get("parallel_mode") == "mix_simd_simt":
+                selected_factor = _selected_npuir_superblock_factor(metadata, opt)
+                _compile_option_list += [f"--super-block-factor={selected_factor}"]
             metadata["auto_blockify_v1_runtime_cap"] = True
         elif not metadata.get("ta_auto_blockify_v1_materialized", False):
             metadata["auto_blockify_v1_runtime_cap"] = False
