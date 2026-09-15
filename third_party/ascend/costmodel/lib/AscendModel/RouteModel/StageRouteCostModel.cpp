@@ -1,6 +1,7 @@
 //===- StageRouteCostModel.cpp - Logical-stage route solver ---------------===//
 
 #include "AscendModel/RouteModel/StageRouteCostModel.h"
+#include "AscendModel/Support/CostModelLogger.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -94,6 +95,30 @@ static void removeAutoBlockifyCostFromAllSIMD(StageRoutePlan &plan,
     plan.entryTransitionCycles[index] = 0.0;
   }
   plan.totalCycles = std::max(0.0, plan.totalCycles);
+}
+
+/// One log block per candidate route: legality, factor, per-Stage mode and
+/// cycles, and the summed total.
+static void logRoutePlan(llvm::StringRef name, const StageRoutePlan &plan,
+                         const StageCostTable &costTable) {
+  llvm::raw_ostream &os = costModelLog();
+  os << "route " << name << ": legal=" << plan.legal
+     << " factor=" << plan.routeSuperblockFactor
+     << " total=" << plan.totalCycles << " cycles";
+  if (plan.runtimePhysicalProgramCount > 0)
+    os << " (physicalPrograms=" << plan.runtimePhysicalProgramCount
+       << " waves=" << plan.runtimeWaveCount << ")";
+  os << "\n";
+  for (size_t index = 0; index < plan.implementations.size(); ++index) {
+    const StageImplementation &implementation = plan.implementations[index];
+    costModelLog() << "  stage '" << costTable.stages[index].id << "': "
+                   << stringifyStageMode(implementation.mode)
+                   << " factor=" << implementation.superblockFactor
+                   << (implementation.localScope ? " local_scope" : "")
+                   << " cycles=" << plan.logicalStageCycles[index]
+                   << " transition=" << plan.entryTransitionCycles[index]
+                   << "\n";
+  }
 }
 
 } // namespace
@@ -383,6 +408,7 @@ llvm::json::Object StageCostModelSummary::toJSON() const {
 llvm::Expected<StageCostModelSummary>
 mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
                                const StageTransitionCost &transition) {
+  COSTMODEL_TRACE("solveStageRoutes");
   if (costTable.stages.empty())
     return llvm::createStringError(std::errc::invalid_argument,
                                    "stage route model requires at least one "
@@ -604,6 +630,12 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
   result.allSimt = bestFactoredPlan(StageKernelRouteKind::AllSIMT);
   result.mixed = bestFactoredPlan(StageKernelRouteKind::Mixed);
   removeAutoBlockifyCostFromAllSIMD(result.allSimd, costTable);
+
+  if (logEnabled()) {
+    logRoutePlan("all_simd", result.allSimd, costTable);
+    logRoutePlan("all_simt_only", result.allSimt, costTable);
+    logRoutePlan("mixed_simd_simt", result.mixed, costTable);
+  }
 
   return result;
 }

@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AscendModel/Analysis/SimtAnchorAnalysis.h"
+#include "AscendModel/Support/CostModelLogger.h"
 #include "AscendModel/Transforms/Passes.h"
 #include "AscendModel/Transforms/SimtSelection.h"
 
@@ -163,6 +164,9 @@ static LogicalResult wrapAnchorRange(ArrayRef<Operation *> ops,
 LogicalResult materializeSimtAnchorPlan(ModuleOp module,
                                         const SimtAnchorPlan &plan,
                                         int64_t superblockFactor) {
+  COSTMODEL_TRACE("materializeSimtAnchorPlan");
+  costModelLog() << "input: module anchors=" << plan.anchors.size()
+                 << " superblock_factor=" << superblockFactor << "\n";
   if (superblockFactor <= 0 || (superblockFactor & (superblockFactor - 1)) != 0)
     return module.emitError(
         "SIMT scope superblock factor must be a positive power of two");
@@ -174,12 +178,32 @@ LogicalResult materializeSimtAnchorPlan(ModuleOp module,
   SmallVector<PlannedRange> anchorRanges;
   DenseSet<Operation *> coveredByRange;
 
-  for (const SimtAnchorDescriptor &anchor : plan.anchors) {
+  for (auto indexedAnchor : llvm::enumerate(plan.anchors)) {
+    const size_t index = indexedAnchor.index();
+    const SimtAnchorDescriptor &anchor = indexedAnchor.value();
     Operation *op = anchor.operation;
-    if (!anchor.materializable || !op || coveredByRange.contains(op))
+    auto logAnchorDecision = [&](llvm::StringRef action) {
+      llvm::raw_ostream &os = costModelDebug();
+      os << "anchor[" << index << "]: action=" << action
+         << " kind=" << stringifySimtAnchorKind(anchor.kind)
+         << " materializable=" << anchor.materializable;
+      if (op)
+        os << " op=" << op->getName().getStringRef() << " " << op->getLoc();
+      os << " scopeOperations=" << anchor.scopeOperations.size() << "\n";
+    };
+    if (!anchor.materializable || !op) {
+      logAnchorDecision(!op ? "skip_null_operation"
+                            : "skip_not_materializable");
       continue;
-    if (hasEnclosingVectorMode(op, "simt"))
+    }
+    if (coveredByRange.contains(op)) {
+      logAnchorDecision("skip_covered_by_compound_range");
       continue;
+    }
+    if (hasEnclosingVectorMode(op, "simt")) {
+      logAnchorDecision("skip_already_inside_simt_scope");
+      continue;
+    }
 
     if (anchor.scopeOperations.size() > 1) {
       for (Operation *rangeOp : anchor.scopeOperations)
@@ -188,13 +212,17 @@ LogicalResult materializeSimtAnchorPlan(ModuleOp module,
       llvm::append_range(range.operations, anchor.scopeOperations);
       range.insertionPoint = anchor.scopeInsertionPoint;
       anchorRanges.push_back(std::move(range));
+      logAnchorDecision("plan_compound_scope");
       continue;
     }
 
-    if (!isMaterializable(op))
+    if (!isMaterializable(op)) {
+      logAnchorDecision("error_not_materializable");
       return op->emitError(
           "SIMT anchor is not materializable as a local scope");
+    }
     anchorOps.push_back(op);
+    logAnchorDecision("plan_single_operation_scope");
   }
 
   int64_t materialized = 0;
@@ -213,6 +241,7 @@ LogicalResult materializeSimtAnchorPlan(ModuleOp module,
   if (materialized == 0)
     return module.emitError(
         "mixed_simd_simt has no materializable local SIMT scope");
+  costModelLog() << "output: materialized scopes=" << materialized << "\n";
   return success();
 }
 
