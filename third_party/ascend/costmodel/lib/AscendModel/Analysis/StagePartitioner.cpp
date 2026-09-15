@@ -28,6 +28,8 @@ static void recomputeIssueElements(StageWorkload &work) {
   for (const auto &entry : work.operationElements)
     elements += entry.second;
   elements += 32.0 * (work.loadWarpInstructions + work.storeWarpInstructions);
+  for (const AtomicWorkload &atomic : work.atomicWorkloads)
+    elements += atomic.logicalElements;
   work.issueElements = elements;
 }
 
@@ -187,6 +189,51 @@ static void accumulateReductionWorkload(Operation *operation,
     work.scanShuffleLaneSteps += steps;
 }
 
+static std::string getAtomicEnumName(Operation *operation,
+                                     llvm::StringRef attribute,
+                                     llvm::ArrayRef<llvm::StringRef> names) {
+  auto value = operation->getAttrOfType<IntegerAttr>(attribute);
+  if (!value || value.getInt() < 0 ||
+      static_cast<size_t>(value.getInt()) >= names.size() ||
+      names[value.getInt()].empty())
+    return "unknown";
+  return names[value.getInt()].str();
+}
+
+static AtomicWorkload getAtomicWorkload(Operation *operation) {
+  static const llvm::StringRef rmwNames[] = {"",     "and",  "or",  "xor",
+                                             "add",  "fadd", "max", "min",
+                                             "umax", "umin", "exch"};
+  static const llvm::StringRef semanticNames[] = {"", "relaxed", "acquire",
+                                                  "release", "acq_rel"};
+  static const llvm::StringRef scopeNames[] = {"", "gpu", "cta", "sys"};
+  const llvm::StringRef name = operation->getName().getStringRef();
+  AtomicWorkload atomic;
+  atomic.kind = name == "tt.atomic_cas"
+                    ? "cas"
+                    : getAtomicEnumName(operation, "atomic_rmw_op", rmwNames);
+  atomic.memorySemantic = getAtomicEnumName(operation, "sem", semanticNames);
+  atomic.memoryScope = getAtomicEnumName(operation, "scope", scopeNames);
+  const unsigned valueOperand = name == "tt.atomic_cas" ? 2 : 1;
+  Value value = operation->getNumOperands() > valueOperand
+                    ? operation->getOperand(valueOperand)
+                    : Value{};
+  Type elementType = value ? getScalarElementType(value.getType()) : Type{};
+  atomic.dataType = elementType ? typeToString(elementType) : "unknown";
+  atomic.logicalElements = value ? getTypeElementCount(value.getType()) : 0.0;
+  atomic.logicalOperationInstances = 1.0;
+  atomic.resultUsed =
+      operation->getNumResults() > 0 && !operation->getResult(0).use_empty();
+  atomic.addressDependsOnLoadedIndex =
+      isLoadedIndexDependentMemoryOp(operation);
+  // TTIR tensor shape alone does not prove that addresses are contiguous or
+  // collision-free.  Keep both facts unknown until an address injectivity
+  // analysis or a cache-keyed launch hint is available.
+  atomic.provenContiguousRunWidth = 0.0;
+  atomic.contentionUnknown = true;
+  return atomic;
+}
+
 static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
   if (!operation || operation->hasTrait<OpTrait::IsTerminator>())
     return;
@@ -196,16 +243,31 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
   if ((name == "tt.load" || name == "tt.gather") &&
       operation->getNumResults() > 0) {
     Value result = operation->getResult(0);
-    work.loadBytes += getValueBytes(result);
-    work.loadWarpInstructions += std::ceil(elements / 32.0);
+    const double bytes = getValueBytes(result);
+    const double logicalMemoryGroups = std::ceil(elements / 32.0);
+    work.loadBytes += bytes;
+    work.loadWarpInstructions += logicalMemoryGroups;
+    if (name == "tt.gather" || isLoadedIndexDependentMemoryOp(operation)) {
+      work.indirectLoadBytes += bytes;
+      work.indirectLoadTransactions += logicalMemoryGroups;
+    }
     return;
   }
-  if ((name == "tt.store" || name.starts_with("tt.atomic")) &&
-      operation->getNumOperands() > 1) {
+  if (name == "tt.store" && operation->getNumOperands() > 1) {
     Value value = operation->getOperand(1);
-    work.storeBytes += getValueBytes(value);
-    work.storeWarpInstructions +=
+    const double bytes = getValueBytes(value);
+    const double logicalMemoryGroups =
         std::ceil(getTypeElementCount(value.getType()) / 32.0);
+    work.storeBytes += bytes;
+    work.storeWarpInstructions += logicalMemoryGroups;
+    if (isLoadedIndexDependentMemoryOp(operation)) {
+      work.indirectStoreBytes += bytes;
+      work.indirectStoreTransactions += logicalMemoryGroups;
+    }
+    return;
+  }
+  if (name.starts_with("tt.atomic")) {
+    work.atomicWorkloads.push_back(getAtomicWorkload(operation));
     return;
   }
   if (name == "tt.dot") {
@@ -236,6 +298,14 @@ static void scaleWorkload(StageWorkload &work, double scale) {
   work.storeBytes *= scale;
   work.loadWarpInstructions *= scale;
   work.storeWarpInstructions *= scale;
+  work.indirectLoadBytes *= scale;
+  work.indirectStoreBytes *= scale;
+  work.indirectLoadTransactions *= scale;
+  work.indirectStoreTransactions *= scale;
+  for (AtomicWorkload &atomic : work.atomicWorkloads) {
+    atomic.logicalElements *= scale;
+    atomic.logicalOperationInstances *= scale;
+  }
   work.predicateElements *= scale;
   work.shuffleLaneSteps *= scale;
   work.scanShuffleLaneSteps *= scale;
@@ -325,6 +395,11 @@ static void mergeWorkload(StageWorkload &into, StageWorkload from) {
   into.storeBytes += from.storeBytes;
   into.loadWarpInstructions += from.loadWarpInstructions;
   into.storeWarpInstructions += from.storeWarpInstructions;
+  into.indirectLoadBytes += from.indirectLoadBytes;
+  into.indirectStoreBytes += from.indirectStoreBytes;
+  into.indirectLoadTransactions += from.indirectLoadTransactions;
+  into.indirectStoreTransactions += from.indirectStoreTransactions;
+  llvm::append_range(into.atomicWorkloads, std::move(from.atomicWorkloads));
   into.predicateElements += from.predicateElements;
   into.shuffleLaneSteps += from.shuffleLaneSteps;
   into.scanShuffleLaneSteps += from.scanShuffleLaneSteps;
@@ -542,6 +617,8 @@ static StageCostModelKind classifySemanticRoot(Operation *root) {
     return StageCostModelKind::RowwiseReduction;
   if (operationTreeHasAnyName(root, {"tt.dot"}))
     return StageCostModelKind::CubeRoofline;
+  if (operationTreeHasAnyName(root, {"tt.atomic_rmw", "tt.atomic_cas"}))
+    return StageCostModelKind::AtomicMemory;
   if (operationTreeContainsLoadedIndexMemory(root) ||
       operationTreeHasAnyName(root, {"tt.gather"}))
     return StageCostModelKind::IndirectGatherMemory;
@@ -572,6 +649,8 @@ static StageScheduleKind scheduleForSemanticRoot(Operation *root,
   if (kind == StageCostModelKind::LoopCarriedRecurrence)
     return StageScheduleKind::LoopCarriedSerial;
   if (kind == StageCostModelKind::IndirectGatherMemory)
+    return StageScheduleKind::PartiallyDependent;
+  if (kind == StageCostModelKind::AtomicMemory)
     return StageScheduleKind::PartiallyDependent;
   if (kind == StageCostModelKind::AutoBlockifyLoop ||
       kind == StageCostModelKind::IndependentPipelinedLoop ||
@@ -838,6 +917,8 @@ static int semanticKindPriority(StageCostModelKind kind) {
   case StageCostModelKind::CubeRoofline:
   case StageCostModelKind::TinyCubeRoofline:
     return 70;
+  case StageCostModelKind::AtomicMemory:
+    return 65;
   case StageCostModelKind::IndirectScalarMemory:
   case StageCostModelKind::IndirectGatherMemory:
     return 60;
@@ -1055,6 +1136,7 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
     for (Operation *root : stage.operations)
       collectOwnedOperationTree(root, owned);
     bool hasMemory = false;
+    bool hasContiguousMemory = false;
     int64_t algorithmLoopCount = 0;
     if (stage.costModelKind != StageCostModelKind::AutoBlockifyDispatch &&
         stage.costModelKind != StageCostModelKind::AutoBlockifyLoop)
@@ -1094,12 +1176,17 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
       }
       if (name.contains("barrier") || name.contains("sync"))
         ++facts.synchronizationCount;
-      if (name == "tt.load" || name == "tt.store" || name == "tt.gather" ||
-          name.starts_with("tt.atomic")) {
+      if (name == "tt.load" || name == "tt.store" || name == "tt.gather") {
         hasMemory = true;
-        facts.hasIndirectMemory |= isLoadedIndexDependentMemoryOp(operation) ||
-                                   name == "tt.gather" ||
-                                   name.starts_with("tt.atomic");
+        const bool indirect =
+            isLoadedIndexDependentMemoryOp(operation) || name == "tt.gather";
+        facts.hasIndirectMemory |= indirect;
+        hasContiguousMemory |= !indirect;
+      }
+      if (name.starts_with("tt.atomic")) {
+        hasMemory = true;
+        facts.hasAtomicMemory = true;
+        facts.hasIndirectMemory |= isLoadedIndexDependentMemoryOp(operation);
       }
       facts.hasReduction |=
           name == "tt.reduce" || name == "tt.scan" || name == "linalg.reduce";
@@ -1113,7 +1200,7 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
           name == "tt.fp_to_fp" || name.contains("convert") ||
           name.contains("pack") || name.contains("unpack");
     }
-    facts.hasContiguousMemory = hasMemory && !facts.hasIndirectMemory;
+    facts.hasContiguousMemory = hasMemory && hasContiguousMemory;
     if (algorithmLoopCount > 0 && stage.iterationCount > 1) {
       if (facts.hasLoopCarriedDataDependency)
         facts.parallelRecurrenceGroupCount = algorithmLoopCount;
@@ -1154,6 +1241,8 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
     case StageCostModelKind::IndirectScalarMemory:
     case StageCostModelKind::IndirectGatherMemory:
       return facts.hasIndirectMemory;
+    case StageCostModelKind::AtomicMemory:
+      return facts.hasAtomicMemory;
     case StageCostModelKind::ContinuousTileMemory:
     case StageCostModelKind::ContinuousTileStore:
     case StageCostModelKind::ContinuousShortLoad:
@@ -1170,8 +1259,9 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
     if (stage.costModelKind == StageCostModelKind::AutoBlockifyDispatch ||
         stage.costModelKind == StageCostModelKind::AutoBlockifyLoop)
       continue;
-    if (facts.hasDot && (facts.hasReduction || facts.hasIndirectMemory ||
-                         facts.hasLoopCarriedDataDependency))
+    if (facts.hasDot &&
+        (facts.hasReduction || facts.hasIndirectMemory ||
+         facts.hasAtomicMemory || facts.hasLoopCarriedDataDependency))
       return llvm::createStringError(
           std::errc::invalid_argument,
           "requires_split: Stage '%s' owns incompatible dominant structures",
@@ -1192,6 +1282,8 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
                    : StageCostModelKind::CubeRoofline;
       if (facts.hasLoop)
         return StageCostModelKind::IndependentPipelinedLoop;
+      if (facts.hasAtomicMemory)
+        return StageCostModelKind::AtomicMemory;
       if (facts.hasIndirectMemory)
         return StageCostModelKind::IndirectGatherMemory;
       if (facts.hasConversionPack)
