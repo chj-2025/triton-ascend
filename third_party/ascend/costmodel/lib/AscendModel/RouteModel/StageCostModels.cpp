@@ -337,6 +337,13 @@ static double estimateStage(const LogicalStage &stage,
                                           r.atomic, r.issue}));
     return serial;
   default:
+    if (mode == StageMode::SIMD)
+      return r.setup +
+             count *
+                 (std::max({r.load, r.store, r.atomic,
+                            r.compute + r.dot + r.shuffle,
+                            r.scalar + r.predicate + controlBody(r), r.issue}) +
+                  r.spill);
     return serial;
   }
 }

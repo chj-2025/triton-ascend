@@ -110,6 +110,10 @@ LogicalResult materializeSimtAnchorPlan(ModuleOp module,
 /// be confused with the legacy rank-based laneDependentPointerOps proxy.
 bool isLoadedIndexDependentMemoryOp(Operation *op);
 
+/// True when a proper descendant matches a shared SIMT anchor pattern.
+/// This checks structural presence, independent of target materializability.
+bool hasSimtAnchorInBody(Operation *operation);
+
 /// Build the non-overlapping shared plan in pre-order.
 SimtAnchorPlan buildMixedSimtAnchorPlan(ModuleOp module, bool compileOn91095);
 
