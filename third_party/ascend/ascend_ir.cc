@@ -630,10 +630,9 @@ void init_ascend_ir(py::module &&m) {
 
   m.def("set_simt_scope_superblock_factor",
         [](OpState &root, int64_t factor) -> int64_t {
-          if (!ascend::isSupportedSuperBlockFactor(factor))
+          if (!ascend::isSupportedScopeSuperBlockFactor(factor))
             throw std::invalid_argument(
-                "SIMT scope SuperBlock factor must be one of "
-                "1, 2, 4, 8, 16 or 32");
+                "SIMT scope SuperBlock factor must be one of 1, 2 or 4");
           int64_t updated = 0;
           root->walk([&](Operation *op) {
             if (op->getName().getStringRef() != "scope.scope")

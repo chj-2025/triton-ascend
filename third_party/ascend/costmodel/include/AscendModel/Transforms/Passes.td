@@ -191,7 +191,7 @@ def SelectSimdSimtCostModelPass
            /*default=*/"false",
            "Whether backend integration can materialize mixed SuperBlock with AutoBlockify V1">,
     Option<"maximumWholeKernelSuperblockFactor", "maximum-whole-kernel-superblock-factor", "int64_t",
-           /*default=*/"32",
+           /*default=*/"64",
            "Largest whole-kernel SuperBlock factor accepted by the backend">,
     Option<"maximumScopeSuperblockFactor", "maximum-scope-superblock-factor", "int64_t",
            /*default=*/"4",

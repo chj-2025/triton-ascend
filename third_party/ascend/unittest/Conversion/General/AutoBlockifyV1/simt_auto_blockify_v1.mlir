@@ -3,6 +3,8 @@
 // RUN: triton-opt --ta-simt-auto-blockify-v1="physical-vector-core-count=64 superblock-factor=1" --ta-refine-simt-auto-blockify-v1-superblock="superblock-factor=2" %s | FileCheck %s --check-prefix=REFINE
 // RUN: triton-opt --ta-simt-auto-blockify-v1="physical-vector-core-count=64 superblock-factor=32" %s | FileCheck %s --check-prefix=SUPERBLOCK32
 // RUN: triton-opt --ta-simt-auto-blockify-v1="physical-vector-core-count=64 superblock-factor=1" --ta-refine-simt-auto-blockify-v1-superblock="superblock-factor=32" %s | FileCheck %s --check-prefix=REFINE32
+// RUN: triton-opt --ta-simt-auto-blockify-v1="physical-vector-core-count=64 superblock-factor=64" %s | FileCheck %s --check-prefix=SUPERBLOCK64
+// RUN: triton-opt --ta-simt-auto-blockify-v1="physical-vector-core-count=64 superblock-factor=1" --ta-refine-simt-auto-blockify-v1-superblock="superblock-factor=64" %s | FileCheck %s --check-prefix=REFINE64
 
 // V1-LABEL: tt.func public @v1_keeps_tile_shape(
 // V1-SAME: attributes {ta.auto_blockify_v1, ta.auto_blockify_v1.superblock_factor = 1 : i32}
@@ -70,6 +72,26 @@
 // REFINE32: %[[LINEAR:.*]] = arith.addi %[[IV]], %[[TASK]] {{.*}} : i32
 // REFINE32: scf.if
 // REFINE32: tt.store
+
+// SUPERBLOCK64-LABEL: tt.func public @v1_keeps_tile_shape(
+// SUPERBLOCK64-SAME: attributes {ta.auto_blockify_v1, ta.auto_blockify_v1.superblock_factor = 64 : i32}
+// SUPERBLOCK64: %[[SIXTY_FOUR:.*]] = arith.constant {{.*}}64 : i32
+// SUPERBLOCK64: %[[SIXTY_FOUR_STEP:.*]] = arith.constant {{.*}}64 : i32
+// SUPERBLOCK64: scf.for %[[IV:.*]] = {{.*}} to %[[UPPER:.*]] step %[[SIXTY_FOUR_STEP]] : i32 {
+// SUPERBLOCK64: %[[TASK:.*]] = arith.remui {{.*}}, %[[SIXTY_FOUR_STEP]] {{.*}} : i32
+// SUPERBLOCK64: %[[LINEAR:.*]] = arith.addi %[[IV]], %[[TASK]] {{.*}} : i32
+// SUPERBLOCK64: scf.if
+// SUPERBLOCK64: tt.store
+
+// REFINE64-LABEL: tt.func public @v1_keeps_tile_shape(
+// REFINE64-SAME: attributes {ta.auto_blockify_v1, ta.auto_blockify_v1.superblock_factor = 64 : i32}
+// REFINE64: %[[SIXTY_FOUR:.*]] = arith.constant {{.*}}64 : i32
+// REFINE64: %[[SIXTY_FOUR_STEP:.*]] = arith.constant {{.*}}64 : i32
+// REFINE64: scf.for %[[IV:.*]] = {{.*}} to %[[UPPER:.*]] step %[[SIXTY_FOUR_STEP]] : i32 {
+// REFINE64: %[[TASK:.*]] = arith.remui {{.*}}, %[[SIXTY_FOUR_STEP]] {{.*}} : i32
+// REFINE64: %[[LINEAR:.*]] = arith.addi %[[IV]], %[[TASK]] {{.*}} : i32
+// REFINE64: scf.if
+// REFINE64: tt.store
 
 module {
   tt.func public @v1_keeps_tile_shape(%arg0: !tt.ptr<f32>) {

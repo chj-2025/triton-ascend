@@ -68,6 +68,8 @@ class CompilerCostmodelContractTest(unittest.TestCase):
                 "_is_ascend_sanitizer_enabled",
                 "_is_debug_line_info_disabled",
                 "_is_auto_map_parallel_blocks_enabled",
+                "_get_modeled_superblock_factors",
+                "_get_current_scope_superblock_factors",
                 "_get_auto_blockify_blacklist_reasons",
                 "_warn_auto_blockify_disabled",
                 "downgrade_llir",
@@ -233,16 +235,14 @@ class CompilerCostmodelContractTest(unittest.TestCase):
     def test_all_bishengir_entries_share_debug_info_option(self):
         cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
 
-        options = []
-        cmplr._append_debug_info_option(options)
-        self.assertEqual(options, ["--enable-debug-info=true"])
-        source = inspect.getsource(cmplr.ttir_to_npubin)
-        self.assertIn("_append_debug_info_option(_compile_option_list)", source)
-
-        cmplr._is_debug_line_info_disabled = lambda: True
-        options = []
-        cmplr._append_debug_info_option(options)
-        self.assertEqual(options, [])
+        for entry in (
+                cmplr.linalg_to_bin_enable_npu_compile_910_95,
+                cmplr.linalg_to_bin_enable_npu_compile_A2_A3,
+                cmplr.ttir_to_npubin,
+        ):
+            source = inspect.getsource(entry)
+            self.assertIn("if not _is_debug_line_info_disabled():", source)
+            self.assertIn('_compile_option_list += ["--enable-debug-info=true"]', source)
 
 
 if __name__ == "__main__":

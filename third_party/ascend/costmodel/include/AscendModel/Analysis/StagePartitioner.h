@@ -73,7 +73,7 @@ public:
 class StageModeLegalityAnalysis {
 public:
   llvm::Error analyze(StagePartition &partition,
-                      int64_t maximumSuperblockFactor = 32,
+                      int64_t maximumSuperblockFactor = 64,
                       bool scopeSuperblockMaterializable = false,
                       int64_t maximumScopeSuperblockFactor = 4) const;
 };

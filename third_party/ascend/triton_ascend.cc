@@ -133,7 +133,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("compile_on_910_95"),
       py::arg("whole_kernel_superblock_materializable") = false,
       py::arg("scope_superblock_materializable") = false,
-      py::arg("maximum_whole_kernel_superblock_factor") = 32,
+      py::arg("maximum_whole_kernel_superblock_factor") = 64,
       py::arg("maximum_scope_superblock_factor") = 4,
       py::arg("logical_program_count_hint") = 0,
       py::arg("analysis_module_path") = "",
