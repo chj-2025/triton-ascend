@@ -620,7 +620,7 @@ def _is_auto_map_parallel_blocks_enabled() -> bool:
 
 
 def _get_modeled_superblock_factors():
-    return (1, 2, 4, 8, 16, 32)
+    return (1, 2, 4, 8, 16, 32, 64)
 
 
 def _get_current_scope_superblock_factors():

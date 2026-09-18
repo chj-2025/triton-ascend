@@ -97,7 +97,7 @@ def test_route_transform_capability_is_single_resolved_fact():
     assert capability["layout_coalescing_applied"]
     assert capability["layout_coalescing_factor"] == 8
     assert capability["auto_blockify_v1_materializable"]
-    assert capability["modeled_superblock_factors"] == [1, 2, 4, 8, 16, 32]
+    assert capability["modeled_superblock_factors"] == [1, 2, 4, 8, 16, 32, 64]
     assert capability["whole_kernel_superblock_factors"] == [1, 2, 4, 8, 16]
     assert capability["scope_superblock_factors"] == [1, 2, 4]
     assert capability["source_logical_program_count_hint"] == 9
@@ -115,7 +115,7 @@ def test_route_transform_capability_is_single_resolved_fact():
 @pytest.mark.parametrize(
     "num_warps,expected",
     [
-        (1, [1, 2, 4, 8, 16, 32]),
+        (1, [1, 2, 4, 8, 16, 32, 64]),
         (2, [1, 2, 4, 8, 16, 32]),
         (4, [1, 2, 4, 8, 16]),
         (8, [1, 2, 4, 8]),
@@ -178,27 +178,29 @@ def test_selected_npuir_superblock_factor_respects_route_owner(metadata, option_
     assert _selected_npuir_superblock_factor(metadata, opt) == expected
 
 
+@pytest.mark.parametrize("selected_factor", [32, 64])
 @pytest.mark.parametrize(
-    "ta_materializes,runtime_cap,expected",
+    "ta_materializes,runtime_cap,expected_prefix",
     [
-        (False, True, ["--enable-auto-blockify-loop", "--super-block-factor=32"]),
-        (True, True, ["--super-block-factor=32"]),
-        (True, False, []),
+        (False, True, ["--enable-auto-blockify-loop"]),
+        (True, True, []),
+        (True, False, None),
     ],
 )
-def test_pure_simt_passes_selected_factor_to_bishengir(ta_materializes, runtime_cap, expected):
+def test_pure_simt_passes_selected_factor_to_bishengir(selected_factor, ta_materializes, runtime_cap, expected_prefix):
     options = []
     metadata = {
         "auto_blockify_v1_enabled": True,
         "auto_blockify_v1_runtime_cap": runtime_cap,
         "auto_simt_effective_kind": "all_simt_only",
-        "auto_simt_superblock_factor": 32,
+        "auto_simt_superblock_factor": selected_factor,
     }
     opt = SimpleNamespace(
         enable_ta_auto_blockify_v1=ta_materializes,
         superblock_factor=1,
     )
     _append_pure_simt_auto_blockify_options(options, metadata, opt)
+    expected = ([] if expected_prefix is None else [*expected_prefix, f"--super-block-factor={selected_factor}"])
     assert options == expected
 
 

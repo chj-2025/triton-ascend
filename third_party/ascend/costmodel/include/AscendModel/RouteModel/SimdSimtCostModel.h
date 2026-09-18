@@ -82,7 +82,7 @@ struct SimdSimtCostModelOptions {
   /// kernel.  This is deliberately independent of local-scope batching.
   bool wholeKernelSuperblockMaterializable = false;
   /// Largest factor accepted by the whole-kernel backend contract.
-  int64_t maximumWholeKernelSuperblockFactor = 32;
+  int64_t maximumWholeKernelSuperblockFactor = 64;
   /// Largest factor accepted by the outlined local-scope backend contract.
   int64_t maximumScopeSuperblockFactor = 4;
   /// Optional runtime launch count. Zero means unknown; a positive value
