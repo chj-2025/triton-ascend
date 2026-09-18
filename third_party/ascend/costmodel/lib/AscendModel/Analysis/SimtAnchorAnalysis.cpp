@@ -646,6 +646,20 @@ bool mlir::ascend::isLoadedIndexDependentMemoryOp(Operation *op) {
          hasTensorPointerOperand(op) && pointerDependsOnLoadedIndex(op);
 }
 
+bool mlir::ascend::hasSimtAnchorInBody(Operation *operation) {
+  if (!operation)
+    return false;
+  return operation
+      ->walk<WalkOrder::PreOrder>([&](Operation *nested) {
+        if (nested == operation)
+          return WalkResult::advance();
+        return analyzeAnchor(nested, /*compileOn91095=*/false)
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
 SimtAnchorPlan mlir::ascend::buildMixedSimtAnchorPlan(ModuleOp module,
                                                       bool compileOn91095) {
   SimtAnchorPlan plan;
