@@ -1,0 +1,241 @@
+{
+  "$schema": "./simd_simt_profile_schema.json",
+  "schema_version": 14,
+  "profile_version": "ascend-950dt-simd-simt-20260912-draft",
+  "target": "Ascend950DT",
+  "description": "DRAFT / NOT RUNNABLE: independent Ascend950DT template. null means unknown, not zero or a PR fallback. See ../profiles/ascend_950dt_README.md (from configs) or profiles/ascend_950dt_README.md in the costmodel tree. Not calibrated; do not use for route scores.",
+  "microbenchmark_profile": "../microbench/ascend_950dt_v1.json",
+  "compatible_targets": [
+    "Ascend950DT*"
+  ],
+  "score_unit": "system_cycle_selection_score",
+  "selection_calibration": {
+    "description": "The only structural threshold consumed by the Stage partitioner. DT remains non-runnable until this model-domain boundary and the missing resource parameters are validated.",
+    "tiny_dot_flops_max": null,
+    "source": "PENDING: establish a DT tiny-dot formula domain; no PR route residuals or multipliers are imported."
+  },
+  "simd": {
+    "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts.",
+    "vector_width_measurement": "simd.vector_width_bits",
+    "startup_system_cycles": {
+      "description": "Fresh DT minimal observable SIMD Stage slope, including its completion barrier; memory-transfer startup is modeled separately per logical operation.",
+      "vector": 44.8475,
+      "source": "microbench/data_provider/950dt_setup_with_simd_1_20260913.csv and 950dt_setup_with_simd_2_20260913.csv",
+      "confidence": "medium",
+      "note": "A Stage setup proxy, not an isolated vector instruction latency. MTE2/MTE3 startup is not duplicated here."
+    },
+    "ops": {
+      "f32.add": {
+        "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts.",
+        "throughput_measurement": "simd.f32.add.throughput"
+      },
+      "f32.sub": {
+        "description": "IR-audited DT measurement. The factor is the measured f32.add vector-instruction rate divided by the f32.sub rate in otherwise identical compile-time-specialized binaries.",
+        "relative_to": "f32.add",
+        "factor": 1.000155,
+        "confidence": "medium"
+      },
+      "f32.mul": {
+        "description": "IR-audited DT measurement; four independent SIMD chains survive optimized LLVM IR.",
+        "relative_to": "f32.add",
+        "factor": 1.999897,
+        "confidence": "medium"
+      },
+      "f32.div": {
+        "description": "IR-audited DT measurement; four independent SIMD chains survive optimized LLVM IR.",
+        "relative_to": "f32.add",
+        "factor": 7.001289,
+        "confidence": "medium"
+      },
+      "f32.max": {
+        "description": "IR-audited DT measurement; four vmax instructions survive optimized LLVM IR.",
+        "relative_to": "f32.add",
+        "factor": 1.0,
+        "confidence": "medium"
+      },
+      "f32.abs": {
+        "description": "IR-audited DT measurement; four vabs instructions survive optimized LLVM IR.",
+        "relative_to": "f32.add",
+        "factor": 0.999639,
+        "confidence": "medium"
+      },
+      "f32.exp": {
+        "description": "Repeated, IR-audited DT SIMD vexp measurement with one finite-range operation per chain.",
+        "relative_to": "f32.add",
+        "factor": 7.01284,
+        "confidence": "medium"
+      },
+      "f32.log": {
+        "description": "Repeated, IR-audited DT SIMD vln measurement with one finite-range operation per chain.",
+        "relative_to": "f32.add",
+        "factor": 7.982208,
+        "confidence": "medium"
+      },
+      "predicate.cmp": {
+        "description": "Derived from repeated, IR-audited vcmp+vsel and vsel-only DT probes: C_cmp = C_pair - C_select.",
+        "relative_to": "f32.add",
+        "factor": 0.999974,
+        "confidence": "medium"
+      },
+      "predicate.select": {
+        "description": "IR-audited DT SIMD vsel measurement. Stage classification currently does not generate this key directly.",
+        "relative_to": "f32.add",
+        "factor": 1.000361,
+        "confidence": "medium"
+      },
+      "convert.cast": {
+        "description": "IR-audited round-trip conversion measurement; factor is per surviving conversion instruction.",
+        "relative_to": "f32.add",
+        "factor": 2.0,
+        "confidence": "medium"
+      },
+      "f32.clamp": {
+        "description": "IR-audited vmaxs+vmins pair; factor represents one semantic clamp lowering to two vector instructions.",
+        "relative_to": "f32.add",
+        "factor": 1.999742,
+        "confidence": "medium"
+      }
+    },
+    "memory": {
+      "description": "Two repeated single-AIV continuous GM-to-UB and UB-to-GM sweeps at 4/32/128 KiB. Rates and per-operation startup are a joint least-squares fit in SYS_CNT ticks.",
+      "vector_mte2_bytes_per_system_cycle": 167.608226,
+      "mte3_bytes_per_system_cycle": 213.142804,
+      "load_operation_startup_system_cycles": 105.984801,
+      "store_operation_startup_system_cycles": 91.298767,
+      "source": "data_provider/950dt_simd_memory_20260913.log and 950dt_simd_memory_repeat_20260913.log",
+      "confidence": "medium",
+      "note": "Per-AIV continuous DMA model. The separate fixed term is required; a bytes/rate-only formula does not fit short and long transfers."
+    },
+    "dot": {
+      "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts.",
+      "startup_system_cycles": null,
+      "flops_per_system_cycle": null,
+      "source": "PENDING: collect target-specific 950DT evidence; no 950PR measurement imported.",
+      "confidence": "low"
+    },
+    "stage_resources": {
+      "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts.",
+      "issue_instructions_per_system_cycle": null,
+      "prefix_scan": {
+        "step_latency_system_cycles": null,
+        "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts."
+      },
+      "indirect_memory": {},
+      "source": "PENDING: collect target-specific 950DT evidence; no 950PR measurement imported."
+    }
+  },
+  "simt": {
+    "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts.",
+    "warp_size_measurement": "simt.warp_size",
+    "setup_system_cycles": {
+      "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts.",
+      "empty_launch_measurement": "simt.setup.empty_with_barrier"
+    },
+    "ops": {
+      "f32.add": {
+        "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts.",
+        "throughput_measurement": "simt.f32.add.throughput"
+      },
+      "f32.sub": {
+        "description": "IR-audited DT specialized measurement. CCEC canonicalizes scalar subtraction by a constant to fadd with a negated operand.",
+        "relative_to": "f32.add",
+        "factor": 0.999915,
+        "confidence": "medium"
+      },
+      "f32.mul": {
+        "description": "IR-audited DT specialized measurement; eight scalar chains survive optimized LLVM IR.",
+        "relative_to": "f32.add",
+        "factor": 0.999942,
+        "confidence": "medium"
+      },
+      "f32.div": {
+        "description": "IR-audited DT specialized measurement; eight scalar chains survive optimized LLVM IR.",
+        "relative_to": "f32.add",
+        "factor": 1.999822,
+        "confidence": "medium"
+      },
+      "f32.max": {
+        "description": "IR-audited DT measurement using four independent cyclic value pairs so repeated max operations cannot be folded.",
+        "relative_to": "f32.add",
+        "factor": 2.687371,
+        "confidence": "medium"
+      },
+      "f32.abs": {
+        "description": "IR-audited DT measurement using four independent cyclic value pairs so repeated abs operations cannot be folded.",
+        "relative_to": "f32.add",
+        "factor": 1.320312,
+        "confidence": "medium"
+      },
+      "f32.exp": {
+        "description": "Repeated, IR-audited DT measurement of AscendC::Simt::Exp with one finite-range operation per chain. Eight semantic Exp calls survive as eight llvm.exp operations in the optimized SIMT VF.",
+        "relative_to": "f32.add",
+        "factor": 1.649316,
+        "confidence": "medium"
+      },
+      "f32.log": {
+        "description": "Repeated, IR-audited DT measurement of AscendC::Simt::Log with one finite-range operation per chain. The public API emits guarded normal/subnormal paths; each semantic call has two static llvm.log occurrences but executes one path.",
+        "relative_to": "f32.add",
+        "factor": 5.492562,
+        "confidence": "medium"
+      },
+      "predicate.cmp": {
+        "description": "Derived from repeated, IR-audited scalar compare+select and select-only DT probes: C_cmp = C_pair - C_select.",
+        "relative_to": "f32.add",
+        "factor": 1.523398,
+        "confidence": "medium"
+      },
+      "predicate.select": {
+        "description": "IR-audited DT specialized measurement with eight scalar select chains.",
+        "relative_to": "f32.add",
+        "factor": 1.164083,
+        "confidence": "medium"
+      },
+      "convert.cast": {
+        "description": "IR-audited DT round-trip conversion measurement; factor is per surviving scalar conversion.",
+        "relative_to": "f32.add",
+        "factor": 1.206945,
+        "confidence": "medium"
+      },
+      "f32.clamp": {
+        "description": "IR-audited DT cyclic-chain measurement. One semantic clamp is counted as its lower- and upper-bound primitive pair.",
+        "relative_to": "f32.add",
+        "factor": 2.687304,
+        "confidence": "medium"
+      }
+    },
+    "dot": {
+      "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts.",
+      "startup_system_cycles": null,
+      "flops_per_system_cycle": null,
+      "source": "PENDING: collect target-specific 950DT evidence; no 950PR measurement imported.",
+      "confidence": "low"
+    },
+    "shuffle": {
+      "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts.",
+      "throughput_measurement": "simt.shuffle.throughput",
+      "confidence": "low"
+    },
+    "memory": {
+      "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts.",
+      "load_throughput_measurement": "simt.gm.load.throughput",
+      "store_throughput_measurement": "simt.gm.store.throughput",
+      "confidence": "low"
+    },
+    "stage_resources": {
+      "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts.",
+      "issue_instructions_per_system_cycle": null,
+      "prefix_scan": {
+        "step_latency_system_cycles": null,
+        "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts."
+      },
+      "indirect_memory": {},
+      "scope_handoff": {
+        "fixed_scope_system_cycles": null,
+        "input_handoff_bytes_per_system_cycle": null,
+        "output_handoff_bytes_per_system_cycle": null,
+        "description": "950DT draft: field structure only; numeric values require DT evidence unless documented as architecture facts."
+      },
+      "source": "PENDING: collect target-specific 950DT evidence; no 950PR measurement imported."
+    }
+  }
+}

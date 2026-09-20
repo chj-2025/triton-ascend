@@ -35,10 +35,10 @@ enum class MemoryType {
 
 struct MemorySpace {
   std::string name;
-  MemoryType type;
-  size_t sizeBytes; // Total size in bytes
-  double bandwidthBytesPerCycle;
-  int latencyCycles;
+  MemoryType type = MemoryType::OnChipLocal;
+  size_t sizeBytes = 0; // Total size in bytes
+  double bandwidthBytesPerCycle = 0.0;
+  int latencyCycles = 0;
   std::string description;
 
   // Convenience methods
@@ -67,15 +67,15 @@ struct FractalSize {
 
 struct ComputeUnit {
   std::string name;
-  ComputeUnitType type;
+  ComputeUnitType type = ComputeUnitType::SIMDEngine;
 
   // Performance specs
-  double tflopsFP16;
-  double tflopsFP32;
-  double tflopsINT8;
+  double tflopsFP16 = 0.0;
+  double tflopsFP32 = 0.0;
+  double tflopsINT8 = 0.0;
 
   // Matrix engine specific - default tile size (for backward compatibility)
-  int tileM, tileN, tileK;
+  int tileM = 0, tileN = 0, tileK = 0;
 
   // Fractal sizes per data type (key: "fp16", "bf16", "fp32", "int8")
   llvm::StringMap<FractalSize> fractalSizes;
@@ -84,8 +84,8 @@ struct ComputeUnit {
   std::string outputSpace;
 
   // SIMD engine specific
-  int widthElements; // Number of elements processed per cycle
-  int widthBytes;
+  int widthElements = 0; // Number of elements processed per cycle
+  int widthBytes = 0;
   std::string computeSpace;
 
   std::vector<std::string> supportedOps;
@@ -101,11 +101,11 @@ struct DataMover {
   std::string description;
   std::string srcSpace;
   std::vector<std::string> dstSpaces;
-  double bandwidthBytesPerCycle;
-  int maxBurstBytes;
-  int alignmentBytes;
-  bool supportsAccumulate;
-  bool supportsCast;
+  double bandwidthBytesPerCycle = 0.0;
+  int maxBurstBytes = 0;
+  int alignmentBytes = 0;
+  bool supportsAccumulate = false;
+  bool supportsCast = false;
 };
 
 //===----------------------------------------------------------------------===//

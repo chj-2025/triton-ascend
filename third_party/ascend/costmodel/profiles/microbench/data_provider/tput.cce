@@ -34,12 +34,25 @@ simt_add(__ubuf__ T *out, int nlane, int nwarp, int iters, T k) {
 #define VLD(reg, j) VectorReg<DT> reg; vlds(reg, ob + (j) * W, 0, NORM)
 #define VST(reg, j) vsts(reg, ob + (j) * W, 0, NORM_B32, m)
 
-extern "C" __global__ [aicore] void measure(__gm__ long long *out, int K, int nlane, int nwarp, int iters, int mode) {
+extern "C" __global__ __aiv__ void measure(__gm__ long long *out, int K, int nlane, int nwarp, int iters, int mode) {
+  // One timed producer: two subblocks must not race on out[0].
+  if (get_subblockid() != 0) return;
   auto ob = reinterpret_cast<__ubuf__ DT *>(0);
   auto kb = reinterpret_cast<__ubuf__ DT *>(8192);
   uint32_t cnt = (uint32_t)W;
   int ilp = nwarp; // for SIMD (mode 1), nwarp carries the ILP count
 
+  // Initialize every SIMD operand outside the timed region. Uninitialized UB
+  // can contain NaNs/denormals and is not valid arithmetic calibration input.
+  __VEC_SCOPE__ {
+    vector_bool initial_mask;
+    CREATE_MASK_BY_SIZE(initial_mask, DT, cnt);
+    VectorReg<DT> initial;
+    vdup(initial, (DT)1, initial_mask, MODE_ZEROING);
+    for (uint16_t slot = 0; slot < 8; ++slot)
+      vsts(initial, ob + slot * W, 0, NORM_B32, initial_mask);
+    vsts(initial, kb, 0, NORM_B32, initial_mask);
+  }
   pipe_barrier(PIPE_ALL);
   long long t0 = get_sys_cnt();
   for (int i = 0; i < K; i++) {
@@ -90,4 +103,9 @@ extern "C" __global__ [aicore] void measure(__gm__ long long *out, int K, int nl
   long long t1 = get_sys_cnt();
   pipe_barrier(PIPE_ALL);
   out[0] = t1 - t0;
+  int results = mode == 0 ? nwarp * 32 : ilp * W;
+  int bytes = results * sizeof(DT);
+  copy_ubuf_to_gm_align_v2(reinterpret_cast<__gm__ DT *>(out + 4), ob,
+                         0, 1, bytes, 0, (uint64_t)bytes, (uint32_t)bytes);
+  pipe_barrier(PIPE_ALL);
 }

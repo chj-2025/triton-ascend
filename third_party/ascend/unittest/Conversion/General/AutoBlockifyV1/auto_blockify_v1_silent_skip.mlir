@@ -1,4 +1,4 @@
-// RUN: triton-opt --ta-simt-auto-blockify-v1="physical-vector-core-count=64 superblock-factor=1" %s | FileCheck %s
+// RUN: triton-opt --ta-auto-blockify-v1="physical-vector-core-count=64 superblock-factor=1" %s | FileCheck %s
 
 // V1 must silently skip helper functions and bodies without a logical program
 // id.  In particular, it must not introduce a loop or claim materialization.

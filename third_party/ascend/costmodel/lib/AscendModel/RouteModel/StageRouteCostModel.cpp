@@ -1,16 +1,20 @@
 //===- StageRouteCostModel.cpp - Logical-stage route solver ---------------===//
 
 #include "AscendModel/RouteModel/StageRouteCostModel.h"
-#include "ascend/include/Utils/SuperBlockFactor.h"
+#include "llvm/Support/MathExtras.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <system_error>
+#include <tuple>
 
 using namespace mlir;
 using namespace mlir::ascend;
@@ -19,60 +23,107 @@ namespace {
 
 static double mixedEquivalentStageCost(const LogicalStageCost &stage,
                                        const StageImplementationCost &selected,
-                                       const StageTransitionCost &transition) {
+                                       const ScopeHandoffCost &scopeHandoff) {
   if (selected.implementation.mode != StageMode::SIMT ||
       !selected.implementation.localScope || !stage.localSimtMaterializable)
     return selected.totalCycles;
-  // Materializer currently creates one scope per primitive anchor.  The
-  // route DP otherwise observes only one Stage-mode change and would charge
-  // one transition pair even when the generated TTIR contains several local
-  // scopes.  Scope-local SuperBlock groups F independent logical programs in
-  // one outlined SIMT VF, so those programs share each fixed SIMD/SIMT mode
-  // switch.  The fixed transition cost is therefore amortized by F.  Tensor
-  // handoff bytes are not divided: the materializer still transfers every
-  // logical program's live-in/live-out values through UB.
-  const int64_t scopeCount = std::max<int64_t>(1, stage.localSimtScopeCount);
-  const double factor = static_cast<double>(
-      std::max<int64_t>(1, selected.implementation.superblockFactor));
-  const double fixedScopeTransitions =
-      static_cast<double>(scopeCount) / factor * transition.fixedPairCycles;
-  const double activeThreads =
-      std::max(1.0, static_cast<double>(transition.simtWarpSize) *
-                        std::clamp(stage.features.activeLaneRatio, 0.0, 1.0));
-  const double simtLoadBytesPerCycle =
-      transition.simtUbLoadBytesPerThreadPerCycle * activeThreads;
-  const double simtStoreBytesPerCycle =
-      transition.simtUbStoreBytesPerThreadPerCycle * activeThreads;
-  const double inputBytes = static_cast<double>(stage.scopeInputTensorBytes);
-  const double outputBytes = static_cast<double>(stage.scopeOutputTensorBytes);
-  // SIMD producer register -> UB -> SIMT register.
-  const double inputHandoffCycles =
-      inputBytes / transition.simdUbStoreBytesPerCycle +
-      inputBytes / simtLoadBytesPerCycle;
-  // SIMT producer register -> UB -> SIMD register.
-  const double outputHandoffCycles =
-      outputBytes / simtStoreBytesPerCycle +
-      outputBytes / transition.simdUbLoadBytesPerCycle;
-  return selected.totalCycles + fixedScopeTransitions + inputHandoffCycles +
-         outputHandoffCycles;
+  // All anchors owned by a Stage are merged into one compound scope before
+  // this candidate becomes legal.  Boundary tensor traffic is part of the
+  // scope Stage body; only the fixed enter/exit envelope is a handoff.  This
+  // distinction prevents ordinary data movement from being reported as a
+  // mode-switch cost while preserving the same total estimate.
+  const double boundaryData = scopeHandoff.estimateScopeBoundaryData(
+      stage.scopeInputTensorBytes, stage.scopeOutputTensorBytes,
+      selected.implementation.superblockFactor);
+  return selected.totalCycles + boundaryData + scopeHandoff.fixedScopeCycles;
 }
 
 static double mixedExecutionMultiplicity(const LogicalStageCost &stage,
                                          const StageImplementationCost &cost,
                                          int64_t factor) {
   if (factor <= 1 || cost.implementation.mode != StageMode::SIMD ||
-      !stage.features.replicatedByLocalSuperBlock)
+      !stage.features.insideAutoBlockifyV1Loop)
     return 1.0;
   // MaterializeSIMTScopeSuperBlock groups F logical programs in one physical
   // V1-loop iteration.  The selected SIMT scope executes them as one F-way
-  // VF, but every SIMD segment left in the logical body is cloned F times.
+  // VF, but every SIMD operation before/after it in the V1 body is cloned F
+  // times. This includes logical-program address/dispatch setup in the loop,
+  // not only algorithm Stages.
   return static_cast<double>(factor);
 }
 
 static double mixedBaseStageCost(const LogicalStageCost &stage,
                                  const StageImplementationCost &cost,
                                  int64_t factor) {
-  return cost.totalCycles * mixedExecutionMultiplicity(stage, cost, factor);
+  const double multiplicity = mixedExecutionMultiplicity(stage, cost, factor);
+  const double setup = cost.resources.setup;
+  return setup + multiplicity * std::max(0.0, cost.totalCycles - setup);
+}
+
+static double mixedBodyStageCost(const LogicalStageCost &stage,
+                                 const StageImplementationCost &cost,
+                                 int64_t factor,
+                                 const ScopeHandoffCost &scopeHandoff) {
+  double body = mixedBaseStageCost(stage, cost, factor);
+  if (cost.implementation.mode == StageMode::SIMT &&
+      cost.implementation.localScope && stage.localSimtMaterializable)
+    body += scopeHandoff.estimateScopeBoundaryData(
+        stage.scopeInputTensorBytes, stage.scopeOutputTensorBytes, factor);
+  return body;
+}
+
+/// Runtime schedule generated by AutoBlockify V1 for one scheduling slot.
+///
+/// `logicalPrograms` is the logical grid size, `slots` is the physical parent
+/// count (AIV for a pure-vector route, AIC for a Cube-bearing route), and
+/// `factor` is the selected SuperBlock factor.  V1 first assigns a contiguous
+/// chunk to each physical slot, then the materializer consumes that chunk as
+/// factor-F groups plus an F1 tail.  Keeping these quantities together avoids
+/// deriving Q independently in the parent and per-stage paths.
+struct RuntimeSchedule {
+  int64_t slots = 1;
+  int64_t programsPerSlot = 0; // Q = ceil(P / C)
+  int64_t fullGroups = 0;      // floor(Q / F)
+  int64_t tailPrograms = 0;    // Q % F
+  int64_t wholeIterations = 0; // ceil(Q / F), pure-SIMT VF loop
+  int64_t mixedIterations = 0; // fullGroups + tailPrograms, local scope
+};
+
+static int64_t ceilDivNonNegative(int64_t numerator, int64_t denominator) {
+  if (denominator <= 0 || numerator <= 0)
+    return 0;
+  // Do not use (numerator + denominator - 1): P is a runtime hint and the
+  // addition can overflow for a valid int64_t value.  This is also the exact
+  // integer form of AutoBlockify's ceildiv for non-negative operands.
+  return numerator / denominator + (numerator % denominator != 0 ? 1 : 0);
+}
+
+static RuntimeSchedule makeRuntimeSchedule(int64_t logicalPrograms,
+                                           int64_t physicalSlots,
+                                           int64_t factor) {
+  RuntimeSchedule schedule;
+  schedule.slots = std::max<int64_t>(1, physicalSlots);
+  const int64_t safeFactor = std::max<int64_t>(1, factor);
+  schedule.programsPerSlot =
+      ceilDivNonNegative(logicalPrograms, schedule.slots);
+  schedule.fullGroups = schedule.programsPerSlot / safeFactor;
+  schedule.tailPrograms = schedule.programsPerSlot % safeFactor;
+  schedule.wholeIterations =
+      schedule.fullGroups + (schedule.tailPrograms != 0 ? 1 : 0);
+  schedule.mixedIterations = schedule.fullGroups + schedule.tailPrograms;
+  return schedule;
+}
+
+static const StageImplementationCost *
+findImplementationCost(const LogicalStageCost &stage,
+                       const StageImplementation &implementation) {
+  for (const StageImplementationCost &cost : stage.implementations)
+    if (cost.implementation.mode == implementation.mode &&
+        cost.implementation.superblockFactor ==
+            implementation.superblockFactor &&
+        cost.implementation.localScope == implementation.localScope)
+      return &cost;
+  return nullptr;
 }
 
 /// AutoBlockify V1 is a route-conditional execution schedule.  The analysis
@@ -90,19 +141,16 @@ static void removeAutoBlockifyCostFromAllSIMD(StageRoutePlan &plan,
     const llvm::StringRef model = costTable.stages[index].model;
     if (model != "auto_blockify_dispatch" && model != "auto_blockify_loop")
       continue;
+    // Kernel setup is attached to the first Stage for accounting, but is not
+    // an AutoBlockify instruction. Preserve it when the all-SIMD executable
+    // removes the route-conditional V1 dispatch/loop shell.
     double setup = 0.0;
-    for (const auto &cost : costTable.stages[index].implementations) {
-      if (cost.implementation.mode == StageMode::SIMD &&
-          cost.implementation.superblockFactor == 1 &&
-          !cost.implementation.localScope) {
-        setup =
-            cost.resources.setup * static_cast<double>(plan.runtimeWaveCount);
-        break;
-      }
-    }
-    plan.totalCycles -= plan.logicalStageCycles[index] - setup;
+    if (const StageImplementationCost *selected = findImplementationCost(
+            costTable.stages[index], plan.implementations[index]))
+      setup = selected->resources.setup;
+    plan.totalCycles += setup - plan.logicalStageCycles[index];
     plan.logicalStageCycles[index] = setup;
-    plan.entryTransitionCycles[index] = 0.0;
+    plan.scopeHandoffCycles[index] = 0.0;
   }
   plan.totalCycles = std::max(0.0, plan.totalCycles);
 }
@@ -157,7 +205,8 @@ llvm::json::Object StageImplementation::toJSON() const {
 
 bool StageModelFeatures::isValid() const {
   return conditionalBranchCount >= 0 && divergentBranchCount >= 0 &&
-         loopBackedgeCount >= 0 && synchronizationCount >= 0 &&
+         loopBackedgeCount >= 0 && upperBoundLoopCount >= 0 &&
+         unknownTripCountLoopCount >= 0 && synchronizationCount >= 0 &&
          parallelRecurrenceGroupCount > 0 && std::isfinite(activeLaneRatio) &&
          activeLaneRatio >= 0.0 && activeLaneRatio <= 1.0 &&
          (!hasLoopCarriedDataDependency || hasLoop);
@@ -167,135 +216,353 @@ bool StageModelFeatures::permitsSimdRoofline() const {
   return !hasLoopCarriedDataDependency;
 }
 
-std::string AtomicWorkload::profileKey() const { return kind + "." + dataType; }
-
-bool AtomicWorkload::isFiniteAndNonNegative() const {
-  const std::array<double, 3> values = {
-      logicalElements, logicalOperationInstances, provenContiguousRunWidth};
-  return !kind.empty() && !dataType.empty() && !memorySemantic.empty() &&
-         !memoryScope.empty() &&
-         std::all_of(values.begin(), values.end(), [](double value) {
-           return std::isfinite(value) && value >= 0.0;
-         });
+int64_t StageMemoryAccess::effectiveRank() const {
+  int64_t rank = 0;
+  for (int64_t extent : shape)
+    if (extent > 1)
+      ++rank;
+  return rank;
 }
 
-llvm::json::Object AtomicWorkload::toJSON() const {
-  llvm::json::Object result;
-  result["kind"] = kind;
-  result["data_type"] = dataType;
-  result["memory_semantic"] = memorySemantic;
-  result["memory_scope"] = memoryScope;
-  result["logical_elements_per_iteration"] = logicalElements;
-  result["logical_operation_instances_per_iteration"] =
-      logicalOperationInstances;
-  if (provenContiguousRunWidth > 0.0)
-    result["proven_contiguous_run_width"] = provenContiguousRunWidth;
-  else
-    result["proven_contiguous_run_width"] = nullptr;
-  result["result_used"] = resultUsed;
-  result["address_depends_on_loaded_index"] = addressDependsOnLoadedIndex;
-  result["contention"] = contentionUnknown ? "runtime_unknown" : "proven";
-  return result;
+bool StageMemoryAccess::hasStaticLayout() const {
+  if (shape.empty() || strides.size() != shape.size() || elementBits <= 0 ||
+      elementBits % 8 != 0)
+    return false;
+  return llvm::all_of(shape, [](int64_t extent) { return extent > 0; }) &&
+         llvm::all_of(strides,
+                      [](const auto &stride) { return stride && *stride > 0; });
 }
 
-bool TensorOperationWorkload::isFiniteAndNonNegative() const {
-  const std::array<double, 2> values = {logicalElements, segmentCount};
-  return !operation.empty() && elementBitWidth > 0 &&
-         contiguousElementsPerSegment > 0 &&
-         std::all_of(values.begin(), values.end(), [](double value) {
-           return std::isfinite(value) && value >= 0.0;
-         });
+int64_t StageMemoryAccess::contiguousAxisBytes() const {
+  if (!hasStaticLayout())
+    return 0;
+  const int64_t elementBytes = elementBits / 8;
+  for (size_t axis = 0; axis < shape.size(); ++axis)
+    if (shape[axis] > 1 && *strides[axis] == 1) {
+      if (shape[axis] > std::numeric_limits<int64_t>::max() / elementBytes)
+        return 0;
+      return shape[axis] * elementBytes;
+    }
+  // Stride > 1 creates holes, not a longer contiguous run. Singleton axes
+  // do not establish continuity of the varying dimensions.
+  return elementBytes;
 }
 
-llvm::json::Object TensorOperationWorkload::toJSON() const {
+int64_t StageMemoryAccess::rowBytes() const { return contiguousAxisBytes(); }
+
+int64_t StageMemoryAccess::rowStrideBytes() const {
+  if (!hasStaticLayout())
+    return 0;
+  const int64_t elementBytes = elementBits / 8;
+  llvm::SmallVector<std::pair<int64_t, int64_t>, 5> dimensions;
+  for (size_t index = 0; index < shape.size(); ++index)
+    if (shape[index] > 1 && strides[index])
+      dimensions.emplace_back(*strides[index], shape[index]);
+  llvm::sort(dimensions);
+  if (dimensions.empty())
+    return rowBytes();
+  const size_t rowAxis = dimensions.front().first == 1 ? 1 : 0;
+  if (rowAxis == dimensions.size())
+    return rowBytes();
+  if (dimensions[rowAxis].first >
+      std::numeric_limits<int64_t>::max() / elementBytes)
+    return 0;
+  return dimensions[rowAxis].first * elementBytes;
+}
+
+int64_t StageMemoryAccess::rowCount() const {
+  if (!hasStaticLayout())
+    return 0;
+  const int64_t contiguousBytes = contiguousAxisBytes();
+  const int64_t elementBytes = elementBits / 8;
+  if (contiguousBytes <= 0 || elementBytes <= 0)
+    return 0;
+  int64_t elements = 1;
+  for (int64_t extent : shape) {
+    if (extent > 0 && elements > std::numeric_limits<int64_t>::max() / extent)
+      return 0;
+    elements *= extent;
+  }
+  const int64_t contiguousElements = contiguousBytes / elementBytes;
+  return contiguousElements > 0 ? llvm::divideCeil(elements, contiguousElements)
+                                : 0;
+}
+
+int64_t StageMemoryAccess::descriptorCount(unsigned maxRank) const {
+  if (!hasStaticLayout() || maxRank == 0)
+    return 0;
+  const int64_t rank = effectiveRank();
+  if (rank <= static_cast<int64_t>(maxRank))
+    return 1;
+  int64_t count = 1;
+  // Conditional geometry only: number of pieces if an uncollapsed maxRank-D
+  // lowering is selected. This is NOT proof of the backend's chosen DMA,
+  // which may fold dimensions, split sub-blocks or select a SIMT template.
+  llvm::SmallVector<std::pair<int64_t, int64_t>, 5> dimensions;
+  for (size_t index = 0; index < shape.size(); ++index)
+    if (shape[index] > 1 && strides[index])
+      dimensions.emplace_back(*strides[index], shape[index]);
+  llvm::sort(dimensions);
+  for (size_t index = maxRank; index < dimensions.size(); ++index) {
+    if (count > std::numeric_limits<int64_t>::max() / dimensions[index].second)
+      return 0;
+    count *= dimensions[index].second;
+  }
+  return count;
+}
+
+StageMemoryAccess::LayoutClass StageMemoryAccess::layoutClass() const {
+  if (!hasStaticLayout() || contiguousAxisBytes() <= 0 || rowStrideBytes() <= 0)
+    return LayoutClass::Unknown;
+  const int64_t bytes = rowBytes();
+  bool packed = true;
+  llvm::SmallVector<std::pair<int64_t, int64_t>, 5> dimensions;
+  for (size_t index = 0; index < shape.size(); ++index)
+    if (shape[index] > 1 && strides[index])
+      dimensions.emplace_back(*strides[index], shape[index]);
+  llvm::sort(dimensions);
+  int64_t expected = 1;
+  for (auto [stride, extent] : dimensions) {
+    if (stride != expected) {
+      packed = false;
+      break;
+    }
+    if (expected > std::numeric_limits<int64_t>::max() / extent)
+      return LayoutClass::Unknown;
+    expected *= extent;
+  }
+  const bool wide = bytes >= 32;
+  if (packed)
+    return wide ? LayoutClass::ContiguousWide : LayoutClass::ContiguousShort;
+  return wide ? LayoutClass::StridedWide : LayoutClass::StridedShort;
+}
+
+bool StageMemoryAccess::hasUnitInnerStride() const {
+  if (!hasStaticLayout())
+    return false;
+  for (size_t axis = 0; axis < shape.size(); ++axis)
+    if (shape[axis] > 1 && *strides[axis] == 1)
+      return true;
+  return effectiveRank() == 0;
+}
+
+bool StageMemoryAccess::hasNonUnitInnerStride() const {
+  return hasStaticLayout() && !hasUnitInnerStride();
+}
+
+bool StageMemoryAccess::isFlatContiguous() const {
+  const LayoutClass layout = layoutClass();
+  return layout == LayoutClass::ContiguousShort ||
+         layout == LayoutClass::ContiguousWide;
+}
+
+bool StageMemoryAccess::isValid() const {
+  if (elementBits <= 0 || !std::isfinite(count) || count < 0.0 ||
+      shape.size() != strides.size())
+    return false;
+  // Broadcast/reversed/unknown strides are legal workloads even when this
+  // calibration only covers positive, non-broadcast descriptors.
+  return llvm::all_of(shape, [](int64_t extent) { return extent > 0; });
+}
+
+llvm::StringRef mlir::ascend::stringifyStageMemoryLayout(
+    StageMemoryAccess::LayoutClass layout) {
+  switch (layout) {
+  case StageMemoryAccess::LayoutClass::Unknown:
+    return "unknown";
+  case StageMemoryAccess::LayoutClass::ContiguousShort:
+    return "contiguous_short";
+  case StageMemoryAccess::LayoutClass::ContiguousWide:
+    return "contiguous_wide";
+  case StageMemoryAccess::LayoutClass::StridedShort:
+    return "strided_short";
+  case StageMemoryAccess::LayoutClass::StridedWide:
+    return "strided_wide";
+  }
+  llvm_unreachable("unknown memory layout class");
+}
+
+std::string StageMemoryAccess::layoutKey() const {
+  std::string key;
+  llvm::raw_string_ostream stream(key);
+  stream << stringifyStageMemoryLayout(layoutClass())
+         << ":r=" << effectiveRank() << ":row=" << rowBytes()
+         << ":stride=" << rowStrideBytes() << ":rows=" << rowCount()
+         << ":bits=" << elementBits << ":masked=" << masked << ":shape=";
+  for (int64_t extent : shape)
+    stream << extent << ',';
+  stream << ":strides=";
+  for (const auto &stride : strides) {
+    if (stride)
+      stream << *stride;
+    else
+      stream << '?';
+    stream << ',';
+  }
+  stream.flush();
+  return key;
+}
+
+llvm::json::Object StageMemoryAccess::toJSON() const {
+  llvm::json::Array shapeJSON;
+  for (int64_t extent : shape)
+    shapeJSON.push_back(extent);
+  llvm::json::Array strideJSON;
+  for (const auto &stride : strides)
+    strideJSON.push_back(stride ? llvm::json::Value(*stride)
+                                : llvm::json::Value(nullptr));
   return llvm::json::Object{
-      {"operation", operation},
-      {"element_bit_width", elementBitWidth},
-      {"logical_elements_per_iteration", logicalElements},
-      {"segment_count_per_iteration", segmentCount},
-      {"contiguous_elements_per_segment", contiguousElementsPerSegment},
-      {"simd_lowering", "segmented_vector"}};
+      {"shape", std::move(shapeJSON)},
+      {"strides", std::move(strideJSON)},
+      {"element_bits", elementBits},
+      {"count_per_iteration", count},
+      {"store", store},
+      {"masked", masked},
+      {"effective_rank", effectiveRank()},
+      {"contiguous_axis_bytes", contiguousAxisBytes()},
+      {"row_bytes", rowBytes()},
+      {"row_stride_bytes", rowStrideBytes()},
+      {"row_count", rowCount()},
+      {"unfolded_pieces_if_5d", descriptorCount(5)},
+      {"unfolded_pieces_if_2d", descriptorCount(2)},
+      {"layout_key", layoutKey()},
+      {"layout_class", stringifyStageMemoryLayout(layoutClass())},
+  };
 }
 
 bool StageWorkload::isFiniteAndNonNegative() const {
-  const std::array<double, 17> values = {scalarOperations,
+  const std::array<double, 15> values = {scalarOperations,
                                          loadBytes,
                                          storeBytes,
+                                         loadOperations,
+                                         storeOperations,
                                          loadWarpInstructions,
                                          storeWarpInstructions,
-                                         indirectLoadBytes,
-                                         indirectStoreBytes,
-                                         indirectLoadTransactions,
-                                         indirectStoreTransactions,
-                                         predicateElements,
                                          shuffleLaneSteps,
-                                         scanShuffleLaneSteps,
+                                         dotOperations,
                                          dotFlops,
                                          issueElements,
-                                         estimatedSpillTransactions,
-                                         scalarLoadCount,
-                                         scalarStoreCount};
-  if (!std::all_of(
-          values.begin(), values.end(),
-          [](double value) { return std::isfinite(value) && value >= 0.0; }) ||
-      indirectLoadBytes > loadBytes || indirectStoreBytes > storeBytes ||
-      indirectLoadTransactions > loadWarpInstructions ||
-      indirectStoreTransactions > storeWarpInstructions ||
-      scanShuffleLaneSteps > shuffleLaneSteps)
+                                         loopBackedges,
+                                         conditionalBranches,
+                                         divergentBranches,
+                                         synchronizations};
+  if (!std::all_of(values.begin(), values.end(), [](double value) {
+        return std::isfinite(value) && value >= 0.0;
+      }))
     return false;
-  return llvm::all_of(operationElements,
-                      [](const auto &entry) {
-                        return std::isfinite(entry.second) &&
-                               entry.second >= 0.0;
-                      }) &&
-         llvm::all_of(tensorOperationWorkloads,
-                      [](const TensorOperationWorkload &tensor) {
-                        return tensor.isFiniteAndNonNegative();
-                      }) &&
-         llvm::all_of(atomicWorkloads, [](const AtomicWorkload &atomic) {
-           return atomic.isFiniteAndNonNegative();
+  auto validCounts = [](const auto &counts) {
+    return llvm::all_of(counts, [](const auto &shapeCount) {
+      return shapeCount.first > 0 && std::isfinite(shapeCount.second) &&
+             shapeCount.second >= 0.0;
+    });
+  };
+  auto validMemoryCounts = [](const auto &counts) {
+    return llvm::all_of(counts, [](const auto &shapeCount) {
+      return shapeCount.first.first > 0 && shapeCount.first.second > 0 &&
+             std::isfinite(shapeCount.second) && shapeCount.second >= 0.0;
+    });
+  };
+  const bool validPrefixScans =
+      llvm::all_of(prefixScanCounts, [](const auto &shapeCount) {
+        return shapeCount.first.first > 1 && shapeCount.first.second > 0 &&
+               std::isfinite(shapeCount.second) && shapeCount.second >= 0.0;
+      });
+  const bool validAccesses = llvm::all_of(
+      memoryAccesses, [](const auto &access) { return access.isValid(); });
+  return validAccesses && validCounts(predicateCounts) &&
+         validCounts(dotFlopCounts) && validPrefixScans &&
+         validMemoryCounts(indirectLoadCounts) &&
+         validMemoryCounts(continuousLoadCounts) &&
+         validMemoryCounts(continuousStoreCounts) &&
+         llvm::all_of(operationCounts, [&](const auto &entry) {
+           return validCounts(entry.second);
          });
 }
 
 llvm::json::Object StageWorkload::toJSON() const {
   llvm::json::Object result;
   llvm::json::Object operations;
-  for (const auto &[name, elements] : operationElements)
+  llvm::json::Object instances;
+  for (const auto &[name, counts] : operationCounts) {
+    double elements = 0.0;
+    llvm::json::Array shapes;
+    for (const auto &[size, count] : counts) {
+      elements += static_cast<double>(size) * count;
+      shapes.push_back(llvm::json::Object{{"elements_per_operation", size},
+                                          {"count_per_iteration", count}});
+    }
     operations[name] = elements;
+    instances[name] = std::move(shapes);
+  }
   result["operation_elements_per_iteration"] = std::move(operations);
-  llvm::json::Array tensors;
-  for (const TensorOperationWorkload &tensor : tensorOperationWorkloads)
-    tensors.push_back(tensor.toJSON());
-  result["tensor_operation_workloads"] = std::move(tensors);
+  result["operation_instances_per_iteration"] = std::move(instances);
   result["scalar_operations_per_iteration"] = scalarOperations;
   result["load_bytes_per_iteration"] = loadBytes;
   result["store_bytes_per_iteration"] = storeBytes;
+  result["load_operations_per_iteration"] = loadOperations;
+  result["store_operations_per_iteration"] = storeOperations;
   result["load_warp_instructions_per_iteration"] = loadWarpInstructions;
   result["store_warp_instructions_per_iteration"] = storeWarpInstructions;
-  result["direct_load_bytes_per_iteration"] = loadBytes - indirectLoadBytes;
-  result["direct_store_bytes_per_iteration"] = storeBytes - indirectStoreBytes;
-  result["direct_load_warp_instructions_per_iteration"] =
-      loadWarpInstructions - indirectLoadTransactions;
-  result["direct_store_warp_instructions_per_iteration"] =
-      storeWarpInstructions - indirectStoreTransactions;
-  result["indirect_load_bytes_per_iteration"] = indirectLoadBytes;
-  result["indirect_store_bytes_per_iteration"] = indirectStoreBytes;
-  result["indirect_load_transactions_per_iteration"] = indirectLoadTransactions;
-  result["indirect_store_transactions_per_iteration"] =
-      indirectStoreTransactions;
-  llvm::json::Array atomics;
-  for (const AtomicWorkload &atomic : atomicWorkloads)
-    atomics.push_back(atomic.toJSON());
-  result["atomic_workloads"] = std::move(atomics);
+  llvm::json::Array accesses;
+  for (const StageMemoryAccess &access : memoryAccesses)
+    accesses.push_back(access.toJSON());
+  result["memory_accesses_per_iteration"] = std::move(accesses);
+  llvm::json::Array continuousLoads;
+  for (const auto &[shape, count] : continuousLoadCounts)
+    continuousLoads.push_back(
+        llvm::json::Object{{"bytes_per_operation", shape.first},
+                           {"elements_per_operation", shape.second},
+                           {"warp_instructions_per_operation",
+                            llvm::divideCeil(shape.second, int64_t(32))},
+                           {"operations_per_iteration", count}});
+  result["continuous_load_shapes"] = std::move(continuousLoads);
+  llvm::json::Array continuousStores;
+  for (const auto &[shape, count] : continuousStoreCounts)
+    continuousStores.push_back(
+        llvm::json::Object{{"bytes_per_operation", shape.first},
+                           {"elements_per_operation", shape.second},
+                           {"warp_instructions_per_operation",
+                            llvm::divideCeil(shape.second, int64_t(32))},
+                           {"operations_per_iteration", count}});
+  result["continuous_store_shapes"] = std::move(continuousStores);
+  llvm::json::Array indirectLoads;
+  for (const auto &[shape, count] : indirectLoadCounts)
+    indirectLoads.push_back(
+        llvm::json::Object{{"bytes_per_operation", shape.first},
+                           {"elements_per_operation", shape.second},
+                           {"warp_instructions_per_operation",
+                            llvm::divideCeil(shape.second, int64_t(32))},
+                           {"operations_per_iteration", count}});
+  result["indirect_load_shapes"] = std::move(indirectLoads);
+  double predicateElements = 0.0;
+  llvm::json::Array predicates;
+  for (const auto &[size, count] : predicateCounts) {
+    predicateElements += static_cast<double>(size) * count;
+    predicates.push_back(llvm::json::Object{{"elements_per_operation", size},
+                                            {"count_per_iteration", count}});
+  }
   result["predicate_elements_per_iteration"] = predicateElements;
+  result["predicate_instances_per_iteration"] = std::move(predicates);
+  llvm::json::Array prefixScans;
+  for (const auto &[shape, count] : prefixScanCounts)
+    prefixScans.push_back(
+        llvm::json::Object{{"axis_extent", shape.first},
+                           {"independent_sequence_count", shape.second},
+                           {"count_per_iteration", count}});
+  result["prefix_scan_instances_per_iteration"] = std::move(prefixScans);
   result["shuffle_lane_steps_per_iteration"] = shuffleLaneSteps;
-  result["scan_shuffle_lane_steps_per_iteration"] = scanShuffleLaneSteps;
+  result["dot_operations_per_iteration"] = dotOperations;
+  llvm::json::Array dotInstances;
+  for (const auto &[flops, count] : dotFlopCounts)
+    dotInstances.push_back(llvm::json::Object{{"flops_per_matrix", flops},
+                                              {"matrix_instances", count}});
+  result["dot_instances_per_iteration"] = std::move(dotInstances);
   result["dot_flops_per_iteration"] = dotFlops;
   result["issue_elements_per_iteration"] = issueElements;
-  result["estimated_spill_transactions_per_iteration"] =
-      estimatedSpillTransactions;
-  result["scalar_load_count_per_iteration"] = scalarLoadCount;
-  result["scalar_store_count_per_iteration"] = scalarStoreCount;
+  result["loop_backedges_per_iteration"] = loopBackedges;
+  result["conditional_branches_per_iteration"] = conditionalBranches;
+  result["divergent_branches_per_iteration"] = divergentBranches;
+  result["synchronizations_per_iteration"] = synchronizations;
   result["pays_kernel_setup"] = paysKernelSetup;
   return result;
 }
@@ -312,10 +579,12 @@ llvm::json::Object StageModelFeatures::toJSON() const {
   result["has_prefix_scan"] = hasPrefixScan;
   result["has_dot"] = hasDot;
   result["has_conversion_pack"] = hasConversionPack;
-  result["replicated_by_local_superblock"] = replicatedByLocalSuperBlock;
+  result["inside_auto_blockify_v1_loop"] = insideAutoBlockifyV1Loop;
   result["conditional_branch_count"] = conditionalBranchCount;
   result["divergent_branch_count"] = divergentBranchCount;
   result["loop_backedge_count"] = loopBackedgeCount;
+  result["upper_bound_loop_count"] = upperBoundLoopCount;
+  result["unknown_trip_count_loop_count"] = unknownTripCountLoopCount;
   result["synchronization_count"] = synchronizationCount;
   result["parallel_recurrence_group_count"] = parallelRecurrenceGroupCount;
   result["active_lane_ratio"] = activeLaneRatio;
@@ -324,11 +593,22 @@ llvm::json::Object StageModelFeatures::toJSON() const {
 }
 
 bool StageResourceCycles::isFiniteAndNonNegative() const {
-  const std::array<double, 17> values = {
-      setup,       scalar,        load,       store,           atomic,
-      compute,     predicate,     shuffle,    scanShuffle,     dot,
-      loopControl, branchControl, divergence, synchronization, spill,
-      issue,       criticalPath};
+  const std::array<double, 16> values = {setup,
+                                         scalar,
+                                         load,
+                                         store,
+                                         compute,
+                                         predicate,
+                                         shuffle,
+                                         dot,
+                                         issue,
+                                         prefixScanIssue,
+                                         prefixScanCriticalPath,
+                                         recurrenceGroupCriticalPath,
+                                         continuousLoadGroup,
+                                         continuousStoreGroup,
+                                         storeLayoutService,
+                                         criticalPath};
   return std::all_of(values.begin(), values.end(), [](double value) {
     return std::isfinite(value) && value >= 0.0;
   });
@@ -346,12 +626,14 @@ llvm::json::Object StageResourceCycles::toJSON() const {
   result["shuffle_per_iteration"] = shuffle;
   result["scan_shuffle_per_iteration"] = scanShuffle;
   result["dot_per_iteration"] = dot;
-  result["loop_control_per_iteration"] = loopControl;
-  result["branch_control_per_iteration"] = branchControl;
-  result["divergence_per_iteration"] = divergence;
-  result["synchronization_per_iteration"] = synchronization;
-  result["spill_per_iteration"] = spill;
   result["issue_per_iteration"] = issue;
+  result["prefix_scan_issue_per_iteration"] = prefixScanIssue;
+  result["prefix_scan_critical_path_per_iteration"] = prefixScanCriticalPath;
+  result["recurrence_group_critical_path_per_iteration"] =
+      recurrenceGroupCriticalPath;
+  result["continuous_load_group_per_iteration"] = continuousLoadGroup;
+  result["continuous_store_group_per_iteration"] = continuousStoreGroup;
+  result["store_layout_service_per_iteration"] = storeLayoutService;
   result["critical_path_per_iteration"] = criticalPath;
   return result;
 }
@@ -364,6 +646,7 @@ bool StageImplementationCost::isValid() const {
 llvm::json::Object StageImplementationCost::toJSON() const {
   return llvm::json::Object{{"implementation", implementation.toJSON()},
                             {"total_system_cycles", totalCycles},
+                            {"formula_evidence", formulaEvidence},
                             {"resource_system_cycles", resources.toJSON()}};
 }
 
@@ -384,7 +667,6 @@ llvm::json::Object LogicalStageCost::toJSON() const {
   result["live_out_count"] = liveOutCount;
   result["live_in_bytes"] = liveInBytes;
   result["live_out_bytes"] = liveOutBytes;
-  result["local_simt_scope_count"] = localSimtScopeCount;
   result["scope_input_tensor_bytes"] = scopeInputTensorBytes;
   result["scope_output_tensor_bytes"] = scopeOutputTensorBytes;
   llvm::json::Array anchorIndices;
@@ -408,28 +690,40 @@ llvm::json::Object LogicalStageCost::toJSON() const {
   return result;
 }
 
-bool StageTransitionCost::isValid() const {
-  return std::isfinite(fixedPairCycles) && fixedPairCycles >= 0.0 &&
-         std::isfinite(simdUbLoadBytesPerCycle) &&
-         simdUbLoadBytesPerCycle > 0.0 &&
-         std::isfinite(simdUbStoreBytesPerCycle) &&
-         simdUbStoreBytesPerCycle > 0.0 &&
-         std::isfinite(simtUbLoadBytesPerThreadPerCycle) &&
-         simtUbLoadBytesPerThreadPerCycle > 0.0 &&
-         std::isfinite(simtUbStoreBytesPerThreadPerCycle) &&
-         simtUbStoreBytesPerThreadPerCycle > 0.0 && simtWarpSize > 0;
+bool ScopeHandoffCost::isValid() const {
+  return std::isfinite(fixedScopeCycles) && fixedScopeCycles >= 0.0 &&
+         std::isfinite(inputHandoffBytesPerCycle) &&
+         inputHandoffBytesPerCycle > 0.0 &&
+         std::isfinite(outputHandoffBytesPerCycle) &&
+         outputHandoffBytesPerCycle > 0.0;
 }
 
-llvm::json::Object StageTransitionCost::toJSON() const {
+double ScopeHandoffCost::estimateScopeBoundaryData(
+    int64_t inputBytes, int64_t outputBytes, int64_t superblockFactor) const {
+  const double factor =
+      static_cast<double>(std::max<int64_t>(1, superblockFactor));
+  const double groupInputBytes =
+      factor * static_cast<double>(std::max<int64_t>(0, inputBytes));
+  const double groupOutputBytes =
+      factor * static_cast<double>(std::max<int64_t>(0, outputBytes));
+  return groupInputBytes / inputHandoffBytesPerCycle +
+         groupOutputBytes / outputHandoffBytesPerCycle;
+}
+
+double ScopeHandoffCost::estimateScopeHandoff(int64_t inputBytes,
+                                              int64_t outputBytes,
+                                              int64_t superblockFactor) const {
+  return fixedScopeCycles +
+         estimateScopeBoundaryData(inputBytes, outputBytes, superblockFactor);
+}
+
+llvm::json::Object ScopeHandoffCost::toJSON() const {
   llvm::json::Object result;
-  result["fixed_pair_system_cycles"] = fixedPairCycles;
-  result["simd_ub_load_bytes_per_system_cycle"] = simdUbLoadBytesPerCycle;
-  result["simd_ub_store_bytes_per_system_cycle"] = simdUbStoreBytesPerCycle;
-  result["simt_ub_load_bytes_per_thread_per_system_cycle"] =
-      simtUbLoadBytesPerThreadPerCycle;
-  result["simt_ub_store_bytes_per_thread_per_system_cycle"] =
-      simtUbStoreBytesPerThreadPerCycle;
-  result["simt_warp_size"] = simtWarpSize;
+  result["fixed_scope_system_cycles"] = fixedScopeCycles;
+  result["input_handoff_bytes_per_system_cycle"] = inputHandoffBytesPerCycle;
+  result["output_handoff_bytes_per_system_cycle"] = outputHandoffBytesPerCycle;
+  result["boundary_data_is_stage_body"] = true;
+  result["handoff_formula"] = "C_fixed_scope per physical scope group";
   return result;
 }
 
@@ -440,12 +734,40 @@ llvm::json::Object StageRoutePlan::toJSON() const {
   result["total_system_cycles"] = totalCycles;
   result["route_superblock_factor"] = routeSuperblockFactor;
   result["runtime_physical_program_count"] = runtimePhysicalProgramCount;
-  result["runtime_wave_count"] = runtimeWaveCount;
+  result["runtime_scheduling_slot_count"] = runtimeSchedulingSlotCount;
+  result["runtime_logical_programs_per_scheduling_slot"] =
+      runtimeLogicalProgramsPerSchedulingSlot;
+  result["runtime_full_group_count"] = runtimeFullGroupCount;
+  result["runtime_tail_program_count"] = runtimeTailProgramCount;
+  result["runtime_loop_iteration_count"] = runtimeLoopIterationCount;
+  // Keep the accounting contract next to the derived values in route.json;
+  // this makes it possible to audit a report without reverse-engineering the
+  // implementation or mistaking F for a second physical-core divisor.
+  result["runtime_schedule_formula"] =
+      "Q=ceil(P/C); full_groups=floor(Q/F); tail=Q%F; "
+      "pure_simt_iters=ceil(Q/F); mixed_local_iters=full_groups+tail";
   llvm::json::Array stages;
   for (size_t i = 0; i < implementations.size(); ++i) {
     llvm::json::Object stage;
     stage["implementation"] = implementations[i].toJSON();
-    stage["entry_transition_system_cycles"] = entryTransitionCycles[i];
+    if (i < runtimeStageSchedulingSlotCounts.size())
+      stage["runtime_scheduling_slot_count"] =
+          runtimeStageSchedulingSlotCounts[i];
+    if (i < runtimeStageLogicalProgramsPerSchedulingSlot.size())
+      stage["runtime_logical_programs_per_scheduling_slot"] =
+          runtimeStageLogicalProgramsPerSchedulingSlot[i];
+    if (i < runtimeStageFullGroupCounts.size())
+      stage["runtime_full_group_count"] = runtimeStageFullGroupCounts[i];
+    if (i < runtimeStageTailProgramCounts.size())
+      stage["runtime_tail_program_count"] = runtimeStageTailProgramCounts[i];
+    if (i < runtimeStageLoopIterationCounts.size())
+      stage["runtime_loop_iteration_count"] =
+          runtimeStageLoopIterationCounts[i];
+    if (i < runtimeStageExecutionDomains.size())
+      stage["runtime_execution_domain"] = runtimeStageExecutionDomains[i];
+    if (i < runtimeStageTailModes.size())
+      stage["runtime_tail_mode"] = runtimeStageTailModes[i];
+    stage["scope_handoff_system_cycles"] = scopeHandoffCycles[i];
     stage["logical_stage_system_cycles"] = logicalStageCycles[i];
     stages.push_back(std::move(stage));
   }
@@ -464,7 +786,7 @@ llvm::json::Object StageCostModelSummary::toJSON() const {
   for (const LogicalStageCost &stage : stages)
     stageArray.push_back(stage.toJSON());
   result["logical_stages"] = std::move(stageArray);
-  result["transition_cost"] = transition.toJSON();
+  result["scope_handoff_cost"] = scopeHandoff.toJSON();
   llvm::json::Object routes;
   routes["all_simd"] = allSimd.toJSON();
   routes["all_simt_only"] = allSimt.toJSON();
@@ -473,17 +795,282 @@ llvm::json::Object StageCostModelSummary::toJSON() const {
   return result;
 }
 
+/// Compose one-group Stage costs according to the schedule that the backend
+/// actually materializes on the most-loaded scheduling slot.
+///
+/// AutoBlockify first assigns Q=ceil(P/C) logical programs to that slot. A
+/// whole-kernel pure-SIMT route executes ceil(Q/F) factor-F loop iterations;
+/// its final partial group is still an F-wide VF guarded by an in-bounds
+/// predicate. A local Mixed SuperBlock is different: NPUIR materializes
+/// floor(Q/F) factor-F main iterations plus Q%F separate factor-1 tail
+/// iterations. One-time dispatch/setup must not be multiplied by either
+/// count.
+static bool applyRuntimeSchedule(StageRoutePlan &plan,
+                                 const StageCostTable &costTable,
+                                 const ScopeHandoffCost &scopeHandoff) {
+  bool usesCubeExecution = false;
+  for (size_t index = 0;
+       index < costTable.stages.size() && index < plan.implementations.size();
+       ++index)
+    usesCubeExecution |= costTable.stages[index].features.hasDot &&
+                         plan.implementations[index].mode == StageMode::SIMD;
+  const int64_t vectorCores = costTable.physicalCoreCountHint;
+  const int64_t aiCores = costTable.physicalAiCoreCountHint > 0
+                              ? costTable.physicalAiCoreCountHint
+                              : vectorCores;
+  // AutoBlockifyParallelLoop runs on the unsplit MIX function, where a CV
+  // kernel is an AIC-owned schedule and therefore uses CUBE_CORE_COUNT.  The
+  // later SplitMixKernel pass clones that same loop into the AIC and AIV
+  // peers; MaterializeSIMTScopeSuperBlock updates both peers in lockstep.
+  // Consequently a Mixed route that actually contains a SIMD/Cube stage uses
+  // the 28 AIC parent slots even though the local SIMT body executes on AIV
+  // sub-blocks.  Using VECTOR_CORE_COUNT here would model a second, unrelated
+  // AIV logical-program loop and undercount Q (for P=512: 10 instead of 19).
+  const bool usesAiSchedule = usesCubeExecution;
+  const int64_t schedulingSlots = usesAiSchedule ? aiCores : vectorCores;
+  const int64_t launchCores = usesCubeExecution ? aiCores : vectorCores;
+  if (costTable.logicalProgramCountHint <= 0 || schedulingSlots <= 0 ||
+      launchCores <= 0)
+    return true;
+  if (plan.logicalStageCycles.size() != costTable.stages.size() ||
+      plan.scopeHandoffCycles.size() != costTable.stages.size() ||
+      plan.implementations.size() != costTable.stages.size())
+    return false;
+
+  plan.runtimeStageSchedulingSlotCounts.assign(costTable.stages.size(), 0);
+  plan.runtimeStageLogicalProgramsPerSchedulingSlot.assign(
+      costTable.stages.size(), 0);
+  plan.runtimeStageFullGroupCounts.assign(costTable.stages.size(), 0);
+  plan.runtimeStageTailProgramCounts.assign(costTable.stages.size(), 0);
+  plan.runtimeStageLoopIterationCounts.assign(costTable.stages.size(), 0);
+  plan.runtimeStageExecutionDomains.assign(costTable.stages.size(), "");
+  plan.runtimeStageTailModes.assign(costTable.stages.size(), "");
+
+  const int64_t logicalPrograms = costTable.logicalProgramCountHint;
+  const int64_t factor = std::max<int64_t>(1, plan.routeSuperblockFactor);
+  const RuntimeSchedule parentSchedule =
+      makeRuntimeSchedule(logicalPrograms, schedulingSlots, factor);
+  const int64_t programsPerSchedulingSlot = parentSchedule.programsPerSlot;
+  const int64_t fullGroups = parentSchedule.fullGroups;
+  const int64_t tailPrograms = parentSchedule.tailPrograms;
+  const int64_t wholeKernelGroupIterations = parentSchedule.wholeIterations;
+  const int64_t mixedLoopIterations = parentSchedule.mixedIterations;
+
+  plan.runtimePhysicalProgramCount = std::min(logicalPrograms, launchCores);
+  plan.runtimeSchedulingSlotCount = std::min(logicalPrograms, schedulingSlots);
+  plan.runtimeLogicalProgramsPerSchedulingSlot = programsPerSchedulingSlot;
+  plan.runtimeFullGroupCount = fullGroups;
+  plan.runtimeTailProgramCount = tailPrograms;
+  switch (plan.candidate) {
+  case StageKernelRouteKind::AllSIMD:
+    plan.runtimeLoopIterationCount = programsPerSchedulingSlot;
+    break;
+  case StageKernelRouteKind::AllSIMT:
+    plan.runtimeLoopIterationCount = wholeKernelGroupIterations;
+    break;
+  case StageKernelRouteKind::Mixed:
+    plan.runtimeLoopIterationCount = mixedLoopIterations;
+    break;
+  }
+
+  const bool hasV1Schedule =
+      llvm::any_of(costTable.stages, [](const LogicalStageCost &stage) {
+        return stage.model == "auto_blockify_dispatch" ||
+               stage.model == "auto_blockify_loop";
+      });
+  std::vector<double> unscaledStageCycles = plan.logicalStageCycles;
+  std::vector<double> unscaledHandoffCycles = plan.scopeHandoffCycles;
+  plan.totalCycles = 0.0;
+
+  // A Mixed CV executable has one shared logical-program owner: the AIC MIX
+  // parent loop.  Its AIV peer and any local SIMT scope consume the same
+  // logical-program indices.  Thus all stages in that route use the AIC slot
+  // count for Q; only a pure-AIV route uses the vector-core count.
+  const RuntimeSchedule perStageSchedule = makeRuntimeSchedule(
+      logicalPrograms, usesCubeExecution ? aiCores : vectorCores, factor);
+
+  for (size_t index = 0; index < costTable.stages.size(); ++index) {
+    const LogicalStageCost &stage = costTable.stages[index];
+    const StageImplementationCost *selected =
+        findImplementationCost(stage, plan.implementations[index]);
+    if (!selected)
+      return false;
+    const double setup = selected->resources.setup;
+    // `logicalStageCycles` includes the fixed local-scope envelope so that
+    // report totals remain backward compatible.  Remove that envelope before
+    // scaling the Stage body; tensor boundary traffic stays in the body.
+    const double fullBody = std::max(0.0, unscaledStageCycles[index] - setup -
+                                              unscaledHandoffCycles[index]);
+    double scaledStageCycles = unscaledStageCycles[index];
+    double scaledHandoffCycles = unscaledHandoffCycles[index];
+
+    const bool isScheduleShell = stage.model == "auto_blockify_dispatch" ||
+                                 stage.model == "auto_blockify_loop";
+    const RuntimeSchedule &schedule =
+        isScheduleShell ? parentSchedule : perStageSchedule;
+    // A factor-F main iteration and an F1 tail use different implementation
+    // records.  In particular, an SIMD peer is replayed F times in the main
+    // group but only once in the tail; reusing the F-wide cost for the tail
+    // overcharges every non-divisible Q and was the source of the old Q=10
+    // Mixed estimates.
+    auto getTailCosts =
+        [&]() -> std::optional<std::tuple<double, double, double>> {
+      if (schedule.tailPrograms == 0 || factor == 1)
+        return std::nullopt;
+      StageImplementation tailImplementation = plan.implementations[index];
+      tailImplementation.superblockFactor = 1;
+      const StageImplementationCost *tail =
+          findImplementationCost(stage, tailImplementation);
+      if (!tail)
+        return std::nullopt;
+      double tailUnitCycles = 0.0;
+      if (tailImplementation.mode == StageMode::SIMT &&
+          tailImplementation.localScope)
+        tailUnitCycles = mixedEquivalentStageCost(stage, *tail, scopeHandoff);
+      else
+        tailUnitCycles = mixedBaseStageCost(stage, *tail, 1);
+      const double tailUnitHandoff =
+          tailUnitCycles - mixedBodyStageCost(stage, *tail, 1, scopeHandoff);
+      return std::make_tuple(tailUnitCycles, tailUnitHandoff,
+                             tail->resources.setup);
+    };
+    const bool localSimtScope =
+        plan.candidate == StageKernelRouteKind::Mixed &&
+        plan.implementations[index].mode == StageMode::SIMT &&
+        plan.implementations[index].localScope && stage.localSimtMaterializable;
+    const bool stageUsesAiSchedule = usesCubeExecution;
+    plan.runtimeStageSchedulingSlotCounts[index] = schedule.slots;
+    plan.runtimeStageLogicalProgramsPerSchedulingSlot[index] =
+        schedule.programsPerSlot;
+    plan.runtimeStageFullGroupCounts[index] = schedule.fullGroups;
+    plan.runtimeStageTailProgramCounts[index] = schedule.tailPrograms;
+    if (localSimtScope)
+      plan.runtimeStageExecutionDomains[index] = "aiv_local_scope";
+    else if (stageUsesAiSchedule)
+      plan.runtimeStageExecutionDomains[index] = "aic_parent";
+    else if (plan.candidate == StageKernelRouteKind::AllSIMT)
+      plan.runtimeStageExecutionDomains[index] = "aiv_whole_kernel";
+    else
+      plan.runtimeStageExecutionDomains[index] = "aiv_vector";
+    if (factor == 1 || schedule.tailPrograms == 0)
+      plan.runtimeStageTailModes[index] =
+          factor == 1 ? "factor1" : "factorF_only";
+    else if (localSimtScope)
+      plan.runtimeStageTailModes[index] = "factorF_plus_factor1_tail";
+    else
+      plan.runtimeStageTailModes[index] = "factorF_body_plus_factor1_tail";
+    if (plan.candidate == StageKernelRouteKind::AllSIMD)
+      plan.runtimeStageLoopIterationCounts[index] = schedule.programsPerSlot;
+    else if (plan.candidate == StageKernelRouteKind::AllSIMT)
+      plan.runtimeStageLoopIterationCounts[index] = schedule.wholeIterations;
+    else
+      plan.runtimeStageLoopIterationCounts[index] =
+          (plan.implementations[index].mode == StageMode::SIMT &&
+           plan.implementations[index].localScope)
+              ? schedule.mixedIterations
+              : schedule.programsPerSlot;
+
+    if (!hasV1Schedule) {
+      if (plan.candidate == StageKernelRouteKind::Mixed &&
+          plan.implementations[index].mode == StageMode::SIMT &&
+          plan.implementations[index].localScope) {
+        // A local scope without an explicit V1 shell still has the same
+        // materialization contract as a V1 body: complete F-wide groups and
+        // individual F1 tails.  `wholeIterations` is the pure-SIMT partial
+        // group count; using it here silently charged an F-wide body for the
+        // tail and made the route depend on whether the dispatch shell was
+        // present in the analysis view.
+        double tailUnitCycles = selected->totalCycles;
+        double tailUnitHandoff = 0.0;
+        double tailSetup = selected->resources.setup;
+        if (auto tail = getTailCosts()) {
+          tailUnitCycles = std::get<0>(*tail);
+          tailUnitHandoff = std::get<1>(*tail);
+          tailSetup = std::get<2>(*tail);
+        } else if (schedule.tailPrograms > 0) {
+          return false;
+        }
+        const double tailBody =
+            std::max(0.0, tailUnitCycles - tailSetup - tailUnitHandoff);
+        scaledStageCycles = setup + schedule.fullGroups * fullBody +
+                            schedule.tailPrograms * tailBody;
+        scaledHandoffCycles =
+            schedule.fullGroups * unscaledHandoffCycles[index] +
+            schedule.tailPrograms * tailUnitHandoff;
+      } else {
+        // With no V1 scheduling shell there is no factor-F cloning to model.
+        // The stage is simply replayed once per logical program (or once per
+        // factor-F VF for a pure-SIMT candidate).  A shell-backed Mixed stage
+        // takes the separate branch below, where SIMD peers use full groups
+        // plus an F1 tail.
+        const int64_t repetitions =
+            plan.candidate == StageKernelRouteKind::AllSIMT
+                ? schedule.wholeIterations
+                : schedule.programsPerSlot;
+        scaledStageCycles = setup + repetitions * fullBody;
+        scaledHandoffCycles *= repetitions;
+      }
+    } else if (stage.model == "auto_blockify_loop") {
+      const int64_t repetitions =
+          plan.candidate == StageKernelRouteKind::AllSIMD
+              ? programsPerSchedulingSlot
+          : plan.candidate == StageKernelRouteKind::AllSIMT
+              ? wholeKernelGroupIterations
+              : mixedLoopIterations;
+      scaledStageCycles = setup + repetitions * fullBody;
+      scaledHandoffCycles *= repetitions;
+    } else if (stage.features.insideAutoBlockifyV1Loop) {
+      if (plan.candidate == StageKernelRouteKind::AllSIMD) {
+        scaledStageCycles = setup + schedule.programsPerSlot * fullBody;
+        scaledHandoffCycles *= schedule.programsPerSlot;
+      } else if (plan.candidate == StageKernelRouteKind::AllSIMT) {
+        scaledStageCycles = setup + schedule.wholeIterations * fullBody;
+        scaledHandoffCycles *= schedule.wholeIterations;
+      } else {
+        double tailUnitCycles = selected->totalCycles;
+        double tailUnitHandoff = 0.0;
+        double tailSetup = selected->resources.setup;
+        if (auto tail = getTailCosts()) {
+          tailUnitCycles = std::get<0>(*tail);
+          tailUnitHandoff = std::get<1>(*tail);
+          tailSetup = std::get<2>(*tail);
+        } else if (tailPrograms > 0) {
+          return false;
+        }
+        const double tailBody =
+            std::max(0.0, tailUnitCycles - tailSetup - tailUnitHandoff);
+        scaledStageCycles = setup + schedule.fullGroups * fullBody +
+                            schedule.tailPrograms * tailBody;
+        scaledHandoffCycles =
+            schedule.fullGroups * unscaledHandoffCycles[index] +
+            schedule.tailPrograms * tailUnitHandoff;
+      }
+    }
+
+    // Keep the public logical-stage total inclusive of the fixed scope
+    // envelope, while exposing that envelope separately in
+    // `scopeHandoffCycles`.  Boundary tensor data was already part of
+    // `fullBody` above and is therefore not added here.
+    scaledStageCycles += scaledHandoffCycles;
+    plan.logicalStageCycles[index] = scaledStageCycles;
+    plan.scopeHandoffCycles[index] = scaledHandoffCycles;
+    plan.totalCycles += scaledStageCycles;
+  }
+  return true;
+}
+
 llvm::Expected<StageCostModelSummary>
 mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
-                               const StageTransitionCost &transition) {
+                               const ScopeHandoffCost &scopeHandoff) {
   if (costTable.stages.empty())
     return llvm::createStringError(std::errc::invalid_argument,
                                    "stage route model requires at least one "
                                    "logical stage");
-  if (!transition.isValid())
+  if (!scopeHandoff.isValid())
     return llvm::createStringError(std::errc::invalid_argument,
-                                   "stage transition costs must be finite and "
-                                   "non-negative");
+                                   "scope handoff fixed cost must be finite "
+                                   "and non-negative, and its rates must be "
+                                   "finite and positive");
 
   auto findImplementation =
       [](const LogicalStageCost &stage, StageMode mode, int64_t factor,
@@ -529,7 +1116,7 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
                                       ? mixedBaseStageCost(stage, *simd, factor)
                                       : std::numeric_limits<double>::infinity();
         const double simtCycles =
-            simt ? mixedEquivalentStageCost(stage, *simt, transition)
+            simt ? mixedEquivalentStageCost(stage, *simt, scopeHandoff)
                  : std::numeric_limits<double>::infinity();
         selected = simtCycles < simdCycles ? simt : simd;
         stageCycles = std::min(simdCycles, simtCycles);
@@ -540,10 +1127,11 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
       if (kind != StageKernelRouteKind::Mixed)
         stageCycles = selected->totalCycles;
 
-      const double transitionCycles =
-          stageCycles - mixedBaseStageCost(stage, *selected, factor);
+      const double scopeHandoffCycles =
+          stageCycles -
+          mixedBodyStageCost(stage, *selected, factor, scopeHandoff);
       plan.implementations.push_back(selected->implementation);
-      plan.entryTransitionCycles.push_back(transitionCycles);
+      plan.scopeHandoffCycles.push_back(scopeHandoffCycles);
       plan.logicalStageCycles.push_back(stageCycles);
       plan.totalCycles += stageCycles;
     }
@@ -561,21 +1149,44 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
         for (size_t simtIndex = 0; simtIndex < mixedChoices.size();
              ++simtIndex) {
           const MixedChoice &simtChoice = mixedChoices[simtIndex];
-          if (!simtChoice.simt ||
-              std::max<int64_t>(
-                  1, costTable.stages[simtIndex].localSimtScopeCount) != 1)
+          if (!simtChoice.simt)
             continue;
           double candidateTotal = simtChoice.simtCycles;
           bool candidateLegal = mixedChoices.size() > 1;
+          StageRoutePlan trial;
+          trial.candidate = kind;
+          trial.routeSuperblockFactor = factor;
           for (size_t index = 0; index < mixedChoices.size(); ++index) {
-            if (index == simtIndex)
-              continue;
-            if (!mixedChoices[index].simd) {
+            const MixedChoice &choice = mixedChoices[index];
+            const StageImplementationCost *selected =
+                index == simtIndex ? choice.simt : choice.simd;
+            if (!selected) {
               candidateLegal = false;
               break;
             }
-            candidateTotal += mixedChoices[index].simdCycles;
+            const double selectedCycles =
+                index == simtIndex ? choice.simtCycles : choice.simdCycles;
+            candidateTotal += index == simtIndex ? 0.0 : choice.simdCycles;
+            trial.implementations.push_back(selected->implementation);
+            trial.scopeHandoffCycles.push_back(
+                selectedCycles - mixedBodyStageCost(costTable.stages[index],
+                                                    *selected, factor,
+                                                    scopeHandoff));
+            trial.logicalStageCycles.push_back(selectedCycles);
           }
+          // Rank the constrained route after execution-domain scheduling, not
+          // from the unscaled one-group sum.  In particular, a local SIMT
+          // scope uses Q_v while the SIMD/Cube peer uses Q_a; comparing the
+          // unscaled minima can choose a route that loses after materializing
+          // the actual AIV/AIC loops.
+          const bool haveRuntimeSchedule =
+              costTable.logicalProgramCountHint > 0 &&
+              costTable.physicalCoreCountHint > 0;
+          if (haveRuntimeSchedule && candidateLegal)
+            candidateTotal =
+                applyRuntimeSchedule(trial, costTable, scopeHandoff)
+                    ? trial.totalCycles
+                    : std::numeric_limits<double>::infinity();
           if (candidateLegal && candidateTotal < bestTotal) {
             bestTotal = candidateTotal;
             bestSimtIndex = simtIndex;
@@ -588,7 +1199,7 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
         }
 
         plan.implementations.clear();
-        plan.entryTransitionCycles.clear();
+        plan.scopeHandoffCycles.clear();
         plan.logicalStageCycles.clear();
         plan.totalCycles = 0.0;
         for (size_t index = 0; index < mixedChoices.size(); ++index) {
@@ -598,9 +1209,10 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
           const double selectedCycles =
               index == bestSimtIndex ? choice.simtCycles : choice.simdCycles;
           plan.implementations.push_back(selected->implementation);
-          plan.entryTransitionCycles.push_back(
-              selectedCycles -
-              mixedBaseStageCost(costTable.stages[index], *selected, factor));
+          plan.scopeHandoffCycles.push_back(
+              selectedCycles - mixedBodyStageCost(costTable.stages[index],
+                                                  *selected, factor,
+                                                  scopeHandoff));
           plan.logicalStageCycles.push_back(selectedCycles);
           plan.totalCycles += selectedCycles;
         }
@@ -641,9 +1253,10 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
             replacementCycles - plan.logicalStageCycles[bestIndex];
         plan.implementations[bestIndex] = replacement->implementation;
         plan.logicalStageCycles[bestIndex] = replacementCycles;
-        plan.entryTransitionCycles[bestIndex] =
-            replacementCycles - mixedBaseStageCost(costTable.stages[bestIndex],
-                                                   *replacement, factor);
+        plan.scopeHandoffCycles[bestIndex] =
+            replacementCycles - mixedBodyStageCost(costTable.stages[bestIndex],
+                                                   *replacement, factor,
+                                                   scopeHandoff);
         return true;
       };
 
@@ -659,16 +1272,10 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
         return invalid;
       }
     }
-    if (costTable.logicalProgramCountHint > 0) {
-      plan.runtimePhysicalProgramCount =
-          (costTable.logicalProgramCountHint + factor - 1) / factor;
-      if (costTable.physicalCoreCountHint > 0)
-        plan.runtimeWaveCount = (plan.runtimePhysicalProgramCount +
-                                 costTable.physicalCoreCountHint - 1) /
-                                costTable.physicalCoreCountHint;
-      for (double &cycles : plan.logicalStageCycles)
-        cycles *= static_cast<double>(plan.runtimeWaveCount);
-      plan.totalCycles *= static_cast<double>(plan.runtimeWaveCount);
+    if (!applyRuntimeSchedule(plan, costTable, scopeHandoff)) {
+      StageRoutePlan invalid;
+      invalid.candidate = kind;
+      return invalid;
     }
     plan.legal = true;
     return plan;
@@ -692,7 +1299,7 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
   result.modeledOperationCount = costTable.modeledOperationCount;
   result.profileVersion = costTable.profileVersion;
   result.stages = costTable.stages;
-  result.transition = transition;
+  result.scopeHandoff = scopeHandoff;
   result.allSimd = buildPlan(StageKernelRouteKind::AllSIMD, 1);
   result.allSimt = bestFactoredPlan(StageKernelRouteKind::AllSIMT);
   result.mixed = bestFactoredPlan(StageKernelRouteKind::Mixed);

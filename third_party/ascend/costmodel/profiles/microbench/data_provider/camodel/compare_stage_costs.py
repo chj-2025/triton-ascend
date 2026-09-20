@@ -19,16 +19,15 @@ RESOURCE_KEYS = (
     "setup",
     "load_per_iteration",
     "store_per_iteration",
+    "shared_local_load_per_iteration",
+    "shared_local_store_per_iteration",
+    "private_stack_load_per_iteration",
+    "private_stack_store_per_iteration",
     "compute_per_iteration",
     "dot_per_iteration",
     "scalar_per_iteration",
     "predicate_per_iteration",
     "shuffle_per_iteration",
-    "branch_control_per_iteration",
-    "loop_control_per_iteration",
-    "divergence_per_iteration",
-    "synchronization_per_iteration",
-    "spill_per_iteration",
     "issue_per_iteration",
     "critical_path_per_iteration",
     "epilogue",
@@ -42,9 +41,15 @@ FAMILY_RESOURCE_KEYS = {
     "scalar": ("scalar_per_iteration", ),
     "predicate": ("predicate_per_iteration", ),
     "shuffle": ("shuffle_per_iteration", ),
-    "control": ("branch_control_per_iteration", "loop_control_per_iteration", "divergence_per_iteration"),
-    "synchronization": ("synchronization_per_iteration", ),
-    "spill": ("spill_per_iteration", ),
+    # The shared issue floor cannot be attributed to one resource family.
+    # Independent control/synchronization latency is intentionally absent
+    # until a composite signature can be measured.
+    "control": (),
+    "synchronization": (),
+    "shared_local": ("shared_local_load_per_iteration",
+                      "shared_local_store_per_iteration"),
+    "private_stack": ("private_stack_load_per_iteration",
+                       "private_stack_store_per_iteration"),
 }
 
 
@@ -57,6 +62,14 @@ def classify_instruction(name, pipe):
     upper_pipe = pipe.upper()
     if upper_name == "VF_SIMT":
         return "envelope"
+    # Check private stack operations before the generic SIMT_LD/SIMT_ST
+    # prefixes.  Otherwise LDK/STK are silently misclassified as ordinary
+    # global/shared loads and stores, which double-counts or hides register
+    # allocation traffic in stage reports.
+    if upper_name.endswith(("STK", "LDK")):
+        return "private_stack"
+    if upper_name.endswith(("STS", "LDS")):
+        return "shared_local"
     if "LD" in upper_pipe or upper_name.startswith(("SIMT_LD", "LD_")):
         return "load"
     if "ST" in upper_pipe or upper_name.startswith(("SIMT_ST", "ST_")):
@@ -71,8 +84,6 @@ def classify_instruction(name, pipe):
         return "control"
     if any(token in upper_name for token in ("SYNC", "SET_FLAG", "WAIT_FLAG")):
         return "synchronization"
-    if upper_name.endswith(("STK", "LDK")):
-        return "spill"
     if "SCALAR" in upper_pipe:
         return "scalar"
     return "compute"
@@ -150,11 +161,20 @@ def addr2line(binary, addresses, load_bias, executable):
         stack = stacks.get(address, [])
         # Inline stacks often start in a CCE intrinsic or library helper.  The
         # Triton source frame is the evidence required by Stage provenance.
-        locations[address] = next((line for line in stack if ".py:" in line), stack[0] if stack else "??:0")
+        locations[address] = next(
+            (line for line in stack
+             if re.search(r"\.(?:py|mlir|ttir|npuir|cce):\d+", line)),
+            stack[0] if stack else "??:0")
     return locations
 
 
 def family_is_predicted(stage, family):
+    # LDK/STK are emitted by SIMT lowering/register-stack formation, not by a
+    # TTIR memory workload.  They therefore have no pre-lowering resource
+    # field to test.  A source/PC attribution is still valid for a SIMT Stage;
+    # keep the observation visible instead of dropping it as "unmatched".
+    if family == "private_stack":
+        return stage.get("implementation", {}).get("mode") == "simt"
     keys = FAMILY_RESOURCE_KEYS.get(family, ())
     resources = stage["predicted_resource_system_cycles"]
     return any(float(resources.get(key, 0.0)) > 0.0 for key in keys)
@@ -163,6 +183,25 @@ def family_is_predicted(stage, family):
 def read_instruction_source_attribution(path, predicted, binary, load_bias, executable):
     with path.open(newline="", encoding="utf-8-sig") as stream:
         rows = list(csv.DictReader(stream))
+    # CaModel emits zero-duration terminal pseudo instructions (for example
+    # END_LABEL/DCI/END) with sentinel addresses such as 0x11111111.  They are
+    # not PCs in the loaded kernel image and must not make addr2line attribution
+    # fail for every real instruction in the trace.
+    sentinel_rows = [
+        row for row in rows
+        if parse_int(row["addr"]) < load_bias
+        and float(row.get("running_time(us)") or 0.0) == 0.0
+    ]
+    invalid_rows = [
+        row for row in rows
+        if parse_int(row["addr"]) < load_bias and row not in sentinel_rows
+    ]
+    if invalid_rows:
+        names = sorted({row["instr"] for row in invalid_rows})
+        raise RuntimeError(
+            "non-sentinel CaModel instruction address is below the supplied "
+            f"load bias: {names}")
+    rows = [row for row in rows if row not in sentinel_rows]
     addresses = sorted({parse_int(row["addr"]) for row in rows})
     locations = addr2line(binary, addresses, load_bias, executable)
     source_owners = build_source_owners(predicted)
@@ -203,7 +242,8 @@ def read_instruction_source_attribution(path, predicted, binary, load_bias, exec
 
 
 def source_line_key(value):
-    match = re.search(r'([^/\\"()]+\.py)"?:(\d+)', value)
+    match = re.search(
+        r'([^/\\"()]+\.(?:py|mlir|ttir|npuir|cce))"?:(\d+)', value)
     if not match:
         return None
     return f"{match.group(1)}:{match.group(2)}"
@@ -306,13 +346,130 @@ def predicted_stage_rows(model, route_name):
             "kind": stage.get("model"),
             "source_locations": stage.get("source_locations", []),
             "implementation": selection["implementation"],
+            # Preserve the runtime-domain audit emitted by StageRoutePlan.
+            # These fields are essential when a Mixed report contains both
+            # the parent AIC loop and a local AIV scope; without them a
+            # downstream comparison can accidentally apply one Q/F schedule
+            # to every Stage.
+            "runtime_execution_domain": selection.get(
+                "runtime_execution_domain"
+            ),
+            "runtime_tail_mode": selection.get("runtime_tail_mode"),
+            "runtime_scheduling_slot_count": selection.get(
+                "runtime_scheduling_slot_count"
+            ),
+            "runtime_logical_programs_per_scheduling_slot": selection.get(
+                "runtime_logical_programs_per_scheduling_slot"
+            ),
+            "runtime_full_group_count": selection.get(
+                "runtime_full_group_count"
+            ),
+            "runtime_tail_program_count": selection.get(
+                "runtime_tail_program_count"
+            ),
+            "runtime_loop_iteration_count": selection.get(
+                "runtime_loop_iteration_count"
+            ),
             "iteration_count": stage.get("iteration_count", 1),
             "predicted_total_system_cycles": selection["logical_stage_system_cycles"],
-            "predicted_entry_transition_system_cycles": selection.get("entry_transition_system_cycles", 0.0),
+            "predicted_scope_handoff_system_cycles": selection.get("scope_handoff_system_cycles", 0.0),
             "predicted_resource_system_cycles": {key: resources.get(key, 0.0)
                                                  for key in RESOURCE_KEYS},
+            # Keep the TTIR-side source facts next to the selected route.  The
+            # offline fitter uses these fields; the online C++ model never
+            # consumes the CaModel output itself.
+            "workload": stage.get("workload", {}),
         })
     return rows, route
+
+
+FIT_FAMILY = {
+    "global_load": ("load", "load"),
+    "global_store": ("store", "store"),
+    "shared_load": ("shared_local", "load"),
+    "shared_store": ("shared_local", "store"),
+    "private_load": ("private_stack", "load"),
+    "private_store": ("private_stack", "store"),
+}
+
+
+def _fit_source_row(stage, observed, family_name):
+    """Build one source-to-generated-traffic fit row from one Stage.
+
+    ``observed`` is the per-Stage instruction attribution produced by either
+    a PC range map or addr2line/debug-line correlation.  For global LDG/STG,
+    TTIR supplies semantic operation/layout facts.  For LDS/STS and LDK/STK,
+    TTIR supplies only explicit lowering counts when present; otherwise the
+    row is omitted rather than manufacturing a target value.
+    """
+    observed_family, direction = FIT_FAMILY[family_name]
+    target = observed.get(observed_family)
+    if not target or float(target.get("call_count", 0.0)) <= 0.0:
+        return None
+    workload = stage.get("workload", {})
+    facts = workload.get("simt_memory_access_facts", {})
+    is_load = direction == "load"
+    prefix = "load" if is_load else "store"
+    if observed_family == "load" or observed_family == "store":
+        direct_key = f"{prefix}_warp_instructions_per_iteration"
+        operations = facts.get(f"{prefix}_operations", 0.0)
+        segments = facts.get(f"{prefix}_segments", 0.0)
+        contiguous = facts.get(f"{prefix}_contiguous_bytes", 0.0)
+        stride = facts.get(f"{prefix}_stride_bytes", 0.0)
+        masked = facts.get(f"{prefix}_masked_operations", 0.0)
+    elif observed_family == "shared_local":
+        direct_key = f"shared_local_{prefix}_instructions_per_iteration"
+        operations = segments = contiguous = stride = masked = 0.0
+    else:
+        direct_key = f"private_stack_{prefix}_instructions_per_iteration"
+        operations = segments = contiguous = stride = masked = 0.0
+    direct = workload.get(direct_key, 0.0)
+    # A generated traffic sample without a lowering-provided direct count is
+    # not a usable source fit.  This keeps missing LDS/STS/LDK/STK metadata
+    # visible instead of fitting a misleading zero-input point.
+    if observed_family != "load" and observed_family != "store" and direct <= 0.0:
+        return None
+    iteration_count = max(1.0, float(stage.get("iteration_count", 1)))
+    raw_target_work = float(target.get("call_count", 0.0))
+    raw_target_cycles = float(target.get("cycles", 0.0))
+    return {
+        "stage_id": stage["id"],
+        "family": family_name,
+        "iteration_count": iteration_count,
+        "direct_instructions": direct,
+        "operations": operations,
+        "segments": segments,
+        "contiguous_bytes": contiguous,
+        "stride_bytes": stride,
+        "masked": masked,
+        "peak_live_register_units": workload.get(
+            "peak_live_register_units_per_logical_program", 0.0),
+        # TTIR workload fields are per Stage iteration.  CaModel attribution
+        # is normally a whole-kernel dynamic sum, so normalize the target by
+        # the same iteration count before fitting.  Keep raw values for audit.
+        "target_work": raw_target_work / iteration_count,
+        "target_cycles": raw_target_cycles / iteration_count,
+        "raw_target_work": raw_target_work,
+        "raw_target_cycles": raw_target_cycles,
+    }
+
+
+def write_fit_evidence(path, predicted, observations, family_name):
+    rows = []
+    for stage in predicted:
+        row = _fit_source_row(stage, observations.get(stage["id"], {}),
+                               family_name)
+        if row is not None:
+            rows.append(row)
+    fields = ("stage_id", "family", "iteration_count", "direct_instructions", "operations",
+              "segments", "contiguous_bytes", "stride_bytes", "masked",
+              "peak_live_register_units", "target_work", "target_cycles",
+              "raw_target_work", "raw_target_cycles")
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
 
 
 def main():
@@ -325,8 +482,19 @@ def main():
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--load-bias", type=parse_int)
     parser.add_argument("--addr2line", type=Path, default=Path("llvm-addr2line"))
+    parser.add_argument(
+        "--fit-evidence-output", type=Path,
+        help="write a source-to-generated-traffic CSV for fit_simt_source_memory.py")
+    parser.add_argument(
+        "--fit-family", choices=tuple(FIT_FAMILY),
+        help="family to export with --fit-evidence-output")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+
+    if args.fit_evidence_output and not args.fit_family:
+        parser.error("--fit-evidence-output requires --fit-family")
+    if args.fit_family and not args.fit_evidence_output:
+        parser.error("--fit-family requires --fit-evidence-output")
 
     report = json.loads(args.report.read_text(encoding="utf-8"))
     model = find_stage_model(report)
@@ -349,6 +517,19 @@ def main():
          unmatched_instruction_sources) = read_instruction_source_attribution(args.instruction_csv, predicted,
                                                                               args.binary, args.load_bias,
                                                                               args.addr2line)
+
+    if args.fit_evidence_output:
+        if args.binary:
+            fit_observations = instruction_source_observations
+        elif ranges:
+            fit_observations = per_stage
+        else:
+            parser.error(
+                "--fit-evidence-output requires --stage-pc-map or --binary")
+        count = write_fit_evidence(args.fit_evidence_output, predicted,
+                                   fit_observations, args.fit_family)
+    else:
+        count = None
 
     for row in predicted:
         if ranges:
@@ -405,6 +586,11 @@ def main():
         unmatched_instruction_sources,
         "unmapped_instruction_pcs":
         unmapped,
+        "fit_evidence": ({
+            "path": str(args.fit_evidence_output),
+            "family": args.fit_family,
+            "rows": count,
+        } if args.fit_evidence_output else None),
         "camodel_kernel_resource_families":
         aggregate,
         "stages":

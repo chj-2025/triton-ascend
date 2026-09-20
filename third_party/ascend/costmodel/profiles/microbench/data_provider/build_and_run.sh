@@ -12,17 +12,23 @@
 set -e
 
 # --- environment (kaixin conda for toolchain, CANN env for ccec + runtime) ---
-conda activate kaixin 2>/dev/null || true
-if [[ -f /data/kaixin/set_env.sh ]]; then
-  source /data/kaixin/set_env.sh >/dev/null 2>&1
-else
-  source /home/kaixin/set_env.sh >/dev/null 2>&1
+# Keep an explicitly initialized TD/PR environment; never switch TD to kaixin.
+if [[ -z "${ASCEND_TOOLKIT_HOME:-}" ]]; then
+  if [[ -n "${PROBE_ENV_SCRIPT:-}" ]]; then
+    source "$PROBE_ENV_SCRIPT"
+  elif [[ -f /data/kaixin/set_env.sh ]]; then
+    source /data/kaixin/set_env.sh
+  else
+    echo "Initialize the target Conda/CANN environment or set PROBE_ENV_SCRIPT." >&2
+    exit 1
+  fi
 fi
 
 # Template headers (RegBase/VecUtils.h, RegBase/Cumulative/SIMTCumsumCore.h, ...).
 # Override by exporting INC=... if your catfood checkout lives elsewhere.
 INC="${INC:-/data/kaixin/AscendNPU-IR-Dev/bishengir/lib/Template/include}"
 TK="${ASCEND_TOOLKIT_HOME:?ASCEND_TOOLKIT_HOME unset - did set_env.sh run?}"
+HOST_ARCH="$(uname -m)"
 
 echo "INC = $INC"
 echo "TK  = $TK"
@@ -31,13 +37,19 @@ echo "TK  = $TK"
 # build one probe: <name>.cce -> <name>.o (device) and <name>_host.cpp -> <name>_host (host)
 build_probe() {
   local name="$1"
+  local arch="${PROBE_DEVICE_ARCH:-dav-c310}"
+  case "$name" in
+    tput|simd_memory|simt_memory|simt_gm_memory|simt_shuffle|setup_probe|dependent_latency|operation_rates|control_rates|scan_rates|transition_pair)
+      arch="${PROBE_DEVICE_ARCH:-dav-c310-vec}" ;;
+  esac
   echo "--- building $name.o (device) ---"
-  ccec -c -std=c++17 -O2 --cce-aicore-only --cce-aicore-arch=dav-c310 \
+  ccec -c -std=c++17 -O2 --cce-aicore-only --cce-aicore-arch="$arch" \
        -I"$INC" "$name.cce" -o "$name.o"
   echo "--- building ${name}_host (host) ---"
   g++ -O2 "${name}_host.cpp" -o "${name}_host" \
-      -I"$TK/x86_64-linux/pkg_inc" -I"$TK/include" \
-      -L"$TK/lib64" -lruntime -lascendcl
+      -I"$TK/$HOST_ARCH-linux/pkg_inc" -I"$TK/$HOST_ARCH-linux/include" \
+      -L"$TK/$HOST_ARCH-linux/lib64" \
+      -Wl,-rpath,"$TK/$HOST_ARCH-linux/lib64" -lruntime -lascendcl
 }
 
 run_probe() {
@@ -48,6 +60,16 @@ run_probe() {
 }
 
 targets="${*:-meas busy tput decomp}"
+if [[ " $targets " == *" operation_rates "* ]]; then
+  echo "operation_rates must use ./run_operation_rates.sh: it builds one" >&2
+  echo "compile-time-specialized binary per operation and audits optimized IR." >&2
+  exit 2
+fi
+if [[ " $targets " == *" scan_rates "* ]]; then
+  echo "scan_rates must use ./run_scan_rates.sh: it specializes scan/identity" >&2
+  echo "modes at compile time and audits optimized IR." >&2
+  exit 2
+fi
 for t in $targets; do
   build_probe "$t"
 done

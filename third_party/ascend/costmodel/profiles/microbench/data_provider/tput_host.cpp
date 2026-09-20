@@ -5,10 +5,18 @@
 #include <acl/acl.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sys/time.h>
 
 using namespace std;
+
+static void check(int code, const char *operation) {
+  if (code != 0) {
+    fprintf(stderr, "%s failed: %d\n", operation, code);
+    exit(EXIT_FAILURE);
+  }
+}
 
 static unsigned long us() {
   timeval t;
@@ -18,6 +26,7 @@ static unsigned long us() {
 
 static char *readBin(const char *f, uint32_t *sz) {
   ifstream s(f, ios::binary);
+  if (!s) { fprintf(stderr, "Cannot open %s\n", f); exit(EXIT_FAILURE); }
   s.seekg(0, ios::end);
   size_t n = s.tellg();
   s.seekg(0);
@@ -36,7 +45,7 @@ static void *reg(const char *bin, char **buf) {
   b.magic = RT_DEV_BINARY_MAGIC_ELF_AIVEC;
   b.version = 0;
   void *h = 0;
-  rtDevBinaryRegister(&b, &h);
+  check(rtDevBinaryRegister(&b, &h), "rtDevBinaryRegister");
   return h;
 }
 
@@ -57,10 +66,27 @@ static long long runK(const char *fn, rtStream_t s, void *dout, int K,
   ai.argsSize = sizeof(a);
   rtTaskCfgInfo_t c = {};
   c.localMemorySize = 192 * 1024;
-  rtKernelLaunchWithFlagV2((void *)fn, 1, &ai, 0, s, 0, &c);
-  rtStreamSynchronize(s);
-  long long cyc = 0;
-  rtMemcpy(&cyc, 8, dout, 8, RT_MEMCPY_DEVICE_TO_HOST);
+  check(rtKernelLaunchWithFlagV2((void *)fn, 1, &ai, 0, s, 0, &c), "rtKernelLaunchWithFlagV2");
+  check(rtStreamSynchronize(s), "rtStreamSynchronize");
+  long long results[1025] = {};
+  check(rtMemcpy(results, sizeof(results), dout, sizeof(results),
+                 RT_MEMCPY_DEVICE_TO_HOST), "rtMemcpy");
+  int count = mode == 0 ? nwarp * 32 : nwarp * 64;
+  for (int index = 0; index < count; ++index) {
+    long long expected = mode == 0
+        ? 8LL * (index % 32 + index / 32 + 1) + 28 + 8LL * iters
+        : 1LL + K * iters;
+    float actual = reinterpret_cast<float *>(results + 4)[index];
+    if (actual < expected - 0.01 || actual > expected + 0.01 || actual != actual) {
+      fprintf(stderr, "Wrong result mode=%d index=%d got=%f expected=%lld\n",
+              mode, index, actual, expected);
+      exit(EXIT_FAILURE);
+    }
+  }
+  long long cyc = results[0];
+  if (cyc <= 0) { fprintf(stderr, "Invalid counter delta\n"); exit(EXIT_FAILURE); }
+  printf("RAW K=%d lanes=%d warps=%d iters=%d mode=%d ticks=%lld\n",
+         K, nlane, nwarp, iters, mode, cyc);
   return cyc;
 }
 
@@ -87,16 +113,16 @@ static double cycPerIter(const char *fn, rtStream_t s, void *dout, int nl,
 }
 
 int main() {
-  aclInit(0);
-  rtSetDevice(0);
+  check(aclInit(0), "aclInit");
+  check(rtSetDevice(0), "rtSetDevice");
   char *buf;
   void *h = reg("tput.o", &buf);
   const char *fn = "measure";
-  rtFunctionRegister(h, fn, fn, (void *)fn, 0);
+  check(rtFunctionRegister(h, fn, fn, (void *)fn, 0), "rtFunctionRegister");
   rtStream_t s;
-  rtStreamCreate(&s, 0);
+  check(rtStreamCreate(&s, 0), "rtStreamCreate");
   void *dout;
-  rtMalloc(&dout, 8, RT_MEMORY_HBM, 0);
+  check(rtMalloc(&dout, 1025 * sizeof(long long), RT_MEMORY_HBM, 0), "rtMalloc");
 
   runK(fn, s, dout, 10, 32, 32, 100, 0); // warmup
 

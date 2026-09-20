@@ -72,29 +72,29 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
   m.def("add_ttir_layout_merge", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createTTIRLayoutMergePass());
   });
-  m.def("add_simt_auto_blockify_v1", [](mlir::PassManager &pm,
-                                        int physicalVectorCoreCount,
-                                        int superBlockFactor) {
+  m.def("add_auto_blockify_v1", [](mlir::PassManager &pm,
+                                    int physicalVectorCoreCount,
+                                    int superBlockFactor) {
     if (physicalVectorCoreCount <= 0)
       throw py::value_error(
           "physical_vector_core_count must be greater than zero");
     if (superBlockFactor <= 0)
       throw py::value_error("super_block_factor must be greater than zero");
-    TASIMTAutoBlockifyV1Options opts;
+    TAAutoBlockifyV1Options opts;
     opts.physicalVectorCoreCount = physicalVectorCoreCount;
     opts.superBlockFactor = superBlockFactor;
     pm.addNestedPass<mlir::triton::FuncOp>(
-        mlir::triton::createTASIMTAutoBlockifyV1Pass(opts));
+        mlir::triton::createTAAutoBlockifyV1Pass(opts));
   });
   m.def(
-      "add_refine_simt_auto_blockify_v1_superblock",
+      "add_refine_auto_blockify_v1_superblock",
       [](mlir::PassManager &pm, int superBlockFactor) {
         if (superBlockFactor <= 0)
           throw py::value_error("super_block_factor must be greater than zero");
-        TARefineSIMTAutoBlockifyV1SuperBlockOptions opts;
+        TARefineAutoBlockifyV1SuperBlockOptions opts;
         opts.superBlockFactor = superBlockFactor;
         pm.addNestedPass<mlir::triton::FuncOp>(
-            mlir::triton::createTARefineSIMTAutoBlockifyV1SuperBlockPass(opts));
+            mlir::triton::createTARefineAutoBlockifyV1SuperBlockPass(opts));
       });
 
 #if TRITON_ASCEND_HAS_INPROC_COSTMODEL

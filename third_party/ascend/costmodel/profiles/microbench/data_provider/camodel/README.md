@@ -2,7 +2,7 @@
 
 This directory documents how to generate CAModel simulator data and how to
 promote the parsed result into the microbenchmark profile data source used by
-`../../ascend_davidv100_v1.json`.
+`../../ascend_950pr_v1.json`.
 
 ## Directory layout
 
@@ -11,11 +11,15 @@ data_provider/
   *.cce / *_host.cpp                 # runnable microbenchmark sources
   build_and_run.sh                   # build + on-board run helper
   build_commands.md                  # normal build/run commands
-  camodel/
+    camodel/
     README.md                        # this workflow
     camodel_experiment_matrix.json   # planned CAModel experiment coverage
     extract_camodel_system_cycle_profile.py
     compare_stage_costs.py           # Stage prediction / CaModel evidence join
+    summarize_local_traffic.py       # PC-attributed LDK/STK and LDS/STS audit
+  fit_simt_source_memory.py          # offline non-negative source fit
+  apply_simt_source_fit.py           # explicit profile promotion step
+  test_simt_source_fit.py            # promotion-path regression test
 ```
 
 ## 1. Build the probe
@@ -117,6 +121,12 @@ The command should print entries such as `core0.veccore0`. An empty mapping
 means that the selected directory does not contain a supported primary SIMT
 dump; do not continue with an empty file.
 
+When `instr_exe.csv` is present, the parsed result also contains
+`vector_pipe_calls` and `vector_pipe_cycles`: `SIMT_LDG/LDS/LDK` are combined
+under `RVECLD`, while `SIMT_STG/STS/STK` are combined under `RVECST`.  These
+are physical-resource totals and must not be added as extra instruction
+classes on top of the per-opcode counts.
+
 The generated JSON count file has this shape:
 
 ```json
@@ -125,7 +135,10 @@ The generated JSON count file has this shape:
     "aiv0": {
       "span": {"delta": 1000},
       "group_counts": {
-        "memory": 100,
+        "global_memory": 70,
+        "shared_local": 20,
+        "private_stack": 10,
+        "memory": 90,
         "float_alu": 200,
         "shuffle": 0,
         "predicate": 10,
@@ -158,6 +171,28 @@ OPPROF_* raw dumps
   -> parsed_simt_memory.json
 ```
 
+### Fit TTIR source facts to generated SIMT work
+
+After joining the TTIR access facts with the corresponding lower-level
+`LDG/STG`, `LDS/STS`, or `LDK/STK` counts, fit one source-to-work rule without
+using a whole-kernel residual:
+
+```bash
+python3 ../fit_simt_source_memory.py source_memory_evidence.csv \
+  --profile-key global_load_source_fit \
+  -o global_load_fit.json
+```
+
+The CSV columns are `direct_instructions`, `operations`, `segments`,
+`contiguous_bytes`, `stride_bytes`, `masked`,
+`peak_live_register_units`, and `target_work`; optional `role=held_out`
+rows are excluded from fitting and reported as validation.  The output
+contains non-negative coefficients and a `profile_snippet` that can be copied
+under `simt.stage_resources`.  The online evaluator consumes the snippet only
+when `enabled=true`; unknown/mixed layouts retain the aggregate warp-rate
+fallback.  Exact S6/S22 layout curves remain in
+`ascend_950pr_simd_simt_v1.json` under `stage_resources.layout_memory`.
+
 The parser emits JSON like:
 
 ```json
@@ -179,7 +214,7 @@ isolated instruction latency.
 
 ## 4. Promote the result into the microbenchmark profile
 
-When a CAModel-derived number is used by `ascend_davidv100_v1.json`, record the
+When a CAModel-derived number is used by `ascend_950pr_v1.json`, record the
 complete provenance in the measurement `source` field.
 
 Recommended source format:
@@ -203,7 +238,7 @@ Before treating a CAModel result as a data source:
 2. Exact build command is covered by `build_commands.md`.
 3. Raw CAModel `OPPROF_*` artifact or a documented extracted subset is saved.
 4. Parser command and output JSON are saved under `data_provider/camodel/`.
-5. `ascend_davidv100_v1.json` `source` points to all relevant artifacts.
+5. `ascend_950pr_v1.json` `source` points to all relevant artifacts.
 6. The profile description does not claim hardware peak if the measurement is
    only workload-effective.
 
@@ -268,3 +303,119 @@ have exactly one predicted Stage owner. Ambiguous and unmatched evidence is
 reported explicitly. Debug-line attribution is supplementary: lowering may
 move a load to the line of a later dot/store, so compiler-emitted Stage PC
 ranges remain the required evidence for complete Stage calibration.
+
+To turn this attribution into a source-to-generated-traffic fitting sample,
+ask the same command to emit one row per uniquely attributed Stage. The
+`--fit-family` value selects the generated stream being fitted; the output is
+directly consumable by `fit_simt_source_memory.py`:
+
+```bash
+python3 camodel/compare_stage_costs.py route_report.json \
+  core0.veccore0_instr_exe.csv --route all_simt \
+  --stage-pc-map stage_pc_map.json \
+  --fit-family global_load \
+  --fit-evidence-output global_load_evidence.csv
+
+python3 fit_simt_source_memory.py global_load_evidence.csv \
+  --profile-key global_load_source_fit -o global_load_fit.json
+
+# Promote the fit explicitly; this writes a new profile and records the
+# evidence hash/held-out error under simt.stage_resources.fit_evidence.
+python3 apply_simt_source_fit.py \
+  ../../simd_simt/ascend_950pr_simd_simt_v1.json \
+  global_load_fit.json -o ascend_950pr_simd_simt_v1.global_load_fit.json
+```
+
+Use `global_store`, `shared_load`, `shared_store`, `private_load`, or
+`private_store` for the other streams. Rows are omitted when the Stage has no
+unique PC/source attribution or when TTIR has no explicit generated-traffic
+count; missing LDS/STS/LDK/STK facts therefore cannot silently become a zero
+sample. This is the offline bridge from TTIR facts + compiler PC map +
+CaModel/assembly counts to versioned profile coefficients. The online route
+model only reads the resulting profile and TTIR facts.
+
+The exported `target_work` and `target_cycles` are normalized by the selected
+Stage's TTIR `iteration_count`; `raw_target_work`/`raw_target_cycles` remain in
+the CSV for audit. This prevents a loop's whole-kernel instruction count from
+being fitted against a per-iteration TTIR workload.
+
+### Local/private traffic audit
+
+`SIMT_LDK`/`SIMT_STK` are private SIMT-stack operations emitted during
+lowering; they are not TTIR `tt.load`/`tt.store` byte traffic. `SIMT_LDS`/
+`SIMT_STS` are shared/local staging operations. Keep the two families separate
+when investigating a Stage gap. With the compiler-produced PC/source map and
+the same `instr_exe.csv`, generate a phase report:
+
+The pipe column in `instr_exe.csv` is the hardware resource identity: loads
+from all three families use `RVECLD` and stores use `RVECST`. These names are
+not SIMD-only concepts; SIMT instructions in the trace issue on the same AIV
+vector load/store pipes. Therefore a model must form
+`RVECLD = LDG + LDS + LDK` and `RVECST = STG + STS + STK` before applying a
+throughput bound.
+
+```bash
+python3 camodel/summarize_local_traffic.py \
+  OPPROF_xxx/.../core0.veccore0_instr_exe.csv \
+  /path/to/source_pc_work.csv \
+  --source-audit /path/to/source_work_audit.json \
+  -o local_traffic_phase_summary.json
+```
+
+The report includes dynamic calls and aggregate CaModel instruction cycles for
+each phase and opcode, vector-pipe totals for RVECLD/RVECST, plus a count
+reconciliation against the source audit.
+The cycle columns are not wall time: intervals from different warps/pipes
+overlap and must not be summed as kernel duration. This evidence can calibrate
+an explicit lowering-provided stack term; it must not be silently converted
+into a TTIR byte-throughput term.
+
+## 7. Enforce the 10% calibration gate
+
+Use `validate_stage_calibration.py` only with measurements from the same
+compiled binary as the Route Model report. It accepts either explicit
+`*_system_cycles` or `*_syscnt_ticks` plus an explicit
+`metadata.syscnt_ticks_per_system_cycle`; it never guesses a clock ratio and
+never fits a correction factor.
+
+The minimum evidence shape is:
+
+```json
+{
+  "metadata": {
+    "same_binary": true,
+    "target": "Ascend950PR_9579",
+    "triton_ascend_sha": "<sha>",
+    "ascend_npu_ir_sha": "<sha>",
+    "syscnt_ticks_per_system_cycle": 1.0
+  },
+  "phases": [
+    {
+      "id": "P1",
+      "measurement_kind": "phase_wall",
+      "predicted_system_cycles": 1000.0,
+      "measured_system_cycles": 950.0
+    }
+  ],
+  "kernel": {
+    "id": "kernel",
+    "measurement_kind": "kernel_wall",
+    "predicted_system_cycles": 4000.0,
+    "measured_system_cycles": 4200.0
+  }
+}
+```
+
+Run it from this directory:
+
+```bash
+python3 camodel/validate_stage_calibration.py calibration_evidence.json \
+  --threshold 0.10 --output calibration_validation.json
+```
+
+`phase_wall`, `wall`, and `kernel_wall` are accepted. Service windows,
+per-core intervals, and CaModel observations without a Stage PC map are
+rejected as calibration measurements. Exit status 0 means every supplied
+Phase and the kernel are within 10%; status 1 means at least one relative
+error exceeds the threshold; status 2 means the evidence is incomplete or
+unit/provenance-invalid.

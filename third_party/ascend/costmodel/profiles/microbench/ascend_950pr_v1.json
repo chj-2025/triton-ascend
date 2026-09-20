@@ -1,0 +1,1889 @@
+{
+  "$schema": "./microbenchmark_profile_schema.json",
+  "schema_version": 1,
+  "profile_version": "ascend-950pr-shared-microbench-20260914-v12",
+  "target": "Ascend950PR/dav-c310",
+  "description": "Model-neutral target facts and microbenchmark evidence. Model-specific scale, penalties, coverage, gates, and fallback priors are intentionally excluded.",
+  "measurements": {
+    "clock.sys_cnt.frequency_mhz": {
+      "description": "Measured SYS_CNT interval [999.942201, 1000.060183] MHz, rounded to 1000 MHz. Not compute-core frequency.",
+      "value": 1000,
+      "unit": "MHz",
+      "cycle_domain": "wall_clock",
+      "scope": "device",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_syscnt_20260912.json",
+      "confidence": "high"
+    },
+    "clock.device_compute.frequency_mhz": {
+      "description": "Configured compute clock, not SYS_CNT or runtime telemetry.",
+      "value": 1650,
+      "unit": "MHz",
+      "cycle_domain": "wall_clock",
+      "scope": "device",
+      "source_kind": "device_configuration",
+      "source": "Installed CANN platform_config/Ascend950PR_9579.ini, physical-machine snapshot 2026-09-12",
+      "confidence": "medium"
+    },
+    "simd.vector_width_bits": {
+      "description": "256-byte vector register width; not instruction throughput.",
+      "value": 2048,
+      "unit": "bit",
+      "cycle_domain": "none",
+      "scope": "single_aiv",
+      "source_kind": "device_configuration",
+      "source": "Installed CANN platform_config/Ascend950PR_9579.ini, physical-machine snapshot 2026-09-12",
+      "confidence": "medium"
+    },
+    "simt.warp_size": {
+      "description": "Number of scalar SIMT lanes that execute as one warp.",
+      "value": 32,
+      "unit": "lane",
+      "cycle_domain": "none",
+      "scope": "single_warp",
+      "source_kind": "architecture_fact",
+      "source": "Ascend SIMT execution contract",
+      "confidence": "high"
+    },
+    "simd.f32.add.throughput": {
+      "description": "Effective source-level FP32 SIMD add throughput on one AIV. The compile-time-specialized IR contains the intended vadd body and the slope removes fixed launch cost.",
+      "value": 3.298629007,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp4_or_more_effective_source_vadd",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simd.frontend.effective_issue_floor": {
+      "description": "Observable conservative SIMD instruction-issue floor, normalized from the full-width independent-vadd ILP sweep. This is not claimed as an architecture peak; it is a measured competing lower bound for Stage formulas.",
+      "value": 3.298629007,
+      "unit": "instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp4_or_more_full_width_vadd",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simd.f32.sub.throughput": {
+      "description": "Effective source-level FP32 SIMD subtract throughput on one AIV.",
+      "value": 3.298629007,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp4_or_more_effective_source_vsub",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simd.f32.mul.throughput": {
+      "description": "Effective source-level FP32 SIMD multiply throughput on one AIV.",
+      "value": 1.649229501,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp4_or_more_effective_source_vmul",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simd.f32.div.throughput": {
+      "description": "Effective source-level FP32 SIMD divide throughput on one AIV.",
+      "value": 0.471222306,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp4_or_more_effective_source_vdiv",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simd.f32.max.throughput": {
+      "description": "Effective source-level FP32 SIMD maximum throughput on one AIV.",
+      "value": 3.298799031,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp4_or_more_effective_source_vmax",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simd.f32.abs.throughput": {
+      "description": "Effective source-level FP32 SIMD absolute-value throughput on one AIV.",
+      "value": 3.299819541,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp4_or_more_effective_source_vabs",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simd.f32.exp.throughput": {
+      "description": "Effective source-level FP32 SIMD exponential throughput on one AIV; the intrinsic has a large fixed body so only the compile-time-specialized single-operation slope is claimed.",
+      "value": 0.473372781,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_special_function_source_operation",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simd.f32.log.throughput": {
+      "description": "Effective source-level FP32 SIMD logarithm throughput on one AIV; the intrinsic has a large fixed body so only the compile-time-specialized single-operation slope is claimed.",
+      "value": 0.410256410,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_special_function_source_operation",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simd.predicate.select.throughput": {
+      "description": "Effective source-level SIMD select throughput on one AIV.",
+      "value": 3.299139131,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp4_or_more_effective_source_select",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simd.predicate.cmp.throughput": {
+      "description": "Standalone semantic SIMD comparison throughput derived from the compare+select pair and the separately measured select rate: 1/(1/pair-1/select).",
+      "value": 3.297269447,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_paired_difference_effective_source_compare",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simd.convert.cast.throughput": {
+      "description": "Effective throughput per SIMD cast. The round-trip probe numerator counts both casts, matching one semantic cast in StageWorkload.",
+      "value": 1.649505793,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_two_cast_roundtrip_effective_per_cast",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simd.f32.clamp.throughput": {
+      "description": "Effective throughput per semantic clamp. The probe performs two boundary operations, so its raw operation rate is divided by two before storing this composite semantic rate.",
+      "value": 1.649569566,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_two_boundary_operations_per_semantic_clamp",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simd.f32.add.dependent_latency": {
+      "description": "Latency of one FP32 SIMD add in a dependent instruction chain on one AIV.",
+      "value": 1.818,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_dependent_chain",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/tput.cce; data_provider/concur2.cce; data_provider/build_commands.md",
+      "confidence": "high"
+    },
+    "simt.f32.add.throughput": {
+      "description": "Effective source-level FP32 SIMT scalar-add throughput on one AIV. The compile-time-specialized IR contains the intended scalar add body and the slope removes fixed launch cost.",
+      "value": 105.554598122,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp8_32_launched_warps_effective_source_fadd",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.frontend.effective_issue_floor": {
+      "description": "Observable conservative SIMT warp-instruction issue floor. The measured 105.554598122 scalar adds/system_cycle is divided by the architecture-defined 32 lanes/warp; this is not claimed as an architecture peak.",
+      "value": 3.2985811913125,
+      "unit": "instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp8_32_launched_warps_normalized_per_warp_instruction",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log; simt.warp_size",
+      "confidence": "high"
+    },
+    "simt.f32.sub.throughput": {
+      "description": "Effective source-level FP32 SIMT scalar-subtract throughput on one AIV.",
+      "value": 105.568030619,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp8_32_launched_warps_effective_source_sub",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.mul.throughput": {
+      "description": "Effective source-level FP32 SIMT scalar-multiply throughput on one AIV.",
+      "value": 105.547288200,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp8_32_launched_warps_effective_source_mul",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.div.throughput": {
+      "description": "Effective source-level FP32 SIMT scalar-divide throughput on one AIV.",
+      "value": 52.783590180,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp8_32_launched_warps_effective_source_div",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.max.throughput": {
+      "description": "Effective source-level FP32 SIMT scalar-maximum throughput on one AIV.",
+      "value": 39.274427485,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp8_32_launched_warps_effective_source_max",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.abs.throughput": {
+      "description": "Effective source-level FP32 SIMT scalar-absolute-value throughput on one AIV.",
+      "value": 79.954957016,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp8_32_launched_warps_effective_source_abs",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.exp.throughput": {
+      "description": "Effective source-level FP32 SIMT exponential throughput on one AIV.",
+      "value": 64.050039093,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_special_function_source_operation",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simt.f32.log.throughput": {
+      "description": "Effective source-level FP32 SIMT logarithm throughput on one AIV.",
+      "value": 19.218768328,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_special_function_source_operation",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simt.predicate.select.throughput": {
+      "description": "Effective source-level SIMT select throughput on one AIV.",
+      "value": 90.674008841,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp8_32_launched_warps_effective_source_select",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.cmp.throughput": {
+      "description": "Standalone semantic SIMT comparison throughput derived from the compare+select pair and the separately measured select rate: 1/(1/pair-1/select).",
+      "value": 69.263227427,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_paired_difference_effective_source_compare",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simt.convert.cast.throughput": {
+      "description": "Effective throughput per SIMT cast. The round-trip probe numerator counts both casts, matching one semantic cast in StageWorkload.",
+      "value": 87.427728314,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_two_cast_roundtrip_effective_per_cast",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.clamp.throughput": {
+      "description": "Effective throughput per semantic SIMT clamp. The probe performs two boundary operations, so its raw operation rate is divided by two.",
+      "value": 39.268732506,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_two_boundary_operations_per_semantic_clamp",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_operation_rates_fresh_20260913.csv; data_provider/950pr_operation_rates_fresh_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simd.setup.serialized_minimal_net": {
+      "description": "Net fixed cost of one minimal observable SIMD body, measured as the mean across warp settings of the least-squares mode3 minus matching barrier-only mode2 slopes over counts 100, 200 and 400.",
+      "value": 36.376276,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_minimal_simd_body_net_of_matching_barrier_loop",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_setup_probe_specialized_20260913.csv; data_provider/950pr_setup_probe_specialized_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simt.setup.serialized_minimal_net.warps_1": {
+      "description": "Completion-inclusive net cost of one minimal SIMT VF with one launched warp, measured as the least-squares serialized-mode1 minus matching barrier-only-mode2 slopes over counts 100, 200 and 400.",
+      "value": 196.233776,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_minimal_simt_vf_net_1_warp",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_setup_probe_specialized_20260913.csv; data_provider/950pr_setup_probe_specialized_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simt.setup.serialized_minimal_net.warps_2": {
+      "description": "Completion-inclusive net cost of one minimal SIMT VF with two launched warps, using the same least-squares net-slope estimator.",
+      "value": 196.274184,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_minimal_simt_vf_net_2_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_setup_probe_specialized_20260913.csv; data_provider/950pr_setup_probe_specialized_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simt.setup.serialized_minimal_net.warps_4": {
+      "description": "Completion-inclusive net cost of one minimal SIMT VF with four launched warps, using the same least-squares net-slope estimator.",
+      "value": 196.278571,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_minimal_simt_vf_net_4_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_setup_probe_specialized_20260913.csv; data_provider/950pr_setup_probe_specialized_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simt.setup.serialized_minimal_net.warps_8": {
+      "description": "Completion-inclusive net cost of one minimal SIMT VF with eight launched warps, using the same least-squares net-slope estimator.",
+      "value": 196.307551,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_minimal_simt_vf_net_8_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_setup_probe_specialized_20260913.csv; data_provider/950pr_setup_probe_specialized_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simt.setup.serialized_minimal_net.warps_16": {
+      "description": "Completion-inclusive net cost of one minimal SIMT VF with sixteen launched warps, using the same least-squares net-slope estimator.",
+      "value": 196.308980,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_minimal_simt_vf_net_16_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_setup_probe_specialized_20260913.csv; data_provider/950pr_setup_probe_specialized_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simt.setup.serialized_minimal_net.warps_32": {
+      "description": "Completion-inclusive net cost of one minimal SIMT VF with thirty-two launched warps, using the same least-squares net-slope estimator.",
+      "value": 224.504388,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_minimal_simt_vf_net_32_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_setup_probe_specialized_20260913.csv; data_provider/950pr_setup_probe_specialized_20260913_ir_audit.log",
+      "confidence": "medium"
+    },
+    "simd.memory.load.startup": {
+      "description": "Fixed startup of one logical contiguous SIMD load from the joint fit C(bytes)=startup+bytes/throughput over 4, 32 and 128 KiB transfers in two fresh runs.",
+      "value": 105.309240226,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_contiguous_load_joint_fit_4kib_32kib_128kib",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simd_memory_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "high"
+    },
+    "simd.memory.load.throughput": {
+      "description": "Asymptotic contiguous SIMD load throughput from the same joint startup-plus-byte fit.",
+      "value": 167.557775299,
+      "unit": "byte/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_contiguous_load_joint_fit_4kib_32kib_128kib",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simd_memory_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "high"
+    },
+    "simd.memory.store.startup": {
+      "description": "Fixed startup of one logical contiguous SIMD store from the joint fit C(bytes)=startup+bytes/throughput over 4, 32 and 128 KiB transfers in two fresh runs.",
+      "value": 90.954331652,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_contiguous_store_joint_fit_4kib_32kib_128kib",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simd_memory_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "high"
+    },
+    "simd.memory.store.throughput": {
+      "description": "Asymptotic contiguous SIMD store throughput from the same joint startup-plus-byte fit.",
+      "value": 213.125675219,
+      "unit": "byte/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_contiguous_store_joint_fit_4kib_32kib_128kib",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simd_memory_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "high"
+    },
+    "simt.shuffle.throughput": {
+      "description": "Effective source-level FP32 shfl-up rate for the stated 32-warp ILP4 runtime-loop workload. Loop/control and sink overhead remain in elapsed cycles; this is not an intrinsic shuffle-pipeline peak.",
+      "value": 0.815411,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_fp32_shfl_up_32_warps_ilp4_four_independent_chains",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_shuffle_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "medium"
+    },
+    "simt.shuffle.dependent_latency": {
+      "description": "Effective FP32 dependent shfl-up chain iteration cost for the stated one-warp runtime-loop workload. It includes loop/control overhead and is not an isolated intrinsic latency.",
+      "value": 27.278581,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_fp32_shfl_up_1_warp_dependent_chain",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_shuffle_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "medium"
+    },
+    "simt.gm.load.throughput": {
+      "description": "Effective source GM-load rate for the stated 32-warp sequential rotating runtime-loop workload. Address generation, loop/control and the source sink remain in elapsed cycles; this is not an intrinsic LSU issue peak.",
+      "value": 0.239204234,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "medium"
+    },
+    "simt.gm.store.throughput": {
+      "description": "Effective source GM-store rate for the stated 32-warp sequential rotating runtime-loop workload. Address generation, value construction and loop/control remain in elapsed cycles; this is not an intrinsic LSU issue peak.",
+      "value": 0.588739138,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "medium"
+    },
+    "simt.gm.load.bandwidth": {
+      "description": "Effective single-AIV GM-load byte bandwidth for the stated workload; this is not whole-device theoretical HBM peak bandwidth.",
+      "value": 30.618142,
+      "unit": "byte/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "medium"
+    },
+    "simt.gm.store.bandwidth": {
+      "description": "Effective single-AIV GM-store byte bandwidth for the stated workload; this is not whole-device theoretical HBM peak bandwidth.",
+      "value": 75.358610,
+      "unit": "byte/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "medium"
+    },
+    "simt.ub.load.throughput": {
+      "description": "Effective source UB-load rate for the stated 32-warp rotating-set runtime-loop workload. Address, ALU and loop/control overhead remain in elapsed cycles.",
+      "value": 0.982288057,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "medium"
+    },
+    "simt.ub.store.throughput": {
+      "description": "Effective source UB-store rate for the stated 32-warp rotating-set runtime-loop workload. Address, ALU and loop/control overhead remain in elapsed cycles.",
+      "value": 0.805250378,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "medium"
+    },
+    "simt.ub.load.bandwidth": {
+      "description": "Effective single-AIV UB-load byte bandwidth for the stated workload.",
+      "value": 125.732871,
+      "unit": "byte/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "medium"
+    },
+    "simt.ub.store.bandwidth": {
+      "description": "Effective single-AIV UB-store byte bandwidth for the stated workload.",
+      "value": 103.072049,
+      "unit": "byte/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
+      "confidence": "medium"
+    },
+    "simt.f32.add.throughput.warps_1": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 12.062420671,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.add.throughput.warps_2": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 23.457857752,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.add.throughput.warps_4": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 44.449508679,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.add.throughput.warps_8": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 76.790221245,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.add.throughput.warps_16": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 84.441203225,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.add.throughput.warps_32": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 105.572707290,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.sub.throughput.warps_1": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 12.063344338,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.sub.throughput.warps_2": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 23.464240806,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.sub.throughput.warps_4": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 44.448061637,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.sub.throughput.warps_8": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 76.797600075,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.sub.throughput.warps_16": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 84.445446639,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.sub.throughput.warps_32": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 105.555533185,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.mul.throughput.warps_1": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 12.422737006,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.mul.throughput.warps_2": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 24.125907078,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.mul.throughput.warps_4": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 45.644494467,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.mul.throughput.warps_8": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 78.543230177,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.mul.throughput.warps_16": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 84.446425948,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.mul.throughput.warps_32": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 105.548903096,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.div.throughput.warps_1": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 7.968484023,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.div.throughput.warps_2": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 15.634960321,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.div.throughput.warps_4": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 30.155674251,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.div.throughput.warps_8": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 52.774324054,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.div.throughput.warps_16": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 52.783292593,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.div.throughput.warps_32": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 52.781549653,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.max.throughput.warps_1": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 7.967244045,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.max.throughput.warps_2": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 15.928756149,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.max.throughput.warps_4": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 30.707927946,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.max.throughput.warps_8": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 34.468539884,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.max.throughput.warps_16": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 37.538183428,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.max.throughput.warps_32": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 39.287082369,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.abs.throughput.warps_1": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 13.617564530,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.abs.throughput.warps_2": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 26.397790732,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.abs.throughput.warps_4": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 49.688235437,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.abs.throughput.warps_8": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 80.449385238,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.abs.throughput.warps_16": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 72.650278525,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.abs.throughput.warps_32": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 79.960371203,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.exp.throughput.warps_1": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 25.600000000,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.exp.throughput.warps_2": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 47.850467290,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.exp.throughput.warps_4": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 86.779661017,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.exp.throughput.warps_8": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 56.186556927,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.exp.throughput.warps_16": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 57.206703911,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.exp.throughput.warps_32": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 64.150352388,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.log.throughput.warps_1": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 1.312147617,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.log.throughput.warps_2": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 2.619595805,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.log.throughput.warps_4": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 5.199289160,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.log.throughput.warps_8": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 8.746530002,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.log.throughput.warps_16": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 16.050156740,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.log.throughput.warps_32": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 19.221022994,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.select.throughput.warps_1": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 12.799720006,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.select.throughput.warps_2": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 25.598480090,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.select.throughput.warps_4": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 48.264322579,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.select.throughput.warps_8": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 75.059384599,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.select.throughput.warps_16": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 105.563439381,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.select.throughput.warps_32": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 90.689818845,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.convert.cast.throughput.warps_1": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 15.937588156,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.convert.cast.throughput.warps_2": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 31.864017815,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.convert.cast.throughput.warps_4": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 61.413783991,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.convert.cast.throughput.warps_8": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 74.259568557,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.convert.cast.throughput.warps_16": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 82.921903904,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.convert.cast.throughput.warps_32": {
+      "description": "Measured aggregate SIMT source-operation throughput at the stated launched warp count.",
+      "value": 87.478667931,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.clamp.throughput.warps_1": {
+      "description": "Composite semantic clamp throughput at the stated launched warp count, derived by dividing the measured lower+upper primitive-operation rate by two.",
+      "value": 7.407554766,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.clamp.throughput.warps_2": {
+      "description": "Composite semantic clamp throughput at the stated launched warp count, derived by dividing the measured lower+upper primitive-operation rate by two.",
+      "value": 14.820818619,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.clamp.throughput.warps_4": {
+      "description": "Composite semantic clamp throughput at the stated launched warp count, derived by dividing the measured lower+upper primitive-operation rate by two.",
+      "value": 29.127628936,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.clamp.throughput.warps_8": {
+      "description": "Composite semantic clamp throughput at the stated launched warp count, derived by dividing the measured lower+upper primitive-operation rate by two.",
+      "value": 34.468757429,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.clamp.throughput.warps_16": {
+      "description": "Composite semantic clamp throughput at the stated launched warp count, derived by dividing the measured lower+upper primitive-operation rate by two.",
+      "value": 36.718795523,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.f32.clamp.throughput.warps_32": {
+      "description": "Composite semantic clamp throughput at the stated launched warp count, derived by dividing the measured lower+upper primitive-operation rate by two.",
+      "value": 39.280018173,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.cmp.throughput.warps_1": {
+      "description": "Standalone SIMT compare throughput at the stated launched warp count, derived by subtracting same-warp select time from the measured compare+select pair.",
+      "value": 21.105786574,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.cmp.throughput.warps_2": {
+      "description": "Standalone SIMT compare throughput at the stated launched warp count, derived by subtracting same-warp select time from the measured compare+select pair.",
+      "value": 42.231375559,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.cmp.throughput.warps_4": {
+      "description": "Standalone SIMT compare throughput at the stated launched warp count, derived by subtracting same-warp select time from the measured compare+select pair.",
+      "value": 84.407053844,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.cmp.throughput.warps_8": {
+      "description": "Standalone SIMT compare throughput at the stated launched warp count, derived by subtracting same-warp select time from the measured compare+select pair.",
+      "value": 63.742539897,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.cmp.throughput.warps_16": {
+      "description": "Standalone SIMT compare throughput at the stated launched warp count, derived by subtracting same-warp select time from the measured compare+select pair.",
+      "value": 58.245679523,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.predicate.cmp.throughput.warps_32": {
+      "description": "Standalone SIMT compare throughput at the stated launched warp count, derived by subtracting same-warp select time from the measured compare+select pair.",
+      "value": 69.295561388,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_8_independent_chains_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_operation_warp_curve_20260913.csv; data_provider/950pr_simt_operation_warp_curve_20260913_ir_audit.log",
+      "confidence": "high"
+    },
+    "simt.ub.load.throughput.warps_1": {
+      "description": "Measured aggregate SIMT UB-memory throughput at the stated launched warp count.",
+      "value": 0.083011320,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.ub.store.throughput.warps_1": {
+      "description": "Measured aggregate SIMT UB-memory throughput at the stated launched warp count.",
+      "value": 0.134694305,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.ub.load.throughput.warps_2": {
+      "description": "Measured aggregate SIMT UB-memory throughput at the stated launched warp count.",
+      "value": 0.166029602,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.ub.store.throughput.warps_2": {
+      "description": "Measured aggregate SIMT UB-memory throughput at the stated launched warp count.",
+      "value": 0.266641781,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.ub.load.throughput.warps_4": {
+      "description": "Measured aggregate SIMT UB-memory throughput at the stated launched warp count.",
+      "value": 0.327827742,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.ub.store.throughput.warps_4": {
+      "description": "Measured aggregate SIMT UB-memory throughput at the stated launched warp count.",
+      "value": 0.497959617,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.ub.load.throughput.warps_8": {
+      "description": "Measured aggregate SIMT UB-memory throughput at the stated launched warp count.",
+      "value": 0.540549461,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.ub.store.throughput.warps_8": {
+      "description": "Measured aggregate SIMT UB-memory throughput at the stated launched warp count.",
+      "value": 0.754903602,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.ub.load.throughput.warps_16": {
+      "description": "Measured aggregate SIMT UB-memory throughput at the stated launched warp count.",
+      "value": 0.888394852,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.ub.store.throughput.warps_16": {
+      "description": "Measured aggregate SIMT UB-memory throughput at the stated launched warp count.",
+      "value": 0.805236531,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.ub.load.throughput.warps_32": {
+      "description": "Measured aggregate SIMT UB-memory throughput at the stated launched warp count.",
+      "value": 0.981741156,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.ub.store.throughput.warps_32": {
+      "description": "Measured aggregate SIMT UB-memory throughput at the stated launched warp count.",
+      "value": 0.804774086,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.shuffle.throughput.warps_1": {
+      "description": "Measured aggregate SIMT ILP4 shuffle throughput at the stated launched warp count.",
+      "value": 0.073333000,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_4_independent_shuffle_chains",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_shuffle_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.shuffle.throughput.warps_2": {
+      "description": "Measured aggregate SIMT ILP4 shuffle throughput at the stated launched warp count.",
+      "value": 0.145066000,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_4_independent_shuffle_chains",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_shuffle_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.shuffle.throughput.warps_4": {
+      "description": "Measured aggregate SIMT ILP4 shuffle throughput at the stated launched warp count.",
+      "value": 0.283875000,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_4_independent_shuffle_chains",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_shuffle_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.shuffle.throughput.warps_8": {
+      "description": "Measured aggregate SIMT ILP4 shuffle throughput at the stated launched warp count.",
+      "value": 0.484398000,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_4_independent_shuffle_chains",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_shuffle_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.shuffle.throughput.warps_16": {
+      "description": "Measured aggregate SIMT ILP4 shuffle throughput at the stated launched warp count.",
+      "value": 0.709876000,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_4_independent_shuffle_chains",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_shuffle_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.shuffle.throughput.warps_32": {
+      "description": "Measured aggregate SIMT ILP4 shuffle throughput at the stated launched warp count.",
+      "value": 0.815229000,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_4_independent_shuffle_chains",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_shuffle_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.gm.load.throughput.warps_1": {
+      "description": "Measured aggregate SIMT GM-memory throughput at the stated launched warp count.",
+      "value": 0.016810766,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.gm.store.throughput.warps_1": {
+      "description": "Measured aggregate SIMT GM-memory throughput at the stated launched warp count.",
+      "value": 0.078552453,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_1_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.gm.load.throughput.warps_2": {
+      "description": "Measured aggregate SIMT GM-memory throughput at the stated launched warp count.",
+      "value": 0.033599109,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.gm.store.throughput.warps_2": {
+      "description": "Measured aggregate SIMT GM-memory throughput at the stated launched warp count.",
+      "value": 0.148257180,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_2_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.gm.load.throughput.warps_4": {
+      "description": "Measured aggregate SIMT GM-memory throughput at the stated launched warp count.",
+      "value": 0.065788805,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.gm.store.throughput.warps_4": {
+      "description": "Measured aggregate SIMT GM-memory throughput at the stated launched warp count.",
+      "value": 0.263879445,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_4_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.gm.load.throughput.warps_8": {
+      "description": "Measured aggregate SIMT GM-memory throughput at the stated launched warp count.",
+      "value": 0.131737297,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.gm.store.throughput.warps_8": {
+      "description": "Measured aggregate SIMT GM-memory throughput at the stated launched warp count.",
+      "value": 0.399796047,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_8_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.gm.load.throughput.warps_16": {
+      "description": "Measured aggregate SIMT GM-memory throughput at the stated launched warp count.",
+      "value": 0.214806750,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.gm.store.throughput.warps_16": {
+      "description": "Measured aggregate SIMT GM-memory throughput at the stated launched warp count.",
+      "value": 0.591182461,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_16_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.gm.load.throughput.warps_32": {
+      "description": "Measured aggregate SIMT GM-memory throughput at the stated launched warp count.",
+      "value": 0.238925352,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.gm.store.throughput.warps_32": {
+      "description": "Measured aggregate SIMT GM-memory throughput at the stated launched warp count.",
+      "value": 0.588371234,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950pr_simt_gm_memory_fresh_20260913.log",
+      "confidence": "high"
+    },
+    "simt.setup.transition_harness_net.warps_1": {
+      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for one launched warp. It is mode1 minus barrier-only mode6 and does not contain a SIMD Stage, so it is neither a mixed transition nor a dependent handoff latency.",
+      "value": 182,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_transition_harness_standalone_empty_vf_net_1_warp",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/transition.cce; data_provider/transition_host.cpp; triton_cases/SIMT_Test/run_transition.remote.sh; data_provider/build_commands.md",
+      "confidence": "low"
+    },
+    "simt.setup.transition_harness_net.warps_2": {
+      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for two launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD Stage, so it is neither a mixed transition nor a dependent handoff latency.",
+      "value": 182,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_transition_harness_standalone_empty_vf_net_2_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/transition.cce; data_provider/transition_host.cpp; triton_cases/SIMT_Test/run_transition.remote.sh; data_provider/build_commands.md",
+      "confidence": "low"
+    },
+    "simt.setup.transition_harness_net.warps_4": {
+      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for four launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD Stage, so it is neither a mixed transition nor a dependent handoff latency.",
+      "value": 182,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_transition_harness_standalone_empty_vf_net_4_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/transition.cce; data_provider/transition_host.cpp; triton_cases/SIMT_Test/run_transition.remote.sh; data_provider/build_commands.md",
+      "confidence": "low"
+    },
+    "simt.setup.transition_harness_net.warps_8": {
+      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for eight launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD Stage, so it is neither a mixed transition nor a dependent handoff latency.",
+      "value": 182,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_transition_harness_standalone_empty_vf_net_8_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/transition.cce; data_provider/transition_host.cpp; triton_cases/SIMT_Test/run_transition.remote.sh; data_provider/build_commands.md",
+      "confidence": "low"
+    },
+    "simt.setup.transition_harness_net.warps_16": {
+      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for sixteen launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD Stage, so it is neither a mixed transition nor a dependent handoff latency.",
+      "value": 182,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_transition_harness_standalone_empty_vf_net_16_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/transition.cce; data_provider/transition_host.cpp; triton_cases/SIMT_Test/run_transition.remote.sh; data_provider/build_commands.md",
+      "confidence": "low"
+    },
+    "simt.setup.transition_harness_net.warps_32": {
+      "description": "Standalone serialized empty-VF net setup proxy from the branch-heavy transition harness for thirty-two launched warps. It is mode1 minus barrier-only mode6 and does not contain a SIMD Stage, so it is neither a mixed transition nor a dependent handoff latency.",
+      "value": 223,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_transition_harness_standalone_empty_vf_net_32_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/transition.cce; data_provider/transition_host.cpp; triton_cases/SIMT_Test/run_transition.remote.sh; data_provider/build_commands.md",
+      "confidence": "low"
+    },
+    "simd.dot.tiny.dependent.startup": {
+      "description": "Per-matrix-instance SIMD tiny-dot setup from a joint fit of dependent N=16 and N=32 dot-chain slopes. Count=0 is excluded because its unused second input load is eliminated.",
+      "value": 134.510204,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_num_warps_4_dependent_square_f32_dot_n16_n32_one_final_store",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_dot_dependency_rate.py; data_provider/950pr_dot_dependency_20260913/; SIMD per-dot slopes N16=148.928571 and N32=249.857143 SYS_CNT cycles; held-out count=8 error <=2.3%",
+      "confidence": "medium"
+    },
+    "simd.dot.tiny.dependent.throughput": {
+      "description": "Effective SIMD dependent tiny-dot throughput jointly fitted with a per-instance startup term from N=16 and N=32 chains.",
+      "value": 568.16419,
+      "unit": "flop/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_num_warps_4_dependent_square_f32_dot_n16_n32_one_final_store",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_dot_dependency_rate.py; data_provider/950pr_dot_dependency_20260913/; held-out count=8 error <=2.3%",
+      "confidence": "medium"
+    },
+    "simt.dot.tiny.dependent.startup": {
+      "description": "Per-matrix-instance SIMT tiny-dot setup from a joint fit of dependent N=16 and N=32 dot-chain slopes. Count=0 is excluded because its unused second input load is eliminated.",
+      "value": 171.994898,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_num_warps_4_dependent_square_f32_dot_n16_n32_one_final_store",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_dot_dependency_rate.py; data_provider/950pr_dot_dependency_20260913/; SIMT per-dot slopes N16=426.321429 and N32=2206.607143 SYS_CNT cycles; held-out count=8 error <=7.7%",
+      "confidence": "medium"
+    },
+    "simt.dot.tiny.dependent.throughput": {
+      "description": "Effective SIMT dependent tiny-dot throughput jointly fitted with a per-instance startup term from N=16 and N=32 chains.",
+      "value": 32.21056,
+      "unit": "flop/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_num_warps_4_dependent_square_f32_dot_n16_n32_one_final_store",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_dot_dependency_rate.py; data_provider/950pr_dot_dependency_20260913/; held-out count=8 error <=7.7%",
+      "confidence": "medium"
+    },
+    "simd.indirect_load.fp16.warp_instructions_8.incremental_cost": {
+      "description": "Incremental cost of one loaded-index FP16 load producing 256 elements (8 logical warp instructions), fitted from count=1,2,4 chains with one final store.",
+      "value": 9563.892857,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "56_AIV_num_warps_4_rows_16_columns_16_loaded_index_gather",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_indirect_gather_rate.py; data_provider/950pr_indirect_gather_20260913/; count=1,2,4 linear slope",
+      "confidence": "medium"
+    },
+    "simd.indirect_load.fp16.warp_instructions_8.startup_cost": {
+      "description": "One-time loaded-index FP16 load envelope for 256 elements (8 logical warp instructions), jointly fitted as the intercept of the count=1,2,4 chain.",
+      "value": 2264.75,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "56_AIV_num_warps_4_rows_16_columns_16_loaded_index_gather",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_indirect_gather_rate.py; data_provider/950pr_indirect_gather_20260913/; count=1,2,4 linear intercept",
+      "confidence": "medium"
+    },
+    "simd.indirect_load.fp16.warp_instructions_16.incremental_cost": {
+      "description": "Incremental cost of one loaded-index FP16 load producing 512 elements (16 logical warp instructions), fitted from count=1,2,4 chains with one final store.",
+      "value": 19176.071429,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "56_AIV_num_warps_4_rows_32_columns_16_loaded_index_gather",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_indirect_gather_rate.py; data_provider/950pr_indirect_gather_20260913/; count=1,2,4 linear slope",
+      "confidence": "medium"
+    },
+    "simd.indirect_load.fp16.warp_instructions_16.startup_cost": {
+      "description": "One-time loaded-index FP16 load envelope for 512 elements (16 logical warp instructions), jointly fitted as the intercept of the count=1,2,4 chain.",
+      "value": 1688.5,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "56_AIV_num_warps_4_rows_32_columns_16_loaded_index_gather",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_indirect_gather_rate.py; data_provider/950pr_indirect_gather_20260913/; count=1,2,4 linear intercept",
+      "confidence": "medium"
+    },
+    "simt.indirect_load.fp16.warp_instructions_8.incremental_cost": {
+      "description": "Incremental cost of one loaded-index FP16 load producing 256 elements (8 logical warp instructions), fitted from count=1,2,4 chains with one final store.",
+      "value": 161.285714,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "56_AIV_num_warps_4_rows_16_columns_16_loaded_index_gather",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_indirect_gather_rate.py; data_provider/950pr_indirect_gather_20260913/; count=1,2,4 linear slope; count=8 exposes unmodeled working-set pressure",
+      "confidence": "medium"
+    },
+    "simt.indirect_load.fp16.warp_instructions_8.startup_cost": {
+      "description": "One-time loaded-index FP16 load envelope for 256 elements (8 logical warp instructions), jointly fitted as the intercept of the count=1,2,4 chain.",
+      "value": 2060.0,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "56_AIV_num_warps_4_rows_16_columns_16_loaded_index_gather",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_indirect_gather_rate.py; data_provider/950pr_indirect_gather_20260913/; count=1,2,4 linear intercept; count=8 exposes unmodeled working-set pressure",
+      "confidence": "medium"
+    },
+    "simt.indirect_load.fp16.warp_instructions_16.incremental_cost": {
+      "description": "Incremental cost of one loaded-index FP16 load producing 512 elements (16 logical warp instructions), fitted from count=1,2,4 chains with one final store.",
+      "value": 459.285714,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "56_AIV_num_warps_4_rows_32_columns_16_loaded_index_gather",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_indirect_gather_rate.py; data_provider/950pr_indirect_gather_20260913/; count=1,2,4 linear slope; count=8 exposes unmodeled working-set pressure",
+      "confidence": "medium"
+    },
+    "simt.indirect_load.fp16.warp_instructions_16.startup_cost": {
+      "description": "One-time loaded-index FP16 load envelope for 512 elements (16 logical warp instructions), jointly fitted as the intercept of the count=1,2,4 chain.",
+      "value": 2169.0,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "56_AIV_num_warps_4_rows_32_columns_16_loaded_index_gather",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_indirect_gather_rate.py; data_provider/950pr_indirect_gather_20260913/; count=1,2,4 linear intercept; count=8 exposes unmodeled working-set pressure",
+      "confidence": "medium"
+    },
+    "simd.continuous_load.fp32.bytes_1024.factor_1.group_incremental_cost": {
+      "description": "Steady incremental cost of one additional contiguous 1024-byte FP32 load per logical program in one SIMD physical group. The observable chain includes address generation and an accumulator sink; this is an execution envelope, not raw HBM bandwidth.",
+      "value": 16.834821429,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_factor_1_224_logical_programs_4_waves_operation_count_4_to_32",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_contiguous_superblock.py; data_provider/950pr_continuous_memory_group_20260913.json; (median_n32-median_n4)/28/4_waves",
+      "confidence": "medium"
+    },
+    "simd.continuous_store.fp32.bytes_1024.factor_1.group_incremental_cost": {
+      "description": "Steady incremental cost of one additional contiguous 1024-byte FP32 store per logical program in one SIMD physical group.",
+      "value": 89.272321429,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_factor_1_224_logical_programs_4_waves_operation_count_4_to_32",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_contiguous_superblock.py; data_provider/950pr_continuous_memory_group_20260913.json; (median_n32-median_n4)/28/4_waves",
+      "confidence": "medium"
+    },
+    "simt.continuous_load.fp32.bytes_1024.factor_1.group_incremental_cost": {
+      "description": "Steady incremental cost of one additional contiguous 1024-byte FP32 load in one SIMT F1 physical group.",
+      "value": 194.477678571,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_factor_1_224_logical_programs_4_waves_operation_count_4_to_32",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_contiguous_superblock.py; data_provider/950pr_continuous_memory_group_20260913.json; (median_n32-median_n4)/28/4_waves",
+      "confidence": "medium"
+    },
+    "simt.continuous_load.fp32.bytes_1024.factor_2.group_incremental_cost": {
+      "description": "Steady incremental cost of one additional contiguous 1024-byte FP32 load per logical program in one SIMT F2 physical SuperBlock group; the value already contains both logical programs.",
+      "value": 210.107142857,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_factor_2_224_logical_programs_2_waves_operation_count_4_to_32",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_contiguous_superblock.py; data_provider/950pr_continuous_memory_group_20260913.json; (median_n32-median_n4)/28/2_waves",
+      "confidence": "medium"
+    },
+    "simt.continuous_load.fp32.bytes_1024.factor_4.group_incremental_cost": {
+      "description": "Steady incremental cost of one additional contiguous 1024-byte FP32 load per logical program in one SIMT F4 physical SuperBlock group; the value already contains four logical programs.",
+      "value": 270.964285714,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_factor_4_224_logical_programs_1_wave_operation_count_4_to_32",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_contiguous_superblock.py; data_provider/950pr_continuous_memory_group_20260913.json; (median_n32-median_n4)/28",
+      "confidence": "medium"
+    },
+    "simt.continuous_store.fp32.bytes_1024.factor_1.group_incremental_cost": {
+      "description": "Steady incremental cost of one additional contiguous 1024-byte FP32 store in one SIMT F1 physical group.",
+      "value": 163.745535714,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_factor_1_224_logical_programs_4_waves_operation_count_4_to_32",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_contiguous_superblock.py; data_provider/950pr_continuous_memory_group_20260913.json; (median_n32-median_n4)/28/4_waves",
+      "confidence": "medium"
+    },
+    "simt.continuous_store.fp32.bytes_1024.factor_2.group_incremental_cost": {
+      "description": "Steady incremental cost of one additional contiguous 1024-byte FP32 store per logical program in one SIMT F2 physical SuperBlock group; the value already contains both logical programs.",
+      "value": 170.625,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_factor_2_224_logical_programs_2_waves_operation_count_4_to_32",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_contiguous_superblock.py; data_provider/950pr_continuous_memory_group_20260913.json; (median_n32-median_n4)/28/2_waves",
+      "confidence": "medium"
+    },
+    "simt.continuous_store.fp32.bytes_1024.factor_4.group_incremental_cost": {
+      "description": "Steady incremental cost of one additional contiguous 1024-byte FP32 store per logical program in one SIMT F4 physical SuperBlock group; the value already contains four logical programs.",
+      "value": 198.839285714,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_factor_4_224_logical_programs_1_wave_operation_count_4_to_32",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_contiguous_superblock.py; data_provider/950pr_continuous_memory_group_20260913.json; (median_n32-median_n4)/28",
+      "confidence": "medium"
+    },
+    "simd.recurrence.reduction_lane_steps_1024.factor_1.group_incremental_cost": {
+      "description": "One physical-program iteration of one runtime loop-carried 16x16 FP32 reduction recurrence in SIMD mode, after removing the matching fixed and wave costs.",
+      "value": 219.5875,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_224_logical_programs_56_cores_runtime_trip_slope",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_recurrence_superblock.py; data_provider/950pr_recurrence_dynamic_simd_20260913/; (median_t14-median_t4)/10/4_waves",
+      "confidence": "medium"
+    },
+    "simd.recurrence.reduction_lane_steps_4096.factor_1.group_incremental_cost": {
+      "description": "One physical-program iteration of four sequential runtime loop-carried 16x16 FP32 reduction recurrences in SIMD mode.",
+      "value": 876.125,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_224_logical_programs_56_cores_runtime_trip_slope",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_recurrence_superblock.py; data_provider/950pr_recurrence_dynamic_simd_20260913/; (median_t14-median_t4)/10/4_waves",
+      "confidence": "medium"
+    },
+    "simt.recurrence.reduction_lane_steps_1024.factor_1.group_incremental_cost": {
+      "description": "One physical-program iteration of one runtime loop-carried 16x16 FP32 reduction recurrence in SIMT F1 mode.",
+      "value": 268.0875,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_224_logical_programs_56_cores_runtime_trip_slope",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_recurrence_superblock.py; data_provider/950pr_recurrence_dynamic_g1_20260913/; (median_t14-median_t4)/10/4_waves",
+      "confidence": "medium"
+    },
+    "simt.recurrence.reduction_lane_steps_4096.factor_1.group_incremental_cost": {
+      "description": "One physical-program iteration of four sequential runtime loop-carried 16x16 FP32 reduction recurrences in SIMT F1 mode.",
+      "value": 1062.7,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_224_logical_programs_56_cores_runtime_trip_slope",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_recurrence_superblock.py; data_provider/950pr_recurrence_dynamic_20260913/; (median_t14-median_t4)/10/4_waves",
+      "confidence": "medium"
+    },
+    "simt.recurrence.reduction_lane_steps_1024.factor_2.group_incremental_cost": {
+      "description": "One physical SuperBlock group's iteration for two logical programs, each containing one runtime loop-carried 16x16 FP32 reduction recurrence.",
+      "value": 322.325,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_superblock_f2_224_logical_programs_56_cores_runtime_trip_slope",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_recurrence_superblock.py; data_provider/950pr_recurrence_dynamic_g1_20260913/; (median_t14-median_t4)/10/2_waves",
+      "confidence": "medium"
+    },
+    "simt.recurrence.reduction_lane_steps_4096.factor_2.group_incremental_cost": {
+      "description": "One physical SuperBlock group's iteration for two logical programs, each containing four sequential runtime loop-carried 16x16 FP32 reduction recurrences.",
+      "value": 1306.85,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_superblock_f2_224_logical_programs_56_cores_runtime_trip_slope",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_recurrence_superblock.py; data_provider/950pr_recurrence_dynamic_20260913/; (median_t14-median_t4)/10/2_waves",
+      "confidence": "medium"
+    },
+    "simt.recurrence.reduction_lane_steps_1024.factor_4.group_incremental_cost": {
+      "description": "One physical SuperBlock group's iteration for four logical programs, each containing one runtime loop-carried 16x16 FP32 reduction recurrence.",
+      "value": 428.6,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_superblock_f4_224_logical_programs_56_cores_runtime_trip_slope",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_recurrence_superblock.py; data_provider/950pr_recurrence_dynamic_g1_20260913/; (median_t14-median_t4)/10/1_wave",
+      "confidence": "medium"
+    },
+    "simt.recurrence.reduction_lane_steps_4096.factor_4.group_incremental_cost": {
+      "description": "One physical SuperBlock group's iteration for four logical programs, each containing four sequential runtime loop-carried 16x16 FP32 reduction recurrences.",
+      "value": 1982.45,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_superblock_f4_224_logical_programs_56_cores_runtime_trip_slope",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/probe_recurrence_superblock.py; data_provider/950pr_recurrence_dynamic_20260913/; (median_t14-median_t4)/10/1_wave",
+      "confidence": "medium"
+    }
+  }
+}

@@ -425,6 +425,22 @@ def _auto_simt_asset_hash(path: str, default_name: str) -> str:
     return digest.hexdigest()
 
 
+def _default_auto_simt_profile_name(arch: str) -> str:
+    """Select the hardware-specific StageCostModel profile by target arch.
+
+    The route model is evaluated before lowering, but its calibration is still
+    target-specific.  Falling back to the historical David-V100 profile for
+    every target silently discards the 950PR/950DT layout and local-memory
+    envelopes, so keep the generic profile only for unknown architectures.
+    """
+    normalized = (arch or "").lower().replace("-", "_")
+    if "950pr" in normalized:
+        return "simd_simt/ascend_950pr_simd_simt_v1.json"
+    if "950dt" in normalized:
+        return "simd_simt/ascend_950dt_simd_simt_v1.json"
+    return "simd_simt/david_v100_simd_simt_v1.json"
+
+
 def _apply_cpp_simd_simt_decision(metadata, effective: str, superblock_factor: int, report: str,
                                   base_num_warps: int = 1) -> None:
     """Translate the native decision into the backend execution contract."""
@@ -525,7 +541,7 @@ def _publish_route_transform_capability(metadata, opt) -> str:
     if not v1_enabled and not disable_reasons:
         disable_reasons = ["not_requested_or_explicitly_disabled"]
     if not target_supported:
-        disable_reasons.append("target_does_not_support_simt_auto_blockify_v1")
+        disable_reasons.append("target_does_not_support_auto_blockify_v1")
 
     modeled_factors = _get_modeled_superblock_factors()
     current_scope_factors = _get_current_scope_superblock_factors()
@@ -541,20 +557,31 @@ def _publish_route_transform_capability(metadata, opt) -> str:
     if not isinstance(coalesce_axis, int):
         coalesce_axis = -1
     physical_vector_cores = max(0, int(getattr(opt, "physical_vector_core_count_hint", 0) or 0))
-    if not physical_vector_cores:
+    physical_aic_cores = max(0, int(getattr(opt, "physical_aicore_count_hint", 0) or 0))
+    if not physical_vector_cores or not physical_aic_cores:
         try:
-            physical_vector_cores = int(NPUUtils().get_aivector_core_num())
+            npu_utils = NPUUtils()
+            if not physical_vector_cores:
+                physical_vector_cores = int(npu_utils.get_aivector_core_num())
+            if not physical_aic_cores:
+                physical_aic_cores = int(npu_utils.get_aicore_num())
         except Exception:
-            physical_vector_cores = 0
+            pass
     source_logical_program_count = max(0, int(getattr(opt, "logical_program_count_hint", 0) or 0))
     transformed_logical_program_count = ((source_logical_program_count + coalesce_factor - 1) //
                                          coalesce_factor if source_logical_program_count else 0)
     capability = {
-        "schema_version": 1,
+        "schema_version": 2,
         "layout_merge_applied": bool(metadata.get("ttir_layout_merge_applied", False)),
         "layout_coalescing_applied": coalesce_factor > 1,
         "layout_coalescing_factor": coalesce_factor,
         "layout_coalescing_axis": coalesce_axis,
+        # Compatibility aliases for the pre-layout terminology consumed by
+        # older Python guards.  Both names describe the same resolved fact;
+        # neither is an independent route decision.
+        "row_coalescing_applied": coalesce_factor > 1,
+        "row_coalescing_factor": coalesce_factor,
+        "row_coalescing_axis": coalesce_axis,
         "auto_blockify_v1_requested": bool(metadata.get("auto_blockify_v1_requested", False)),
         "auto_blockify_v1_materializable": v1_materializable,
         "auto_blockify_v1_disable_reasons": sorted(set(disable_reasons)),
@@ -564,16 +591,11 @@ def _publish_route_transform_capability(metadata, opt) -> str:
         "source_logical_program_count_hint": source_logical_program_count,
         "logical_program_count_hint": transformed_logical_program_count,
         "physical_vector_core_count_hint": physical_vector_cores,
+        "physical_aicore_count_hint": physical_aic_cores,
     }
-    logical_program_count = capability["logical_program_count_hint"]
-    if logical_program_count:
-        capability["superblock_runtime_groups"] = {
-            str(factor): {
-                "full_group_count": logical_program_count // factor,
-                "tail_count": logical_program_count % factor,
-            }
-            for factor in legal_factors
-        }
+    # Keep this contract factual. Route-specific Q/group/tail composition has
+    # one implementation in the native RouteSolver; duplicating that formula
+    # in Python previously let the two sides drift apart.
     capability_json = json.dumps(capability, sort_keys=True, separators=(",", ":"))
     metadata["route_transform_capability"] = capability_json
     metadata["route_transform_v1_materializable"] = v1_materializable
@@ -588,8 +610,7 @@ def _run_cpp_simd_simt_costmodel(mod, metadata, opt, analysis_ttir_code: str = "
     if mode == "off" or metadata.get("compile_mode") != "simd_simt":
         return "backend_default"
 
-    profile = opt.auto_simt_model_profile or str(
-        _costmodel_profiles_dir() / "simd_simt" / "david_v100_simd_simt_v1.json")
+    profile = opt.auto_simt_model_profile or str(_costmodel_profiles_dir() / _default_auto_simt_profile_name(opt.arch))
     pm = ir.pass_manager(mod.context)
     pm.enable_debug()
     capability_json = metadata.get("route_transform_capability")
@@ -703,8 +724,8 @@ def _resolve_auto_blockify_v1_policy(ttir_code: str, metadata, opt) -> bool:
     return enabled
 
 
-def _run_ta_simt_auto_blockify_v1(mod, metadata, opt, *, super_block_factor=None) -> bool:
-    """Materialize the TA port of SIMT AutoBlockify V1.
+def _run_ta_auto_blockify_v1(mod, metadata, opt, *, super_block_factor=None) -> bool:
+    """Materialize the TA port of AutoBlockify V1.
 
     V1 keeps one logical program's tile tensor shapes unchanged.  The launcher
     is capped to the same physical vector-core count passed to this transform;
@@ -717,12 +738,12 @@ def _run_ta_simt_auto_blockify_v1(mod, metadata, opt, *, super_block_factor=None
     super_block_factor = max(1, int(super_block_factor))
     pm = ir.pass_manager(mod.context)
     pm.enable_debug()
-    ascend.passes.ttir.add_simt_auto_blockify_v1(
+    ascend.passes.ttir.add_auto_blockify_v1(
         pm,
         physical_vector_cores,
         super_block_factor,
     )
-    pm.run(mod, "ta_simt_auto_blockify_v1")
+    pm.run(mod, "ta_auto_blockify_v1")
     materialized = _get_then_remove_rc(mod, "ta.auto_blockify_v1.materialized") == 1
     metadata["ta_auto_blockify_v1_materialized"] = materialized
     metadata["ta_auto_blockify_v1_physical_core_count"] = physical_vector_cores
@@ -762,7 +783,7 @@ def _build_costmodel_analysis_ttir(mod, metadata, opt) -> str:
 
     analysis_mod = _parse_ttir_text(str(mod), getattr(mod, "context", None))
     analysis_metadata = {}
-    materialized = _run_ta_simt_auto_blockify_v1(
+    materialized = _run_ta_auto_blockify_v1(
         analysis_mod,
         analysis_metadata,
         opt,
@@ -774,15 +795,15 @@ def _build_costmodel_analysis_ttir(mod, metadata, opt) -> str:
     return str(analysis_mod) if materialized else ""
 
 
-def _refine_ta_simt_auto_blockify_v1_superblock(mod, metadata, super_block_factor) -> None:
+def _refine_ta_auto_blockify_v1_superblock(mod, metadata, super_block_factor) -> None:
     """Apply a pure-SIMT SuperBlock factor to the factor-1 V1 schedule."""
     super_block_factor = max(1, int(super_block_factor))
     if super_block_factor == 1:
         return
     pm = ir.pass_manager(mod.context)
     pm.enable_debug()
-    ascend.passes.ttir.add_refine_simt_auto_blockify_v1_superblock(pm, super_block_factor)
-    pm.run(mod, "refine_ta_simt_auto_blockify_v1_superblock")
+    ascend.passes.ttir.add_refine_auto_blockify_v1_superblock(pm, super_block_factor)
+    pm.run(mod, "refine_ta_auto_blockify_v1_superblock")
     metadata["ta_auto_blockify_v1_super_block_factor"] = super_block_factor
 
 
@@ -828,14 +849,13 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         selected_superblock_factor = metadata.get("auto_simt_superblock_factor", opt.superblock_factor)
         if (opt.enable_ta_auto_blockify_v1 and auto_blockify_v1_enabled
                 and metadata.get("ta_auto_blockify_v1_materialized", False)):
-            _refine_ta_simt_auto_blockify_v1_superblock(mod, metadata, selected_superblock_factor)
+            _refine_ta_auto_blockify_v1_superblock(mod, metadata, selected_superblock_factor)
             metadata["auto_blockify_v1_runtime_cap"] = True
         elif (opt.enable_ta_auto_blockify_v1 and auto_blockify_v1_enabled
               and not metadata.get("ta_auto_blockify_v1_materialized", False)):
             # A TA silent-skip must not cap the launch grid. It also must not
             # fall through to NPUIR and hide a parity bug in the TA port.
-            materialized = _run_ta_simt_auto_blockify_v1(mod, metadata, opt,
-                                                         super_block_factor=selected_superblock_factor)
+            materialized = _run_ta_auto_blockify_v1(mod, metadata, opt, super_block_factor=selected_superblock_factor)
             metadata["auto_blockify_v1_runtime_cap"] = materialized
         elif not metadata.get("ta_auto_blockify_v1_materialized", False):
             metadata["auto_blockify_v1_runtime_cap"] = auto_blockify_v1_enabled
@@ -1346,15 +1366,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         ]
 
         _compile_option_list += [f"--enable-optimized-metaop={is_cann_version_at_least(9, 2, 0)}"]
-
-        npu_utils = NPUUtils()
-        if npu_utils.has_device_limit():
-            _compile_option_list += [
-                f"--custom-aic-number={npu_utils.get_aicore_num()}",
-            ]
-            _compile_option_list += [
-                f"--custom-aiv-number={npu_utils.get_aivector_core_num()}",
-            ]
+        _compile_option_list += _custom_core_count_options()
 
         if force_disable_ffts(opt.target_arch):
             _compile_option_list += ["--disable-ffts"]
@@ -1945,6 +1957,7 @@ class NPUOptions:
     # frontend cannot provide a stable value for this compile.
     logical_program_count_hint: int = 0
     physical_vector_core_count_hint: int = 0
+    physical_aicore_count_hint: int = 0
     # Native AscendModel selection: Python only schedules the C++ passes.
     # Empty/"off" disables the route model; "auto" selects, "report" dumps.
     auto_simt_scope_mode: str = ""
@@ -2059,7 +2072,7 @@ class NPUOptions:
         if self.auto_simt_scope_mode == "off":
             dump, profile, asset_hash = "", "", "disabled"
         else:
-            asset_hash = _auto_simt_asset_hash(profile, "simd_simt/david_v100_simd_simt_v1.json")
+            asset_hash = _auto_simt_asset_hash(profile, _default_auto_simt_profile_name(self.arch))
         object.__setattr__(self, "auto_simt_scope_dump", dump)
         object.__setattr__(self, "auto_simt_model_profile", profile)
         object.__setattr__(self, "auto_simt_model_assets_hash", asset_hash)
@@ -2116,6 +2129,18 @@ def _normalize_bishengir_simt_optimization_for_context(options: NPUOptions, raw_
     object.__setattr__(options, option_name, 0)
 
 
+def _custom_core_count_options():
+    # Scoring, launch capping and both A5 compiler entries must agree on the
+    # scheduling-slot count. In particular, pure-SIMT V1 must not silently
+    # keep the target's full AIV count when NPU_DEVICE_LIMIT is set.
+    npu_utils = NPUUtils()
+    if not npu_utils.has_device_limit():
+        return []
+    return [
+        f"--custom-aic-number={npu_utils.get_aicore_num()}", f"--custom-aiv-number={npu_utils.get_aivector_core_num()}"
+    ]
+
+
 def ttir_to_npubin(mod, metadata, opt):
     force_simt_only = bool(getattr(opt, "force_simt_only", False) or metadata.get("force_simt_only", False))
     if force_simt_only:
@@ -2140,7 +2165,7 @@ def ttir_to_npubin(mod, metadata, opt):
                 metadata["ttir_layout_coalesce_grid_ceil_div"] = False
             auto_blockify_v1_enabled = _resolve_auto_blockify_v1_policy(str(mod), metadata, opt)
             if opt.enable_ta_auto_blockify_v1 and auto_blockify_v1_enabled:
-                materialized = _run_ta_simt_auto_blockify_v1(mod, metadata, opt)
+                materialized = _run_ta_auto_blockify_v1(mod, metadata, opt)
                 metadata["auto_blockify_v1_runtime_cap"] = materialized
             else:
                 metadata["auto_blockify_v1_runtime_cap"] = auto_blockify_v1_enabled
@@ -2172,6 +2197,7 @@ def ttir_to_npubin(mod, metadata, opt):
             _compile_option_list += ["--enable-hivm-compile=false"]
             _compile_option_list += ["--enable-triton-ir-compile"]
             _compile_option_list += ["--pure-simt"]
+            _compile_option_list += _custom_core_count_options()
             _compile_option_list += [f"--num-warps={opt.num_warps}"]
             _compile_option_list += [f"--threads-per-warp={opt.warp_size}"]
             if opt.simt_optimization_mode != 0000000:

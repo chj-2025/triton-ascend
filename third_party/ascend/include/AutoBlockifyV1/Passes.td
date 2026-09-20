@@ -3,16 +3,16 @@
 
 include "mlir/Pass/PassBase.td"
 
-def TASIMTAutoBlockifyV1
-    : Pass<"ta-simt-auto-blockify-v1", "mlir::triton::FuncOp"> {
+def TAAutoBlockifyV1
+    : Pass<"ta-auto-blockify-v1", "mlir::triton::FuncOp"> {
   let summary = "Map logical Triton programs onto a fixed physical-core wave";
   let description = [{
-    This is the Triton-Adapter port of the NPUIR SIMT AutoBlockify V1 pass.
+    This is the Triton-Adapter port of the NPUIR AutoBlockify V1 pass.
     It keeps every logical program's tile shape unchanged and wraps the
     original program body in an outer scf.for.  AutoBlockify V2 is a separate
     pass that expands tile tensor shapes and is intentionally unaffected.
   }];
-  let constructor = "mlir::triton::createTASIMTAutoBlockifyV1Pass()";
+  let constructor = "mlir::triton::createTAAutoBlockifyV1Pass()";
   let dependentDialects = [
     "mlir::arith::ArithDialect",
     "mlir::gpu::GPUDialect",
@@ -28,8 +28,8 @@ def TASIMTAutoBlockifyV1
   ];
 }
 
-def TARefineSIMTAutoBlockifyV1SuperBlock
-    : Pass<"ta-refine-simt-auto-blockify-v1-superblock",
+def TARefineAutoBlockifyV1SuperBlock
+    : Pass<"ta-refine-auto-blockify-v1-superblock",
            "mlir::triton::FuncOp"> {
   let summary = "Refine an existing factor-1 V1 loop into a pure-SIMT SuperBlock loop";
   let description = [{
@@ -39,7 +39,7 @@ def TARefineSIMTAutoBlockifyV1SuperBlock
     does not touch AutoBlockify V2.
   }];
   let constructor =
-      "mlir::triton::createTARefineSIMTAutoBlockifyV1SuperBlockPass()";
+      "mlir::triton::createTARefineAutoBlockifyV1SuperBlockPass()";
   let dependentDialects = [
     "mlir::arith::ArithDialect",
     "mlir::gpu::GPUDialect",

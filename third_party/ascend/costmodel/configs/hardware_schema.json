@@ -39,6 +39,28 @@
       "minLength": 1,
       "description": "Canonical compiler target used to validate referenced measurement assets"
     },
+    "hardware_identity": {
+      "type": "object",
+      "description": "Separates the product model, runtime architecture number, and compiler architecture. These identifiers are related but are not interchangeable.",
+      "properties": {
+        "product_model": {
+          "type": "string",
+          "description": "Concrete product/SOC name reported by the platform and runtime, for example Ascend950PR_9579."
+        },
+        "npu_arch_id": {
+          "type": "integer",
+          "description": "Numeric ACL_DEV_ATTR_NPU_ARCH value. This is an architecture identifier, not a product model."
+        },
+        "compiler_arch": {
+          "type": "string",
+          "description": "Compiler architecture selected for code generation, for example dav-c310."
+        },
+        "description": {
+          "type": "string",
+          "description": "Evidence and interpretation of the three identity fields."
+        }
+      }
+    },
     "microbenchmark_profile": {
       "type": "string",
       "description": "Path, relative to this hardware config, to the shared model-neutral measurement catalog"
@@ -102,17 +124,33 @@
             "type": "number",
             "description": "Capacity label in KB; the current loader multiplies by 1024 bytes."
           },
-          "bandwidth_tbps": {
+          "physical_size_kb": {
             "type": "number",
-            "description": "Theoretical or model bandwidth in decimal 10^12 byte/s; converted to byte/device-compute-cycle."
+            "description": "Physical capacity before compiler/runtime reservations. Documentary unless a consumer explicitly reads it."
+          },
+          "compiler_reserved_size_kb": {
+            "type": "number",
+            "description": "Capacity withheld by the compiler from the physical memory space."
+          },
+          "compiler_usable_size_kb": {
+            "type": "number",
+            "description": "Capacity visible to compiler allocation. For compatibility, size_kb should equal this value when the cost model needs allocatable capacity."
+          },
+          "runtime_reported_size_bytes": {
+            "type": "integer",
+            "description": "Capacity returned by the runtime device query. It may exclude firmware/runtime reservations and therefore need not equal nominal physical capacity."
+          },
+          "bandwidth_tbps": {
+            "type": ["number", "null"],
+            "description": "Theoretical or model bandwidth in decimal 10^12 byte/s; converted to byte/device-compute-cycle. null means target-specific evidence is not yet available and must not be treated as zero."
           },
           "bandwidth_gbps": {
-            "type": "number",
-            "description": "Theoretical or model bandwidth in decimal 10^9 byte/s; converted to byte/device-compute-cycle."
+            "type": ["number", "null"],
+            "description": "Theoretical or model bandwidth in decimal 10^9 byte/s; converted to byte/device-compute-cycle. null means target-specific evidence is not yet available and must not be treated as zero."
           },
           "latency_cycles": {
-            "type": "integer",
-            "description": "Fixed access-latency prior in device-compute cycles."
+            "type": ["integer", "null"],
+            "description": "Fixed access-latency prior in device-compute cycles. null means target-specific evidence is not yet available and must not be treated as zero."
           },
           "description": {
             "type": "string",
@@ -153,15 +191,15 @@
             "description": "Purpose and evidence boundary of this compute unit."
           },
           "tflops_fp16": {
-            "type": "number",
+            "type": ["number", "null"],
             "description": "Declared FP16 peak arithmetic rate in TFLOP/s."
           },
           "tflops_fp32": {
-            "type": "number",
+            "type": ["number", "null"],
             "description": "Declared FP32 peak arithmetic rate in TFLOP/s."
           },
           "tflops_int8": {
-            "type": "number",
+            "type": ["number", "null"],
             "description": "Declared INT8 peak operation rate; the legacy field name says TFLOPS although TOPS is the more precise unit."
           },
           "fractal_sizes": {
@@ -184,7 +222,7 @@
             "description": "Fallback Cube reduction dimension K when no dtype-specific fractal shape is found."
           },
           "width_elements": {
-            "type": "integer",
+            "type": ["integer", "null"],
             "description": "Nominal SIMD element count, traditionally expressed for the reference dtype; do not use as a dtype-independent lane count."
           },
           "width_bytes": {
@@ -261,15 +299,15 @@
             }
           },
           "bandwidth_gbps": {
-            "type": "number",
+            "type": ["number", "null"],
             "description": "Modeled transfer bandwidth in decimal GB/s."
           },
           "max_burst_bytes": {
-            "type": "integer",
+            "type": ["integer", "null"],
             "description": "Maximum bytes in one modeled burst."
           },
           "alignment_bytes": {
-            "type": "integer",
+            "type": ["integer", "null"],
             "description": "Required or efficient byte alignment for this transfer path."
           },
           "supports_accumulate": {
@@ -374,23 +412,23 @@
               "description": "Consumption status or provenance shared by the startup-latency fields."
             },
             "vector_startup_cycles": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "Vector pipeline startup prior in device-compute cycles."
             },
             "mte2_startup_cycles": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "MTE2 startup prior in device-compute cycles."
             },
             "mte3_startup_cycles": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "MTE3 startup prior in device-compute cycles."
             },
             "cube_startup_cycles": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "Cube engine startup prior in device-compute cycles."
             },
             "fixpipe_startup_cycles": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "FixPipe startup prior in device-compute cycles."
             },
             "notes": {
@@ -408,35 +446,35 @@
               "description": "Consumption status or provenance shared by these operation-cycle priors."
             },
             "exp": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "Vector exponential cycles per instruction."
             },
             "log": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "Vector logarithm cycles per instruction."
             },
             "tanh": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "Vector tanh cycles per instruction."
             },
             "sigmoid": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "Vector sigmoid cycles per instruction."
             },
             "sqrt": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "Vector square-root cycles per instruction."
             },
             "rsqrt": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "Vector reciprocal-square-root cycles per instruction."
             },
             "div": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "Vector division cycles per instruction."
             },
             "simple_ops_add_sub_mul_etc": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "Shared legacy cycle prior for simple vector add, sub, mul, and cast instructions."
             },
             "notes": {
@@ -454,19 +492,19 @@
               "description": "Source and interpretation shared by the scalar-overhead fields."
             },
             "aiv_scalar_to_vec_ratio_steady_state": {
-              "type": "number",
+              "type": ["number", "null"],
               "description": "Steady-state AIV scalar cost relative to vector cost."
             },
             "aic_scalar_to_mac_ratio_steady_state": {
-              "type": "number",
+              "type": ["number", "null"],
               "description": "Steady-state AIC scalar cost relative to Cube MAC cost."
             },
             "aiv_vec_ratio_observed": {
-              "type": "number",
+              "type": ["number", "null"],
               "description": "Observed fraction of AIV time attributed to vector work."
             },
             "aiv_scalar_overhead_factor": {
-              "type": "number",
+              "type": ["number", "null"],
               "description": "Non-vector overhead factor in total ≈ vector × (1 + factor)."
             }
           }
@@ -498,7 +536,7 @@
               "description": "Calibration source and interpretation of the barrier prior."
             },
             "cycles_per_inner_iteration": {
-              "type": "integer",
+              "type": ["integer", "null"],
               "description": "Modeled AIC/AIV pipe-barrier cost per inner iteration."
             }
           }
@@ -643,7 +681,7 @@
           "description": "Human-readable expression."
         },
         "base_cycles": {
-          "type": "integer",
+          "type": ["integer", "null"],
           "description": "Nominal cycles per atomic unit in the documented formula."
         }
       }
