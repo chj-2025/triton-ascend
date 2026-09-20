@@ -10,3 +10,35 @@ This directory is the canonical source for target-specific Cost Model data.
 Python packaging copies these files to
 `triton/backends/ascend/costmodel_profiles/`. That installed directory is a
 generated runtime asset location; it is not the source owner of the profiles.
+
+Run the active-profile wiring and evidence audit after changing either target:
+
+```bash
+python3 microbench/data_provider/audit_active_simd_simt_profiles.py
+```
+
+The audit rejects obsolete route multipliers and dangling measurement IDs.
+It also keeps the incomplete 950DT profile non-runnable and prints every 950PR
+selection parameter that remains an explicit, uncalibrated fallback. This is
+not limited to transition parameters: generic scalar/issue, indirect-memory,
+and control-flow fallbacks are included.
+
+The individual evidence validators recompute parameters from raw samples
+instead of trusting copied JSON values. In particular:
+
+```bash
+python3 microbench/data_provider/validate_operation_rate_evidence.py
+python3 microbench/data_provider/validate_setup_evidence.py
+python3 microbench/data_provider/validate_control_evidence.py
+python3 microbench/data_provider/validate_scan_evidence.py
+python3 microbench/data_provider/validate_dot_dependency_evidence.py
+python3 microbench/data_provider/validate_indirect_gather_evidence.py
+python3 microbench/data_provider/validate_recurrence_group_evidence.py
+python3 microbench/data_provider/validate_continuous_memory_evidence.py
+```
+
+The control and scan validators may finish successfully while printing
+`promotion=REJECTED`. That means the raw SYS_CNT table is internally valid,
+but subtraction does not identify the independent non-negative parameter
+assumed by the current Stage formula. Such data is evidence for a formula gap,
+not permission to fit a convenient constant.

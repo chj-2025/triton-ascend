@@ -183,9 +183,35 @@ struct SelectSimdSimtCostModelPass
         std::max<int64_t>(0, logicalProgramCountHint.getValue());
     if (auto capability =
             llvm::json::parse(routeTransformCapabilityJSON.getValue()))
-      if (auto *object = capability->getAsObject())
+      if (auto *object = capability->getAsObject()) {
         if (auto count = object->getInteger("physical_vector_core_count_hint"))
           options.physicalVectorCoreCountHint = std::max<int64_t>(0, *count);
+        if (auto count = object->getInteger("physical_aicore_count_hint"))
+          options.physicalAiCoreCountHint = std::max<int64_t>(0, *count);
+        auto readFactors = [&](StringRef key, std::vector<int64_t> &factors) {
+          if (!object->get(key))
+            return true;
+          auto *values = object->getArray(key);
+          if (!values)
+            return false;
+          factors.clear();
+          for (const auto &value : *values) {
+            auto factor = value.getAsInteger();
+            if (!factor || (*factor != 1 && *factor != 2 && *factor != 4))
+              return false;
+            factors.push_back(*factor);
+          }
+          return true;
+        };
+        if (!readFactors("whole_kernel_superblock_factors",
+                         options.wholeKernelSuperblockFactors) ||
+            !readFactors("scope_superblock_factors",
+                         options.scopeSuperblockFactors)) {
+          module.emitError("invalid backend SuperBlock factor set");
+          signalPassFailure();
+          return;
+        }
+      }
 
     SimtAnchorPlan anchorPlan =
         buildMixedSimtAnchorPlan(module, options.compileOn91095);
@@ -323,14 +349,31 @@ struct SelectSimdSimtCostModelPass
         static_cast<int64_t>(mixedAnchors.size());
     reportJSON["selected_superblock_factor"] = selectedSuperblockFactor;
     reportJSON["logical_program_count_hint"] = options.logicalProgramCountHint;
-    if (options.logicalProgramCountHint > 0) {
-      reportJSON["effective_runtime_factor"] = std::min<int64_t>(
-          selectedSuperblockFactor, options.logicalProgramCountHint);
-      reportJSON["full_group_count"] =
-          options.logicalProgramCountHint / selectedSuperblockFactor;
-      reportJSON["tail_count"] =
-          options.logicalProgramCountHint % selectedSuperblockFactor;
-    }
+    const StageRoutePlan *selectedRuntimePlan =
+        recommended == kAllSimd
+            ? &report.stageModel.allSimd
+            : recommended == kAllSimtOnly ? &report.stageModel.allSimt
+                                          : &report.stageModel.mixed;
+    reportJSON["runtime_physical_program_count"] =
+        selectedRuntimePlan->runtimePhysicalProgramCount;
+    reportJSON["runtime_scheduling_slot_count"] =
+        selectedRuntimePlan->runtimeSchedulingSlotCount;
+    reportJSON["logical_programs_per_scheduling_slot"] =
+        selectedRuntimePlan->runtimeLogicalProgramsPerSchedulingSlot;
+    reportJSON["full_group_count"] =
+        selectedRuntimePlan->runtimeFullGroupCount;
+    reportJSON["tail_count"] =
+        selectedRuntimePlan->runtimeTailProgramCount;
+    reportJSON["runtime_loop_iteration_count"] =
+        selectedRuntimePlan->runtimeLoopIterationCount;
+    const int64_t effectiveRuntimeFactor =
+        recommended == kAllSimd
+            ? 1
+            : recommended == kMixedSimdSimt &&
+                      selectedRuntimePlan->runtimeFullGroupCount == 0
+                  ? 1
+                  : selectedSuperblockFactor;
+    reportJSON["effective_runtime_factor"] = effectiveRuntimeFactor;
     std::string json =
         llvm::formatv("{0}", llvm::json::Value(std::move(reportJSON))).str();
     module->setAttr(kReportJSONAttr, builder.getStringAttr(json));

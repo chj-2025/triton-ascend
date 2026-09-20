@@ -4,16 +4,28 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <cstdlib>
+#include <vector>
 
 using namespace std;
 
+static void check(int code, const char *name) {
+  if (code) {
+    fprintf(stderr, "%s failed: %d\n", name, code);
+    exit(1);
+  }
+}
+
 static char *readBin(const char *f, uint32_t *sz) {
   ifstream s(f, ios::binary);
+  if (!s) exit(1);
   s.seekg(0, ios::end);
   size_t n = s.tellg();
+  if (!n) exit(1);
   s.seekg(0);
   char *b = new char[n];
   s.read(b, n);
+  if (!s) exit(1);
   *sz = n;
   return b;
 }
@@ -21,13 +33,13 @@ static char *readBin(const char *f, uint32_t *sz) {
 static void *reg(const char *bin, char **buf) {
   uint32_t sz;
   *buf = readBin(bin, &sz);
-  rtDevBinary_t b;
+  rtDevBinary_t b = {};
   b.data = *buf;
   b.length = sz;
   b.magic = RT_DEV_BINARY_MAGIC_ELF_AIVEC;
   b.version = 0;
   void *h = nullptr;
-  rtDevBinaryRegister(&b, &h);
+  check(rtDevBinaryRegister(&b, &h), "register binary");
   return h;
 }
 
@@ -48,11 +60,33 @@ static long long runK(const char *fn, rtStream_t stream, void *dout, int K,
   ai.argsSize = sizeof(args);
   rtTaskCfgInfo_t cfg = {};
   cfg.localMemorySize = 192 * 1024;
-  rtKernelLaunchWithFlagV2((void *)fn, 1, &ai, 0, stream, 0, &cfg);
-  rtStreamSynchronize(stream);
+  check(rtKernelLaunchWithFlagV2((void *)fn, 1, &ai, 0, stream, 0, &cfg), "launch");
+  check(rtStreamSynchronize(stream), "synchronize");
   long long cycles = 0;
-  rtMemcpy(&cycles, sizeof(cycles), dout, sizeof(cycles),
-           RT_MEMCPY_DEVICE_TO_HOST);
+  check(rtMemcpy(&cycles, sizeof(cycles), dout, sizeof(cycles),
+                 RT_MEMCPY_DEVICE_TO_HOST), "copy ticks");
+  vector<float> values(nwarp * 32);
+  check(rtMemcpy(values.data(), values.size() * sizeof(float),
+                 static_cast<char *>(dout) + 32, values.size() * sizeof(float),
+                 RT_MEMCPY_DEVICE_TO_HOST), "copy output");
+  for (int warp = 0; warp < nwarp; ++warp) {
+    float x[4][32];
+    for (int chain = 0; chain < 4; ++chain)
+      for (int lane = 0; lane < 32; ++lane)
+        x[chain][lane] = lane + warp + 1 + chain;
+    for (int i = 0; i < iters; ++i)
+      for (int chain = 0; chain < (mode ? 4 : 1); ++chain)
+        for (int lane = 31; lane >= (1 << chain); --lane)
+          x[chain][lane] = x[chain][lane - (1 << chain)];
+    for (int lane = 0; lane < 32; ++lane) {
+      float expected = x[0][lane] + x[1][lane] + x[2][lane] + x[3][lane];
+      if (values[warp * 32 + lane] != expected || cycles <= 0) {
+        fprintf(stderr, "shuffle mismatch: warp=%d lane=%d\n", warp, lane);
+        exit(2);
+      }
+    }
+  }
+  printf("sample,%d,%d,%d,%d,%lld,PASS\n", nwarp, mode, K, iters, cycles);
   return cycles;
 }
 
@@ -78,16 +112,16 @@ static double cyclesPerIter(const char *fn, rtStream_t stream, void *dout,
 }
 
 int main() {
-  aclInit(nullptr);
-  rtSetDevice(0);
+  check(aclInit(nullptr), "aclInit");
+  check(rtSetDevice(0), "set device");
   char *binary = nullptr;
   void *handle = reg("simt_shuffle.o", &binary);
   const char *fn = "measure";
-  rtFunctionRegister(handle, fn, fn, (void *)fn, 0);
+  check(rtFunctionRegister(handle, fn, fn, (void *)fn, 0), "register function");
   rtStream_t stream;
-  rtStreamCreate(&stream, 0);
+  check(rtStreamCreate(&stream, 0), "stream");
   void *dout = nullptr;
-  rtMalloc(&dout, sizeof(long long), RT_MEMORY_HBM, 0);
+  check(rtMalloc(&dout, 32 + 1024 * sizeof(float), RT_MEMORY_HBM, 0), "allocate");
 
   runK(fn, stream, dout, 2, 4, 16, 0);
   printf("SIMT __shfl_up dependent and ILP4 throughput\n");
@@ -101,10 +135,9 @@ int main() {
            (double)warps * 4.0 / ilpCycles);
   }
 
-  rtFree(dout);
-  rtStreamDestroy(stream);
-  rtDeviceReset(0);
-  aclFinalize();
+  check(rtFree(dout), "free");
+  check(rtStreamDestroy(stream), "destroy stream");
+  check(aclFinalize(), "finalize");
   delete[] binary;
   return 0;
 }

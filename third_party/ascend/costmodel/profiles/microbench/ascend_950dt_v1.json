@@ -1,0 +1,379 @@
+{
+  "$schema": "./microbenchmark_profile_schema.json",
+  "schema_version": 1,
+  "profile_version": "ascend-950dt-shared-microbench-20260912-draft",
+  "target": "Ascend950DT",
+  "description": "DRAFT / NOT RUNNABLE: independent Ascend950DT template. null means unknown, not zero or a PR fallback. See ../profiles/ascend_950dt_README.md (from configs) or profiles/ascend_950dt_README.md in the costmodel tree. Not calibrated; do not use for route scores.",
+  "measurements": {
+    "clock.sys_cnt.frequency_mhz": {
+      "description": "Measured SYS_CNT interval [999.923515, 1000.122079] MHz, rounded to 1000 MHz. Not compute-core frequency.",
+      "value": 1000,
+      "unit": "MHz",
+      "cycle_domain": "wall_clock",
+      "scope": "device",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_syscnt_20260912.json",
+      "confidence": "high"
+    },
+    "clock.device_compute.frequency_mhz": {
+      "description": "Configured compute clock, not SYS_CNT or runtime telemetry.",
+      "value": 1650,
+      "unit": "MHz",
+      "cycle_domain": "wall_clock",
+      "scope": "device",
+      "source_kind": "device_configuration",
+      "source": "Installed CANN platform_config/Ascend950DT_9582.ini, physical-machine snapshot 2026-09-12",
+      "confidence": "medium"
+    },
+    "simd.vector_width_bits": {
+      "description": "256-byte vector register width; not instruction throughput.",
+      "value": 2048,
+      "unit": "bit",
+      "cycle_domain": "none",
+      "scope": "single_aiv",
+      "source_kind": "device_configuration",
+      "source": "Installed CANN platform_config/Ascend950DT_9582.ini, physical-machine snapshot 2026-09-12",
+      "confidence": "medium"
+    },
+    "simt.warp_size": {
+      "description": "Direct ACL_DEV_ATTR_WARP_SIZE query on Ascend950DT_9582, return code 0. Not inferred from PR.",
+      "value": 32,
+      "unit": "lane",
+      "cycle_domain": "none",
+      "scope": "single_warp",
+      "source_kind": "device_configuration",
+      "source": "data_provider/950dt_device_properties_20260912.json",
+      "confidence": "high"
+    },
+    "simd.f32.add.throughput": {
+      "description": "DT measured saturated source vector ADD throughput; ILP 4/6/8 sweep, 64 FP32 lanes per source vector ADD. Not dependent latency.",
+      "value": 3.3,
+      "unit": "vector_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp4_or_more_effective_source_vadd",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_add_checked_20260912.json",
+      "confidence": "medium"
+    },
+    "simd.f32.add.dependent_latency": {
+      "description": "Measured dependent source-vadd latency. The value is the mean of two independent physical runs and two chain-length slopes per run; all 252 checks passed.",
+      "value": 1.81821,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_dependent_chain",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_dependent_latency_candidate_20260913.json; data_provider/950dt_dependent_latency_repeat_20260913.json",
+      "confidence": "medium"
+    },
+    "simt.f32.add.throughput": {
+      "description": "DT measured effective source scalar ADD rate, 32 launched warps, ILP8. Not throughput per individual thread.",
+      "value": 105.6,
+      "unit": "scalar_op/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_runtime_loop_ilp8_32_launched_warps_effective_source_fadd",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_add_checked_20260912.json",
+      "confidence": "medium"
+    },
+    "simt.setup.empty": {
+      "description": "Measured minimal VF enqueue slope at 32 warps, including device loop and one observable UB store; no per-iteration barrier. Not isolated transition latency.",
+      "value": 123.625,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_minimal_vf_enqueue_slope_no_per_iteration_barrier",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_setup_20260912.json",
+      "confidence": "medium"
+    },
+    "simt.setup.empty_with_barrier": {
+      "description": "Repeated fresh serialized minimal-VF slope at 32 warps, including one observable UB store and PIPE_ALL per iteration. Mean of the 200-to-400 slopes from two runs; not the sum of isolated enter/exit costs.",
+      "value": 235.6075,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_serialized_minimal_vf_with_per_iteration_barrier",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_setup_with_simd_1_20260913.csv; data_provider/950dt_setup_with_simd_2_20260913.csv",
+      "confidence": "medium"
+    },
+    "simd.setup.minimal_with_barrier": {
+      "description": "Repeated fresh minimal observable SIMD Stage slope, including one vdup, one UB vector store and PIPE_ALL per iteration. Mean of the 200-to-400 slopes from two runs; this is a Stage setup proxy, not an isolated instruction latency.",
+      "value": 44.8475,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_minimal_simd_stage_with_per_iteration_barrier",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_setup_with_simd_1_20260913.csv; data_provider/950dt_setup_with_simd_2_20260913.csv",
+      "confidence": "medium"
+    },
+    "simt.shuffle.throughput": {
+      "description": "Correctness-checked effective source shfl_up rate at 32 warps, ILP4, including loop control. Assembly review pending; not isolated instruction peak.",
+      "value": 0.815417,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_fp32_shfl_up_32_warps_ilp4_four_independent_chains",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_shuffle_checked_20260912.json",
+      "confidence": "low"
+    },
+    "simt.shuffle.dependent_latency": {
+      "description": "Measured one-warp dependent shfl_up source latency. The value is the mean of two independent physical runs and two chain-length slopes per run; all 252 checks passed.",
+      "value": 10.2846,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_fp32_shfl_up_1_warp_dependent_chain",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_dependent_latency_candidate_20260913.json; data_provider/950dt_dependent_latency_repeat_20260913.json",
+      "confidence": "medium"
+    },
+    "simt.gm.load.throughput": {
+      "description": "Measured effective GM-path workload rate, including arithmetic/control. Active footprint changes from 32 to 128 MiB; not pure HBM bandwidth. See evidence limitations.",
+      "value": 0.2475782265625,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_gm_checked_20260912.json",
+      "confidence": "low"
+    },
+    "simt.gm.store.throughput": {
+      "description": "Measured effective GM-path workload rate, including arithmetic/control. Active footprint changes from 32 to 128 MiB; not pure HBM bandwidth. See evidence limitations.",
+      "value": 0.588884953125,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_gm_checked_20260912.json",
+      "confidence": "low"
+    },
+    "simt.gm.load.bandwidth": {
+      "description": "Measured effective GM-path workload rate, including arithmetic/control. Active footprint changes from 32 to 128 MiB; not pure HBM bandwidth. See evidence limitations.",
+      "value": 31.690013,
+      "unit": "byte/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_gm_checked_20260912.json",
+      "confidence": "low"
+    },
+    "simt.gm.store.bandwidth": {
+      "description": "Measured effective GM-path workload rate, including arithmetic/control. Active footprint changes from 32 to 128 MiB; not pure HBM bandwidth. See evidence limitations.",
+      "value": 75.377274,
+      "unit": "byte/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_sequential_128mib_rotating_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_gm_checked_20260912.json",
+      "confidence": "low"
+    },
+    "simt.ub.load.throughput": {
+      "description": "Measured effective UB workload rate including arithmetic/address/control. Full sink and store validation. Not pure hardware bandwidth or latency.",
+      "value": 0.982452,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_ub_checked_20260912.json",
+      "confidence": "low"
+    },
+    "simt.ub.store.throughput": {
+      "description": "Measured effective UB workload rate including arithmetic/address/control. Full sink and store validation. Not pure hardware bandwidth or latency.",
+      "value": 0.8053552734375,
+      "unit": "warp_instruction/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_ub_checked_20260912.json",
+      "confidence": "low"
+    },
+    "simt.ub.load.bandwidth": {
+      "description": "Measured effective UB workload rate including arithmetic/address/control. Full sink and store validation. Not pure hardware bandwidth or latency.",
+      "value": 125.753856,
+      "unit": "byte/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_ub_checked_20260912.json",
+      "confidence": "low"
+    },
+    "simt.ub.store.bandwidth": {
+      "description": "Measured effective UB workload rate including arithmetic/address/control. Full sink and store validation. Not pure hardware bandwidth or latency.",
+      "value": 103.085475,
+      "unit": "byte/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_32_warps_128kib_4_rotating_sets_8_independent_ops_per_thread",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_ub_checked_20260912.json",
+      "confidence": "low"
+    },
+    "simt.setup.transition_harness_net.warps_1": {
+      "description": "Measured minimal VF plus barrier slope minus barrier-only slope in one binary, repeated for stability. Harness-specific, NOT Mixed transition; cross-binary sensitivity unresolved.",
+      "value": 208.985,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_transition_harness_standalone_empty_vf_net_1_warp",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_setup_net_20260912.json",
+      "confidence": "low"
+    },
+    "simt.setup.transition_harness_net.warps_2": {
+      "description": "Measured minimal VF plus barrier slope minus barrier-only slope in one binary, repeated for stability. Harness-specific, NOT Mixed transition; cross-binary sensitivity unresolved.",
+      "value": 208.9,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_transition_harness_standalone_empty_vf_net_2_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_setup_net_20260912.json",
+      "confidence": "low"
+    },
+    "simt.setup.transition_harness_net.warps_4": {
+      "description": "Measured minimal VF plus barrier slope minus barrier-only slope in one binary, repeated for stability. Harness-specific, NOT Mixed transition; cross-binary sensitivity unresolved.",
+      "value": 209.015,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_transition_harness_standalone_empty_vf_net_4_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_setup_net_20260912.json",
+      "confidence": "low"
+    },
+    "simt.setup.transition_harness_net.warps_8": {
+      "description": "Measured minimal VF plus barrier slope minus barrier-only slope in one binary, repeated for stability. Harness-specific, NOT Mixed transition; cross-binary sensitivity unresolved.",
+      "value": 208.955,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_transition_harness_standalone_empty_vf_net_8_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_setup_net_20260912.json",
+      "confidence": "low"
+    },
+    "simt.setup.transition_harness_net.warps_16": {
+      "description": "Measured minimal VF plus barrier slope minus barrier-only slope in one binary, repeated for stability. Harness-specific, NOT Mixed transition; cross-binary sensitivity unresolved.",
+      "value": 209.02,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_transition_harness_standalone_empty_vf_net_16_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_setup_net_20260912.json",
+      "confidence": "low"
+    },
+    "simt.setup.transition_harness_net.warps_32": {
+      "description": "Measured minimal VF plus barrier slope minus barrier-only slope in one binary, repeated for stability. Harness-specific, NOT Mixed transition; cross-binary sensitivity unresolved.",
+      "value": 244.095,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_transition_harness_standalone_empty_vf_net_32_warps",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_setup_net_20260912.json",
+      "confidence": "low"
+    },
+    "simd.gm.load.continuous_dma": {
+      "description": "Per-AIV continuous GM-to-UB DMA slope from a joint least-squares fit of two independent 4/32/128 KiB sweeps. The paired startup measurement must be charged once per logical transfer.",
+      "value": 167.608226,
+      "unit": "byte/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_continuous_gm_to_ub_dma",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_simd_memory_20260913.log; data_provider/950dt_simd_memory_repeat_20260913.log",
+      "confidence": "medium"
+    },
+    "simd.gm.load.continuous_dma_startup": {
+      "description": "Intercept of the same GM-to-UB fit; it is a per-logical-transfer startup, not kernel setup.",
+      "value": 105.984801,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_continuous_gm_to_ub_dma_operation",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_simd_memory_20260913.log; data_provider/950dt_simd_memory_repeat_20260913.log",
+      "confidence": "medium"
+    },
+    "simd.gm.store.continuous_dma": {
+      "description": "Per-AIV continuous UB-to-GM DMA slope from a joint least-squares fit of two independent 4/32/128 KiB sweeps. The paired startup measurement must be charged once per logical transfer.",
+      "value": 213.142804,
+      "unit": "byte/system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_continuous_ub_to_gm_dma",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_simd_memory_20260913.log; data_provider/950dt_simd_memory_repeat_20260913.log",
+      "confidence": "medium"
+    },
+    "simd.gm.store.continuous_dma_startup": {
+      "description": "Intercept of the same UB-to-GM fit; it is a per-logical-transfer startup, not kernel setup.",
+      "value": 91.298767,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_continuous_ub_to_gm_dma_operation",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_simd_memory_20260913.log; data_provider/950dt_simd_memory_repeat_20260913.log",
+      "confidence": "medium"
+    },
+    "simd.control.dependent_fadd_pair_delta": {
+      "description": "Increment from one to two dependent scalar fadd instructions in the same SIMD loop body. Mean of two fresh pair runs; optimized LLVM IR contains one versus two surviving fadd instructions. This delta is evidence for formula review, not yet a scalar-throughput profile parameter.",
+      "value": 2.424625,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_one_additional_dependent_scalar_fadd_per_loop_iteration",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_control_rates_pair_20260913.csv; data_provider/950dt_control_rates_pair_ir_audit_20260913.log",
+      "confidence": "medium"
+    },
+    "simt.control.one_warp_loop_plus_fadd": {
+      "description": "One-warp loop containing one dependent fadd per lane. Mean of two fresh runs. It combines loop/control and arithmetic and therefore is not an isolated loop-backedge latency.",
+      "value": 13.940594,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_one_simt_warp_one_dependent_fadd_per_lane_per_loop_iteration",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_control_warp_sweep_20260913.csv; data_provider/950dt_control_rates_pair_ir_audit_20260913.log",
+      "confidence": "medium"
+    },
+    "simt.control.thirty_two_warp_loop_plus_fadd": {
+      "description": "Thirty-two-warp loop containing one dependent fadd per lane. Mean of two fresh runs. The 38.7855-cycle value and the non-linear 1/2/4/8/16/32-warp sweep prove that one constant loop_backedge_system_cycles cannot represent both dependency and shared-issue effects.",
+      "value": 38.7855,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_thirty_two_simt_warps_one_dependent_fadd_per_lane_per_loop_iteration",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_control_warp_sweep_20260913.csv; data_provider/950dt_control_rates_pair_ir_audit_20260913.log",
+      "confidence": "medium"
+    },
+    "simd.prefix_scan.fit_intercept": {
+      "description": "Intercept of the correctness-checked SIMD prefix-scan fit C=intercept+(axis_extent-1)*row_step for one vector group. It includes seed load/store and fixed serialized Stage work; it is not a generic kernel setup constant.",
+      "value": 46.06769,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_fp32_prefix_scan_one_vector_group_axis_extent_4_8_16_32",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_scan_rates_1_20260913.csv; data_provider/950dt_scan_rates_2_20260913.csv",
+      "confidence": "medium"
+    },
+    "simd.prefix_scan.row_step": {
+      "description": "Slope per additional scan-axis row for one <=64-lane vector group in the same SIMD prefix-scan fit. Two runs agree within 0.03%; extrapolation to multiple vector groups still requires validation.",
+      "value": 3.030274,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_fp32_prefix_scan_additional_axis_row_one_vector_group",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_scan_rates_1_20260913.csv; data_provider/950dt_scan_rates_2_20260913.csv",
+      "confidence": "medium"
+    },
+    "simt.prefix_scan.rows_4_columns_8": {
+      "description": "End-to-end serialized SIMT Kogge-Stone prefix scan for 8 independent sequences of extent 4. This validates a concrete point but is not promoted to a single dependency factor because warp count and scan depth are separate dimensions.",
+      "value": 278.6535,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_fp32_simt_prefix_scan_axis_extent_4_independent_sequences_8",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_scan_rates_1_20260913.csv; data_provider/950dt_scan_rates_2_20260913.csv",
+      "confidence": "medium"
+    },
+    "simt.prefix_scan.rows_32_columns_32": {
+      "description": "End-to-end serialized SIMT Kogge-Stone prefix scan for 32 independent sequences of extent 32. This validates a concrete point but is not promoted to a single dependency factor because warp count and scan depth are separate dimensions.",
+      "value": 1447.76,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_aiv_fp32_simt_prefix_scan_axis_extent_32_independent_sequences_32",
+      "source_kind": "isolated_microbenchmark",
+      "source": "data_provider/950dt_scan_rates_1_20260913.csv; data_provider/950dt_scan_rates_2_20260913.csv",
+      "confidence": "medium"
+    }
+  }
+}

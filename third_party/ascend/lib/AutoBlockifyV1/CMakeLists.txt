@@ -1,5 +1,5 @@
 add_triton_library(AutoBlockifyV1
-  SIMTAutoBlockifyV1.cpp
+  AutoBlockifyV1.cpp
 
   DEPENDS
   AutoBlockifyV1PassIncGen

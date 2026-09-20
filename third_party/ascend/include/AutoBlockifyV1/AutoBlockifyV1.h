@@ -15,22 +15,22 @@
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
-#define GEN_PASS_DECL_TASIMTAUTOBLOCKIFYV1
-#define GEN_PASS_DECL_TAREFINESIMTAUTOBLOCKIFYV1SUPERBLOCK
+#define GEN_PASS_DECL_TAAUTOBLOCKIFYV1
+#define GEN_PASS_DECL_TAREFINEAUTOBLOCKIFYV1SUPERBLOCK
 #include "ascend/include/AutoBlockifyV1/Passes.h.inc"
 
-#define GEN_PASS_DEF_TASIMTAUTOBLOCKIFYV1
-#define GEN_PASS_DEF_TAREFINESIMTAUTOBLOCKIFYV1SUPERBLOCK
+#define GEN_PASS_DEF_TAAUTOBLOCKIFYV1
+#define GEN_PASS_DEF_TAREFINEAUTOBLOCKIFYV1SUPERBLOCK
 #include "ascend/include/AutoBlockifyV1/Passes.h.inc"
 
 namespace mlir::triton {
 
 std::unique_ptr<OperationPass<FuncOp>>
-createTASIMTAutoBlockifyV1Pass(const TASIMTAutoBlockifyV1Options &options = {});
+createTAAutoBlockifyV1Pass(const TAAutoBlockifyV1Options &options = {});
 
 std::unique_ptr<OperationPass<FuncOp>>
-createTARefineSIMTAutoBlockifyV1SuperBlockPass(
-    const TARefineSIMTAutoBlockifyV1SuperBlockOptions &options = {});
+createTARefineAutoBlockifyV1SuperBlockPass(
+    const TARefineAutoBlockifyV1SuperBlockOptions &options = {});
 
 } // namespace mlir::triton
 

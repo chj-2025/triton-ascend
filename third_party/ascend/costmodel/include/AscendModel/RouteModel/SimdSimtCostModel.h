@@ -90,10 +90,15 @@ struct SimdSimtCostModelOptions {
   /// logical-program group.
   int64_t logicalProgramCountHint = 0;
   int64_t physicalVectorCoreCountHint = 0;
+  int64_t physicalAiCoreCountHint = 0;
+  /// Backend capability sets, intersected with structural/resource legality.
+  /// Empty explicitly disables the corresponding SIMT implementations.
+  std::vector<int64_t> wholeKernelSuperblockFactors = {1, 2, 4};
+  std::vector<int64_t> scopeSuperblockFactors = {1, 2, 4};
 };
 
 struct SimdSimtCostReport {
-  int64_t schemaVersion = 14;
+  int64_t schemaVersion = 18;
   std::string model = "ascend_stage_route_cost_v3_cpp";
   std::string profileVersion;
   std::string profileTarget;

@@ -28,8 +28,9 @@ enum class StageCostModelKind {
   ScalarIssue,
   ScalarControl,
   ScalarMath,
-  ScalarLoad,
-  ScalarStore,
+  /// Elementwise tensor/vector computation, not scalar dispatch. The mode
+  /// selects SIMD vector throughput or SIMT lane throughput for its workload.
+  VectorIssue,
   IndexGeneration,
   PredicateMask,
   LoopPredicate,
@@ -51,15 +52,6 @@ enum class StageCostModelKind {
 
 llvm::StringRef stringifyStageCostModel(StageCostModelKind kind);
 
-struct StageControlFlowRates {
-  double loopBackedgeCycles = 0.0;
-  double conditionalBranchCycles = 0.0;
-  double divergentBranchPenaltyCycles = 0.0;
-  double synchronizationCycles = 0.0;
-
-  bool isFiniteAndNonNegative() const;
-};
-
 struct LogicalStage {
   std::string id;
   StageCostModelKind costModelKind = StageCostModelKind::ScalarIssue;
@@ -80,8 +72,9 @@ struct LogicalStage {
   int64_t liveOutBytes = 0;
   /// Exact tensor traffic at the local scope boundary.  Unlike Stage
   /// live-in/live-out, these fields mirror the SSA values captured by and
-  /// returned from the materialized scope.scope regions.
-  int64_t localSimtScopeCount = 0;
+  /// returned from the single compound scope.scope region produced by
+  /// mergeSimtStageAnchors.  If the anchors cannot form one scope, the local
+  /// SIMT implementation is illegal rather than being scored approximately.
   int64_t scopeInputTensorBytes = 0;
   int64_t scopeOutputTensorBytes = 0;
   /// Indices into the immutable SimtAnchorPlan.  A mixed route may
@@ -110,6 +103,25 @@ struct StagePartition {
 struct StageOperationRate {
   double throughput = 0.0;
   double factor = 1.0;
+  /// Aggregate throughput of one SIMT VF indexed by its launched warp count.
+  /// Each concrete Stage implementation selects its own point using
+  /// baseWarpCount * SuperBlockFactor; throughput is the fallback for profiles
+  /// that do not yet provide an occupancy curve.
+  std::map<int64_t, double> throughputByWarpCount;
+};
+
+/// Completed group fit after subtracting a matched nonempty control VF:
+/// C(n>0)=first+(n-1)*increment. No empty-harness cost is charged to an access.
+/// The key includes full logical geometry and concrete VF warp count/factor.
+/// Populating it requires a matching lowering/probe, not shape alone.
+struct StageMemoryLayoutCost {
+  double firstCycles = 0.0;
+  double incrementalCycles = 0.0;
+  int64_t minCount = 1;
+  int64_t maxCount = 0;
+  std::string evidence;
+  bool isValid() const;
+  std::optional<double> evaluate(double count) const;
 };
 
 struct StageAtomicRate {
@@ -125,73 +137,87 @@ struct StageAtomicRate {
 };
 
 struct StageModeProfile {
+  /// Resolved by the evaluator; not an independently editable profile knob.
+  int64_t activeWarpCount = 0;
   double setupCycles = 0.0;
-  /// Physical SIMD instruction width.  Unlike vectorWidth, this preserves
-  /// bytes/bits so FP16 and FP32 short-axis segments are priced correctly.
-  int64_t vectorWidthBits = 1;
+  /// Completion-inclusive setup measurements indexed by the launched SIMT
+  /// warp count.  The scalar setupCycles remains the documented fallback.
+  std::map<int64_t, double> setupCyclesByWarpCount;
   int64_t vectorWidth = 1;
   int64_t issueWidth = 1;
   llvm::StringMap<StageOperationRate> operationRates;
   double loadBytesPerCycle = 0.0;
   double storeBytesPerCycle = 0.0;
+  /// Startup cost of one logical load/store operation.  For a continuous
+  /// group curve this is used when no shape-matched group-startup curve is
+  /// present; otherwise it applies only to uncovered operations.
+  double loadOperationSetupCycles = 0.0;
+  double storeOperationSetupCycles = 0.0;
   double loadWarpInstructionsPerCycle = 0.0;
   double storeWarpInstructionsPerCycle = 0.0;
+  std::map<int64_t, double> loadWarpInstructionsPerCycleByWarpCount;
+  std::map<int64_t, double> storeWarpInstructionsPerCycleByWarpCount;
+  std::map<std::string, StageMemoryLayoutCost> loadLayoutCosts;
+  std::map<std::string, StageMemoryLayoutCost> storeLayoutCosts;
+  /// Optimistic full-tile service estimate, not first-round completion or
+  /// barrier/stack cost. The unit is fitted address coverage, not an ISA claim.
+  int64_t storeFootprintUnitBytes = 0;
+  double storeCyclesPerFootprintUnit = 0.0;
+  std::map<int64_t, double> storeIssueFloorByWarpCount;
   double predicateOperationsPerCycle = 0.0;
   double shuffleLanesPerCycle = 0.0;
-  double prefixScanDependencyFactor = 1.0;
+  std::map<int64_t, double> shuffleLanesPerCycleByWarpCount;
+  /// Latency of one dependent scan step. For SIMD this is one dependent
+  /// vector add; for SIMT it is one dependent shuffle/add/control step.
+  double prefixScanStepLatencyCycles = 0.0;
   double dotSetupCycles = 0.0;
   double dotFlopsPerCycle = 0.0;
-  double scalarOperationsPerCycle = 0.0;
   double issueOperationsPerCycle = 0.0;
-  double spillTransactionsPerCycle = 0.0;
-  /// Scalar white-box terms in SYS_CNT cycles (CAModel 1.8GHz + 988.9/1800).
-  double mainScalarLoadPrepCycles = 0.0;
-  double mainScalarLoadFillCycles = 0.0;
-  double mainScalarLoadIssueCycles = 0.0;
-  double mainScalarLoadOutstandingLines = 0.0;
-  double mainScalarLoadExtraLineLowCycles = 0.0;
-  double mainScalarLoadExtraLineHighCycles = 0.0;
-  double mainScalarLoadExtraLineHighThreshold = 0.0;
-  double simtUniformLoadPrepCycles = 0.0;
-  double simtUniformLoadFillCycles = 0.0;
-  double simtUniformLoadDiffLineIssueCycles = 0.0;
-  double mte3StorePrepCycles = 0.0;
-  double mte3StoreFillCycles = 0.0;
-  double simtUniformStoreBaseCycles = 0.0;
-  /// Loaded-index memory cannot use the continuous MTE/LSU throughput model.
-  /// These rates operate on logical warp/transaction counts and include one
-  /// uncovered dependency latency per Stage iteration.
-  double indirectLoadTransactionsPerCycle = 0.0;
-  double indirectStoreTransactionsPerCycle = 0.0;
-  double indirectDependencyLatencyCycles = 0.0;
-  llvm::StringMap<StageAtomicRate> atomicRates;
-  StageControlFlowRates controlFlow;
-
+  /// Completion-exclusive incremental cost of one loaded-index load, indexed
+  /// by the load's logical warp-instruction count.  Loaded-index work without
+  /// a classified load shape is unsupported instead of receiving an invented
+  /// generic transaction rate or dependency latency.
+  std::map<int64_t, double> indirectLoadSystemCyclesByWarpInstructions;
+  /// One-time loaded-index execution envelope for a Stage, indexed by the
+  /// same logical warp-instruction shape.  It is the intercept of the same
+  /// count sweep as the incremental curve and is paid once, not per load.
+  std::map<int64_t, double> indirectLoadStartupSystemCyclesByWarpInstructions;
+  /// Measured cost of one physical SuperBlock group's recurrence iteration.
+  /// The outer key is the SuperBlock factor; the inner key is the semantic
+  /// reduction lane-step count of one logical program.  F logical programs
+  /// share this group cost, while route composition accounts for waves once.
+  int64_t recurrenceGroupBaseWarpCount = 0;
+  std::map<int64_t, std::map<int64_t, double>>
+      recurrenceReductionGroupCyclesByFactorAndLaneSteps;
+  /// Steady incremental cost of one ordinary FP32 load/store operation in a
+  /// physical group. Outer key is SuperBlock factor; inner key is bytes per
+  /// logical-program operation. The measurement already includes all F
+  /// logical programs and must not be scaled by F again.
+  int64_t continuousMemoryGroupBaseWarpCount = 0;
+  std::map<int64_t, std::map<int64_t, double>>
+      continuousLoadGroupCyclesByFactorAndBytes;
+  std::map<int64_t, std::map<int64_t, double>>
+      continuousStoreGroupCyclesByFactorAndBytes;
+  /// Optional one-time Stage-direction startup fitted independently from the
+  /// steady operation slope. It is paid once for all covered shapes, not once
+  /// per operation; profiles omit it when n=0/1 evidence is not wave-stable.
+  std::map<int64_t, std::map<int64_t, double>>
+      continuousLoadGroupStartupCyclesByFactorAndBytes;
+  std::map<int64_t, std::map<int64_t, double>>
+      continuousStoreGroupStartupCyclesByFactorAndBytes;
   bool isValid(StageMode mode) const;
 };
 
 struct HardwareProfile {
   std::string profileVersion;
   std::string target;
-  /// Logical warp groups available to one SIMT program.  This is a compile
-  /// option, not a hardware constant, and bounds cross-group interleaving in
-  /// recurrence Stage models.
-  int64_t logicalWarpGroupCount = 1;
-  /// Long-lived recurrence state consumes finite register/stack bandwidth.
-  /// The byte rate is shared by the SIMD recurrence-state term and the extra
-  /// pressure created when a SIMT SuperBlock replicates that state; neither
-  /// formula depends on a workload name.
-  /// Largest factor that still gives proportional latency-hiding benefit.
-  int64_t superblockUsefulFactorLimit = 1;
-  /// Largest factor that may replicate loop-carried live state without an
-  /// explicit persistent-state pressure charge.  This is intentionally
-  /// independent from the latency-hiding limit: straight-line kernels may
-  /// benefit through F4 while recurrence state becomes expensive above F2.
-  int64_t superblockPersistentStatePressureFreeFactor = 1;
-  double superblockPersistentStateBytesPerCycle = 1.0;
+  /// Base warp count of one logical SIMT program. This is a compile option,
+  /// not a hardware constant. A SuperBlock-F implementation launches
+  /// baseSimtWarpCount * F active warps in the physical VF.
+  int64_t baseSimtWarpCount = 1;
   StageModeProfile simd;
   StageModeProfile simt;
-  StageTransitionCost transition;
+  ScopeHandoffCost scopeHandoff;
 
   bool isValid() const;
 };

@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Parse raw CAModel output into normalized per-unit instruction counts."""
+"""Parse raw CAModel output into normalized per-unit instruction counts.
+
+The output keeps the historical aggregate ``memory`` group (GM + shared/local)
+and also emits ``global_memory``, ``shared_local``, and ``private_stack``
+groups.  The latter are the resource families consumed by the TTIR source-fit
+workflow; private stack traffic is intentionally not folded into ``memory``.
+"""
 
 import argparse
 import csv
@@ -24,13 +30,28 @@ PRIMARY_SUFFIXES = (
 )
 
 OP_GROUPS = {
-    "memory": ("SIMT_LDG", "SIMT_STG", "SIMT_LDS", "SIMT_STS"),
+    # Keep the aggregate ``memory`` bucket for compatibility, but put the
+    # source-relevant families first.  The first-match path used for
+    # instr_exe.csv then preserves GM/shared/private attribution instead of
+    # swallowing LDS/STS/LDK/STK into one generic memory bucket.
+    "global_memory": ("SIMT_LDG", "SIMT_STG"),
+    "shared_local": ("SIMT_LDS", "SIMT_STS"),
+    # Private SIMT stack traffic is intentionally separate from ordinary
+    # memory.  LDK/STK are produced after register allocation and must not be
+    # folded into the TTIR tt.load/tt.store byte model.
+    "private_stack": ("SIMT_LDK", "SIMT_STK"),
     "shuffle": ("SIMT_SHFL", ),
     "predicate": ("SIMT_ISETP", "SIMT_ISETP_I", "SIMT_PLOP3"),
     "control": ("SIMT_BRANCH", "SIMT_END"),
     "float_alu": ("SIMT_FADD", "SIMT_FMUL", "SIMT_FMNMX", "SIMT_FMNMX_I"),
     "int_alu": ("SIMT_IADD", "SIMT_IADD_I", "SIMT_IADD_X", "SIMT_IADD_X_I", "SIMT_IMUL", "SIMT_SHFI", "SIMT_LOP3"),
     "move": ("SIMT_MOV", ),
+    "memory": ("SIMT_LDG", "SIMT_STG", "SIMT_LDS", "SIMT_STS"),
+}
+
+VECTOR_PIPE_OPS = {
+    "RVECLD": ("SIMT_LDG", "SIMT_LDS", "SIMT_LDK"),
+    "RVECST": ("SIMT_STG", "SIMT_STS", "SIMT_STK"),
 }
 
 
@@ -105,6 +126,8 @@ def _parse_instr_exe(root):
         "pipe_cycles": Counter(),
         "instr_cycles": Counter(),
         "instr_calls": Counter(),
+        "group_cycles": Counter(),
+        "group_calls": Counter(),
     }
     for path in sorted(Path(root).glob("**/*instr_exe*.csv")):
         with path.open(newline="", errors="ignore") as file:
@@ -120,18 +143,65 @@ def _parse_instr_exe(root):
             pipe_cycles[pipe] += cycles
             instr_cycles[instr] += cycles
             instr_calls[instr] += calls
+        group_cycles = Counter()
+        group_calls = Counter()
+        for instr, cycles in instr_cycles.items():
+            group = next(
+                (name for name, prefixes in OP_GROUPS.items()
+                 if any(instr == prefix or instr.startswith(prefix + "_")
+                        for prefix in prefixes)),
+                "other",
+            )
+            group_cycles[group] += cycles
+        for instr, calls in instr_calls.items():
+            group = next(
+                (name for name, prefixes in OP_GROUPS.items()
+                 if any(instr == prefix or instr.startswith(prefix + "_")
+                        for prefix in prefixes)),
+                "other",
+            )
+            group_calls[group] += calls
+        vector_pipe_cycles = {
+            pipe: sum(instr_cycles.get(op, 0.0) for op in ops)
+            for pipe, ops in VECTOR_PIPE_OPS.items()
+        }
+        vector_pipe_calls = {
+            pipe: sum(instr_calls.get(op, 0.0) for op in ops)
+            for pipe, ops in VECTOR_PIPE_OPS.items()
+        }
+        unit_match = re.search(r"(core\d+\.veccore\d+)", path.name)
         result["files"].append({
             "path": str(path),
+            "unit": unit_match.group(1) if unit_match else path.stem,
             "rows": len(rows),
             "pipe_cycles": dict(pipe_cycles.most_common()),
             "instr_cycles": dict(instr_cycles.most_common(50)),
+            "instr_calls": dict(instr_calls.most_common(80)),
+            "group_cycles": dict(group_cycles.most_common()),
+            "group_calls": dict(group_calls.most_common()),
+            "vector_pipe_cycles": vector_pipe_cycles,
+            "vector_pipe_calls": vector_pipe_calls,
         })
         _merge_counter(result["pipe_cycles"], pipe_cycles)
         _merge_counter(result["instr_cycles"], instr_cycles)
         _merge_counter(result["instr_calls"], instr_calls)
+        _merge_counter(result["group_cycles"], group_cycles)
+        _merge_counter(result["group_calls"], group_calls)
+    all_instr_cycles = result["instr_cycles"]
+    all_instr_calls = result["instr_calls"]
     result["pipe_cycles"] = dict(result["pipe_cycles"].most_common())
-    result["instr_cycles"] = dict(result["instr_cycles"].most_common(80))
-    result["instr_calls"] = dict(result["instr_calls"].most_common(80))
+    result["instr_cycles"] = dict(all_instr_cycles.most_common(80))
+    result["instr_calls"] = dict(all_instr_calls.most_common(80))
+    result["group_cycles"] = dict(result["group_cycles"].most_common())
+    result["group_calls"] = dict(result["group_calls"].most_common())
+    result["vector_pipe_cycles"] = {
+        pipe: sum(all_instr_cycles.get(op, 0.0) for op in ops)
+        for pipe, ops in VECTOR_PIPE_OPS.items()
+    }
+    result["vector_pipe_calls"] = {
+        pipe: sum(all_instr_calls.get(op, 0.0) for op in ops)
+        for pipe, ops in VECTOR_PIPE_OPS.items()
+    }
     return result
 
 
@@ -156,6 +226,7 @@ def _make_seed(op_counts, group_counts, span):
 def extract(root):
     root = Path(root)
     dump_dir = root / "dump" if (root / "dump").is_dir() else root
+    instr_exe = _parse_instr_exe(root)
     aggregate_counts = Counter()
     aggregate_first = {}
     aggregate_last = {}
@@ -173,8 +244,26 @@ def extract(root):
             aggregate_first.setdefault(op, timestamp)
             aggregate_examples.setdefault(op, examples.get(op, ""))
         for op, timestamp in last_ts.items():
-            per_unit[unit_key]["last_ts"][op] = max(per_unit[unit_key]["last_ts"].get(op, timestamp), timestamp)
+            per_unit[unit_key]["last_ts"][op] = max(
+                per_unit[unit_key]["last_ts"].get(op, timestamp), timestamp)
             aggregate_last[op] = max(aggregate_last.get(op, timestamp), timestamp)
+
+    # Some OPPROF captures preserve instr_exe CSVs but not the raw primary
+    # SIMT dump files.  Keep those captures usable: call_count is the dynamic
+    # instruction count, while cycles remain a separate observation.  This
+    # fallback is deliberately marked by a missing timestamp span so callers
+    # do not mistake it for a dump-derived timeline.
+    if not per_unit and instr_exe["files"]:
+        for file_record in instr_exe["files"]:
+            counts = Counter(file_record.get("instr_calls", {}))
+            unit = file_record["unit"]
+            per_unit[unit] = {
+                "counts": counts,
+                "first_ts": {},
+                "last_ts": {},
+                "files": [Path(file_record["path"]).name],
+            }
+            _merge_counter(aggregate_counts, counts)
 
     per_unit_output = {}
     for unit, data in sorted(per_unit.items()):
@@ -205,7 +294,7 @@ def extract(root):
             "seed": _make_seed(aggregate_counts, aggregate_groups, aggregate_span),
         },
         "per_unit": per_unit_output,
-        "instr_exe": _parse_instr_exe(root),
+        "instr_exe": instr_exe,
     }
 
 

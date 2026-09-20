@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <iterator>
 #include <optional>
 #include <set>
 #include <system_error>
@@ -53,6 +54,7 @@ struct StructuralProfile {
 
 struct CandidateProfile {
   HardwareProfile hardware;
+  std::vector<std::string> compatibleTargets;
   std::string scoreUnit;
   std::string contentSha256;
   std::string selectionContentSha256;
@@ -61,6 +63,41 @@ struct CandidateProfile {
   std::string microbenchmarkContentSha256;
   StructuralProfile structural;
 };
+
+static bool wildcardMatchInsensitive(llvm::StringRef pattern,
+                                     llvm::StringRef value) {
+  const std::string loweredPattern = pattern.lower();
+  const std::string loweredValue = value.lower();
+  size_t patternIndex = 0;
+  size_t valueIndex = 0;
+  size_t starIndex = std::string::npos;
+  size_t starValueIndex = 0;
+  while (valueIndex < loweredValue.size()) {
+    if (patternIndex < loweredPattern.size() &&
+        (loweredPattern[patternIndex] == '?' ||
+         loweredPattern[patternIndex] == loweredValue[valueIndex])) {
+      ++patternIndex;
+      ++valueIndex;
+      continue;
+    }
+    if (patternIndex < loweredPattern.size() &&
+        loweredPattern[patternIndex] == '*') {
+      starIndex = patternIndex++;
+      starValueIndex = valueIndex;
+      continue;
+    }
+    if (starIndex != std::string::npos) {
+      patternIndex = starIndex + 1;
+      valueIndex = ++starValueIndex;
+      continue;
+    }
+    return false;
+  }
+  while (patternIndex < loweredPattern.size() &&
+         loweredPattern[patternIndex] == '*')
+    ++patternIndex;
+  return patternIndex == loweredPattern.size();
+}
 
 /// Small fail-fast facade around llvm::json.  It permits a readable profile
 /// parser while retaining a single actionable error message.
@@ -152,6 +189,100 @@ static double resolveNumberOrMeasurement(
   return reader.number(object, numberKey, context);
 }
 
+static void readPositiveIntegerMeasurementCurve(
+    const llvm::json::Object &owner, llvm::StringRef curveKey,
+    llvm::StringRef expectedUnit, const MicrobenchmarkProfile *microbench,
+    ProfileJSONReader &reader, llvm::StringRef context,
+    std::map<int64_t, double> &curve) {
+  const auto *object = owner.getObject(curveKey);
+  if (!object)
+    return;
+  if (!microbench) {
+    reader.setError(context + "." + curveKey +
+                    " requires microbenchmark_profile");
+    return;
+  }
+  llvm::StringRef expectedCycleDomain = "none";
+  if (expectedUnit == "system_cycle" || expectedUnit.ends_with("/system_cycle"))
+    expectedCycleDomain = "SYS_CNT";
+  for (const auto &entry : *object) {
+    int64_t point = 0;
+    if (llvm::StringRef(entry.first).getAsInteger(10, point) || point <= 0) {
+      reader.setError(context + "." + curveKey +
+                      " keys must be positive integers");
+      return;
+    }
+    const auto measurement = entry.second.getAsString();
+    if (!measurement) {
+      reader.setError(context + "." + curveKey +
+                      " values must be measurement names");
+      return;
+    }
+    auto value = microbench->requireValue(*measurement, expectedUnit,
+                                          expectedCycleDomain);
+    if (!value) {
+      reader.setError(llvm::toString(value.takeError()));
+      return;
+    }
+    curve[point] = *value;
+  }
+}
+
+static void readFactorMeasurementCurves(
+    const llvm::json::Object &owner, llvm::StringRef curveKey,
+    llvm::StringRef expectedUnit, const MicrobenchmarkProfile *microbench,
+    ProfileJSONReader &reader, llvm::StringRef context,
+    std::map<int64_t, std::map<int64_t, double>> &curves) {
+  const auto *factors = owner.getObject(curveKey);
+  if (!factors)
+    return;
+  if (!microbench) {
+    reader.setError(context + "." + curveKey +
+                    " requires microbenchmark_profile");
+    return;
+  }
+  llvm::StringRef expectedCycleDomain = "none";
+  if (expectedUnit == "system_cycle" || expectedUnit.ends_with("/system_cycle"))
+    expectedCycleDomain = "SYS_CNT";
+  for (const auto &factorEntry : *factors) {
+    const llvm::StringRef factorKey(factorEntry.first);
+    int64_t factor = 0;
+    if (factorKey.getAsInteger(10, factor) || factor <= 0) {
+      reader.setError(context + "." + curveKey +
+                      " factor keys must be positive integers");
+      return;
+    }
+    const std::string factorContext =
+        (context + "." + curveKey + "." + factorKey).str();
+    const auto *points = factorEntry.second.getAsObject();
+    if (!points) {
+      reader.setError(factorContext + " must be an object");
+      return;
+    }
+    auto &curve = curves[factor];
+    for (const auto &pointEntry : *points) {
+      int64_t laneSteps = 0;
+      if (llvm::StringRef(pointEntry.first).getAsInteger(10, laneSteps) ||
+          laneSteps <= 0) {
+        reader.setError(factorContext + " keys must be positive integers");
+        return;
+      }
+      const auto measurement = pointEntry.second.getAsString();
+      if (!measurement) {
+        reader.setError(factorContext + " values must be measurement names");
+        return;
+      }
+      auto value = microbench->requireValue(*measurement, expectedUnit,
+                                            expectedCycleDomain);
+      if (!value) {
+        reader.setError(llvm::toString(value.takeError()));
+        return;
+      }
+      curve[laneSteps] = *value;
+    }
+  }
+}
+
 static StageOperationRate
 resolveOpProfile(const llvm::json::Object &ops, llvm::StringRef opName,
                  llvm::StringRef throughputKey, llvm::StringRef expectedUnit,
@@ -172,12 +303,18 @@ resolveOpProfile(const llvm::json::Object &ops, llvm::StringRef opName,
     StageOperationRate base = resolveOpProfile(
         ops, *relative, throughputKey, expectedUnit, microbench, reader);
     result.throughput = base.throughput;
-    result.factor = reader.optionalNumber(*op, "factor", 1.0);
+    result.throughputByWarpCount = std::move(base.throughputByWarpCount);
+    // A relative operation without a measured factor is not calibrated.  In
+    // particular, an explicit JSON null must not silently become unit cost.
+    result.factor = reader.number(*op, "factor", opName);
     return result;
   }
   result.throughput =
       resolveNumberOrMeasurement(*op, throughputKey, "throughput_measurement",
                                  expectedUnit, microbench, reader, opName);
+  readPositiveIntegerMeasurementCurve(*op, "throughput_measurements",
+                                      expectedUnit, microbench, reader, opName,
+                                      result.throughputByWarpCount);
   result.factor = reader.optionalNumber(*op, "factor", 1.0);
   return result;
 }
@@ -231,112 +368,161 @@ static std::string resolveProfileReference(llvm::StringRef ownerPath,
   return resolved.str().str();
 }
 
+static void
+readLayoutCostMap(ProfileJSONReader &reader,
+                  const llvm::json::Object &resources, llvm::StringRef key,
+                  llvm::StringRef context,
+                  std::map<std::string, StageMemoryLayoutCost> &out) {
+  const auto *object = resources.getObject(key);
+  if (!object)
+    return;
+  for (const auto &entry : *object) {
+    const auto *value = entry.second.getAsObject();
+    const llvm::StringRef entryKey = entry.first;
+    const std::string path = (context + "." + key + "." + entryKey).str();
+    if (!value) {
+      reader.setError(path + " must be an object");
+      return;
+    }
+    StageMemoryLayoutCost cost;
+    cost.firstCycles = reader.number(*value, "first_system_cycles", path);
+    cost.incrementalCycles =
+        reader.number(*value, "incremental_system_cycles", path);
+    cost.minCount = reader.integer(*value, "min_count", path);
+    cost.maxCount = reader.integer(*value, "max_count", path);
+    cost.evidence = reader.string(*value, "evidence", path);
+    if (!cost.isValid())
+      reader.setError(path + " requires finite nonnegative costs, a valid "
+                             "count domain and evidence");
+    out[entryKey.str()] = cost;
+  }
+}
+
 static void readStageResources(ProfileJSONReader &reader,
                                const llvm::json::Object &mode,
                                llvm::StringRef context,
+                               const MicrobenchmarkProfile *microbench,
                                StageModeProfile &profile) {
   const auto *resources = reader.object(mode, "stage_resources", context);
   if (!resources)
     return;
   const std::string prefix = (context + ".stage_resources").str();
-  profile.scalarOperationsPerCycle =
-      reader.number(*resources, "scalar_operations_per_system_cycle", prefix);
-  profile.issueOperationsPerCycle =
-      reader.number(*resources, "issue_instructions_per_system_cycle", prefix);
-  profile.spillTransactionsPerCycle =
-      reader.number(*resources, "spill_transactions_per_system_cycle", prefix);
+  profile.issueOperationsPerCycle = resolveNumberOrMeasurement(
+      *resources, "issue_instructions_per_system_cycle",
+      "issue_instructions_per_system_cycle_measurement",
+      "instruction/system_cycle", microbench, reader, prefix);
   if (const auto *scan = resources->getObject("prefix_scan"))
-    profile.prefixScanDependencyFactor =
-        reader.number(*scan, "dependency_factor", prefix + ".prefix_scan");
-  if (const auto *scalar = reader.object(*resources, "scalar_memory", prefix)) {
-    const std::string path = prefix + ".scalar_memory";
-    profile.mainScalarLoadPrepCycles =
-        reader.optionalNumber(*scalar, "main_load_prep_system_cycles",
-                              profile.mainScalarLoadPrepCycles);
-    profile.mainScalarLoadFillCycles =
-        reader.optionalNumber(*scalar, "main_load_fill_system_cycles",
-                              profile.mainScalarLoadFillCycles);
-    profile.mainScalarLoadIssueCycles =
-        reader.optionalNumber(*scalar, "main_load_issue_system_cycles",
-                              profile.mainScalarLoadIssueCycles);
-    profile.mainScalarLoadOutstandingLines =
-        reader.optionalNumber(*scalar, "main_load_outstanding_line_count",
-                              profile.mainScalarLoadOutstandingLines);
-    profile.mainScalarLoadExtraLineLowCycles =
-        reader.optionalNumber(*scalar, "main_load_extra_line_low_system_cycles",
-                              profile.mainScalarLoadExtraLineLowCycles);
-    profile.mainScalarLoadExtraLineHighCycles = reader.optionalNumber(
-        *scalar, "main_load_extra_line_high_system_cycles",
-        profile.mainScalarLoadExtraLineHighCycles);
-    profile.mainScalarLoadExtraLineHighThreshold =
-        reader.optionalNumber(*scalar, "main_load_extra_line_high_threshold",
-                              profile.mainScalarLoadExtraLineHighThreshold);
-    profile.simtUniformLoadPrepCycles =
-        reader.optionalNumber(*scalar, "uniform_load_prep_system_cycles",
-                              profile.simtUniformLoadPrepCycles);
-    profile.simtUniformLoadFillCycles =
-        reader.optionalNumber(*scalar, "uniform_load_fill_system_cycles",
-                              profile.simtUniformLoadFillCycles);
-    profile.simtUniformLoadDiffLineIssueCycles = reader.optionalNumber(
-        *scalar, "uniform_load_diff_line_issue_system_cycles",
-        profile.simtUniformLoadDiffLineIssueCycles);
-    profile.mte3StorePrepCycles = reader.optionalNumber(
-        *scalar, "mte3_store_prep_system_cycles", profile.mte3StorePrepCycles);
-    profile.mte3StoreFillCycles = reader.optionalNumber(
-        *scalar, "mte3_store_fill_system_cycles", profile.mte3StoreFillCycles);
-    profile.simtUniformStoreBaseCycles =
-        reader.optionalNumber(*scalar, "uniform_store_base_system_cycles",
-                              profile.simtUniformStoreBaseCycles);
+    profile.prefixScanStepLatencyCycles = resolveNumberOrMeasurement(
+        *scan, "step_latency_system_cycles", "step_latency_measurement",
+        "system_cycle", microbench, reader, prefix + ".prefix_scan");
+  if (const auto *recurrence =
+          resources->getObject("loop_carried_recurrence")) {
+    if (auto baseWarpCount = recurrence->getInteger("base_warp_count")) {
+      if (*baseWarpCount <= 0)
+        reader.setError(prefix +
+                        ".loop_carried_recurrence.base_warp_count must be "
+                        "positive");
+      else
+        profile.recurrenceGroupBaseWarpCount = *baseWarpCount;
+    }
+    readFactorMeasurementCurves(
+        *recurrence, "reduction_group_iteration_system_cycle_measurements",
+        "system_cycle", microbench, reader, prefix + ".loop_carried_recurrence",
+        profile.recurrenceReductionGroupCyclesByFactorAndLaneSteps);
+  }
+  if (const auto *continuous = resources->getObject("continuous_memory")) {
+    if (auto baseWarpCount = continuous->getInteger("base_warp_count")) {
+      if (*baseWarpCount <= 0)
+        reader.setError(prefix +
+                        ".continuous_memory.base_warp_count must be positive");
+      else
+        profile.continuousMemoryGroupBaseWarpCount = *baseWarpCount;
+    }
+    readFactorMeasurementCurves(
+        *continuous, "load_group_operation_system_cycle_measurements",
+        "system_cycle", microbench, reader, prefix + ".continuous_memory",
+        profile.continuousLoadGroupCyclesByFactorAndBytes);
+    readFactorMeasurementCurves(
+        *continuous, "store_group_operation_system_cycle_measurements",
+        "system_cycle", microbench, reader, prefix + ".continuous_memory",
+        profile.continuousStoreGroupCyclesByFactorAndBytes);
+    readFactorMeasurementCurves(
+        *continuous, "load_group_startup_system_cycle_measurements",
+        "system_cycle", microbench, reader, prefix + ".continuous_memory",
+        profile.continuousLoadGroupStartupCyclesByFactorAndBytes);
+    readFactorMeasurementCurves(
+        *continuous, "store_group_startup_system_cycle_measurements",
+        "system_cycle", microbench, reader, prefix + ".continuous_memory",
+        profile.continuousStoreGroupStartupCyclesByFactorAndBytes);
+  }
+  if (const auto *layout = resources->getObject("layout_memory")) {
+    readLayoutCostMap(reader, *layout, "load", prefix + ".layout_memory",
+                      profile.loadLayoutCosts);
+    readLayoutCostMap(reader, *layout, "store", prefix + ".layout_memory",
+                      profile.storeLayoutCosts);
+  }
+  if (const auto *service = resources->getObject("store_footprint_service")) {
+    const std::string path = prefix + ".store_footprint_service";
+    if (reader.string(*service, "evidence", path).empty())
+      reader.setError(path + ".evidence must identify the calibration data");
+    profile.storeFootprintUnitBytes =
+        reader.integer(*service, "unit_bytes", path);
+    profile.storeCyclesPerFootprintUnit =
+        reader.number(*service, "system_cycles_per_unit", path);
+    if (const auto *floors =
+            reader.object(*service, "issue_floor_by_warps", path))
+      for (const auto &entry : *floors) {
+        const llvm::StringRef key = entry.first;
+        int64_t warps = 0;
+        auto value = entry.second.getAsNumber();
+        if (key.getAsInteger(10, warps) || warps <= 0 || !value || *value <= 0)
+          reader.setError(path + " has an invalid warp-count floor");
+        else
+          profile.storeIssueFloorByWarpCount[warps] = *value;
+      }
   }
   if (const auto *indirect =
           reader.object(*resources, "indirect_memory", prefix)) {
     const std::string path = prefix + ".indirect_memory";
-    profile.indirectLoadTransactionsPerCycle =
-        reader.number(*indirect, "load_transactions_per_system_cycle", path);
-    profile.indirectStoreTransactionsPerCycle =
-        reader.number(*indirect, "store_transactions_per_system_cycle", path);
-    profile.indirectDependencyLatencyCycles =
-        reader.number(*indirect, "dependency_latency_system_cycles", path);
+    readPositiveIntegerMeasurementCurve(
+        *indirect, "load_system_cycle_measurements", "system_cycle", microbench,
+        reader, path, profile.indirectLoadSystemCyclesByWarpInstructions);
+    readPositiveIntegerMeasurementCurve(
+        *indirect, "load_startup_system_cycle_measurements", "system_cycle",
+        microbench, reader, path,
+        profile.indirectLoadStartupSystemCyclesByWarpInstructions);
   }
-  if (const auto *atomic = reader.object(*resources, "atomic_memory", prefix)) {
-    const std::string path = prefix + ".atomic_memory";
-    auto readRate = [&](const llvm::json::Object &object, llvm::StringRef key) {
-      const std::string ratePath = path + "." + key.str();
-      StageAtomicRate rate;
-      rate.logicalElementsPerCycle =
-          reader.number(object, "logical_elements_per_system_cycle", ratePath);
-      rate.operationStartupCycles =
-          reader.number(object, "operation_startup_system_cycles", ratePath);
-      rate.resultDependencyCycles =
-          reader.number(object, "result_dependency_system_cycles", ratePath);
-      rate.unknownContentionMultiplier =
-          reader.number(object, "unknown_contention_multiplier", ratePath);
-      profile.atomicRates[key] = rate;
-    };
-    if (const auto *fallback = reader.object(*atomic, "default", path))
-      readRate(*fallback, "default");
-    if (const auto *operations = reader.object(*atomic, "operations", path)) {
-      for (const auto &[key, value] : *operations) {
-        const auto *operation = value.getAsObject();
-        if (!operation) {
-          reader.setError(path + ".operations." + key.str() +
-                          " must be an object");
-          break;
-        }
-        readRate(*operation, key);
-      }
+}
+
+static void readSetupCycleCurve(ProfileJSONReader &reader,
+                                const llvm::json::Object &setup,
+                                const MicrobenchmarkProfile *microbench,
+                                StageModeProfile &profile) {
+  const auto *curve = setup.getObject("empty_launch_measurements");
+  if (!curve)
+    return;
+  if (!microbench) {
+    reader.setError("SIMT setup curve requires microbenchmark_profile");
+    return;
+  }
+  for (const auto &entry : *curve) {
+    int64_t warpCount = 0;
+    if (llvm::StringRef(entry.first).getAsInteger(10, warpCount) ||
+        warpCount <= 0) {
+      reader.setError("SIMT setup curve keys must be positive warp counts");
+      return;
     }
-  }
-  if (const auto *control = reader.object(*resources, "control_flow", prefix)) {
-    const std::string path = prefix + ".control_flow";
-    profile.controlFlow.loopBackedgeCycles =
-        reader.number(*control, "loop_backedge_system_cycles", path);
-    profile.controlFlow.conditionalBranchCycles =
-        reader.number(*control, "conditional_branch_system_cycles", path);
-    profile.controlFlow.divergentBranchPenaltyCycles =
-        reader.number(*control, "divergent_branch_penalty_system_cycles", path);
-    profile.controlFlow.synchronizationCycles =
-        reader.number(*control, "synchronization_system_cycles", path);
+    const auto measurement = entry.second.getAsString();
+    if (!measurement) {
+      reader.setError("SIMT setup curve values must be measurement names");
+      return;
+    }
+    auto cycles = microbench->requireValue(*measurement, "system_cycle");
+    if (!cycles) {
+      reader.setError(llvm::toString(cycles.takeError()));
+      return;
+    }
+    profile.setupCyclesByWarpCount[warpCount] = *cycles;
   }
 }
 
@@ -365,12 +551,10 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
     return llvm::createStringError(std::errc::invalid_argument,
                                    "SIMD/SIMT profile root must be an object");
   auto selectionSchemaVersion = root->getInteger("schema_version");
-  if (!selectionSchemaVersion ||
-      *selectionSchemaVersion != kSupportedProfileSchemaVersion)
+  if (!selectionSchemaVersion || *selectionSchemaVersion != 14)
     return llvm::createStringError(
         std::errc::invalid_argument,
-        "SIMD/SIMT profile schema_version must be %lld",
-        static_cast<long long>(kSupportedProfileSchemaVersion));
+        "SIMD/SIMT profile schema_version must be 14");
 
   CandidateProfile profile;
   ProfileJSONReader reader;
@@ -397,6 +581,21 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
   HardwareProfile &hardware = profile.hardware;
   hardware.profileVersion = reader.string(*root, "profile_version", "profile");
   hardware.target = reader.string(*root, "target", "profile");
+  if (const auto *targets = root->getArray("compatible_targets")) {
+    for (const llvm::json::Value &target : *targets) {
+      auto pattern = target.getAsString();
+      if (!pattern || pattern->empty()) {
+        reader.setError(
+            "profile.compatible_targets entries must be non-empty strings");
+        break;
+      }
+      profile.compatibleTargets.push_back(pattern->str());
+    }
+    if (profile.compatibleTargets.empty())
+      reader.setError("profile.compatible_targets must not be empty");
+  } else {
+    reader.setError("profile.compatible_targets must be an array");
+  }
   if (microbench && llvm::StringRef(hardware.target) != microbench->getTarget())
     reader.setError("selection profile target '" + hardware.target +
                     "' does not match shared microbenchmark target '" +
@@ -404,14 +603,9 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
   profile.scoreUnit = reader.string(*root, "score_unit", "profile");
   const auto *calibration =
       reader.object(*root, "selection_calibration", "profile");
-  if (calibration) {
-    if (const auto *structural =
-            reader.object(*calibration, "simd_structural_penalty_ratio",
-                          "profile.selection_calibration")) {
-      profile.structural.tinyDotFlopsMax =
-          reader.integer(*structural, "tiny_dot_flops_max", "structural");
-    }
-  }
+  if (calibration)
+    profile.structural.tinyDotFlopsMax = reader.integer(
+        *calibration, "tiny_dot_flops_max", "profile.selection_calibration");
 
   const auto *simd = reader.object(*root, "simd", "profile");
   if (simd) {
@@ -430,8 +624,9 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
     hardware.simd.issueWidth = hardware.simd.vectorWidth;
     if (const auto *startup =
             reader.object(*simd, "startup_system_cycles", "simd"))
-      hardware.simd.setupCycles =
-          reader.number(*startup, "vector", "simd.startup_system_cycles");
+      hardware.simd.setupCycles = resolveNumberOrMeasurement(
+          *startup, "vector", "vector_measurement", "system_cycle", microbench,
+          reader, "simd.startup_system_cycles");
     if (const auto *ops = reader.object(*simd, "ops", "simd")) {
       for (llvm::StringRef op :
            {"f32.add", "f32.sub", "f32.mul", "f32.div", "f32.max", "f32.abs",
@@ -442,18 +637,40 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
             "vector_instruction/system_cycle", microbench, reader);
     }
     if (const auto *memory = reader.object(*simd, "memory", "simd")) {
-      hardware.simd.loadBytesPerCycle = reader.number(
-          *memory, "vector_mte2_bytes_per_system_cycle", "simd.memory");
-      hardware.simd.storeBytesPerCycle =
-          reader.number(*memory, "mte3_bytes_per_system_cycle", "simd.memory");
+      hardware.simd.loadBytesPerCycle = resolveNumberOrMeasurement(
+          *memory, "vector_mte2_bytes_per_system_cycle",
+          "load_throughput_measurement", "byte/system_cycle", microbench,
+          reader, "simd.memory");
+      hardware.simd.storeBytesPerCycle = resolveNumberOrMeasurement(
+          *memory, "mte3_bytes_per_system_cycle",
+          "store_throughput_measurement", "byte/system_cycle", microbench,
+          reader, "simd.memory");
+      if (memory->getString("load_startup_measurement"))
+        hardware.simd.loadOperationSetupCycles = resolveNumberOrMeasurement(
+            *memory, "load_operation_startup_system_cycles",
+            "load_startup_measurement", "system_cycle", microbench, reader,
+            "simd.memory");
+      else
+        hardware.simd.loadOperationSetupCycles = reader.optionalNumber(
+            *memory, "load_operation_startup_system_cycles", 0.0);
+      if (memory->getString("store_startup_measurement"))
+        hardware.simd.storeOperationSetupCycles = resolveNumberOrMeasurement(
+            *memory, "store_operation_startup_system_cycles",
+            "store_startup_measurement", "system_cycle", microbench, reader,
+            "simd.memory");
+      else
+        hardware.simd.storeOperationSetupCycles = reader.optionalNumber(
+            *memory, "store_operation_startup_system_cycles", 0.0);
     }
     if (const auto *dot = reader.object(*simd, "dot", "simd")) {
-      hardware.simd.dotSetupCycles =
-          reader.number(*dot, "startup_system_cycles", "simd.dot");
-      hardware.simd.dotFlopsPerCycle =
-          reader.number(*dot, "flops_per_system_cycle", "simd.dot");
+      hardware.simd.dotSetupCycles = resolveNumberOrMeasurement(
+          *dot, "startup_system_cycles", "startup_measurement", "system_cycle",
+          microbench, reader, "simd.dot");
+      hardware.simd.dotFlopsPerCycle = resolveNumberOrMeasurement(
+          *dot, "flops_per_system_cycle", "throughput_measurement",
+          "flop/system_cycle", microbench, reader, "simd.dot");
     }
-    readStageResources(reader, *simd, "simd", hardware.simd);
+    readStageResources(reader, *simd, "simd", microbench, hardware.simd);
     const auto predicate = hardware.simd.operationRates.lookup("predicate.cmp");
     hardware.simd.predicateOperationsPerCycle =
         predicate.throughput / std::max(1.0, predicate.factor);
@@ -477,6 +694,7 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
       hardware.simt.setupCycles = resolveNumberOrMeasurement(
           *setup, "empty_launch", "empty_launch_measurement", "system_cycle",
           microbench, reader, "simt.setup_system_cycles");
+      readSetupCycleCurve(reader, *setup, microbench, hardware.simt);
     }
     if (const auto *ops = reader.object(*simt, "ops", "simt")) {
       for (llvm::StringRef op :
@@ -488,10 +706,12 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
                              "scalar_op/system_cycle", microbench, reader);
     }
     if (const auto *dot = reader.object(*simt, "dot", "simt")) {
-      hardware.simt.dotSetupCycles =
-          reader.number(*dot, "startup_system_cycles", "simt.dot");
-      hardware.simt.dotFlopsPerCycle =
-          reader.number(*dot, "flops_per_system_cycle", "simt.dot");
+      hardware.simt.dotSetupCycles = resolveNumberOrMeasurement(
+          *dot, "startup_system_cycles", "startup_measurement", "system_cycle",
+          microbench, reader, "simt.dot");
+      hardware.simt.dotFlopsPerCycle = resolveNumberOrMeasurement(
+          *dot, "flops_per_system_cycle", "throughput_measurement",
+          "flop/system_cycle", microbench, reader, "simt.dot");
     }
     const auto predicate = hardware.simt.operationRates.lookup("predicate.cmp");
     hardware.simt.predicateOperationsPerCycle =
@@ -503,6 +723,13 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
               *shuffle, "warp_instructions_per_system_cycle",
               "throughput_measurement", "warp_instruction/system_cycle",
               microbench, reader, "simt.shuffle");
+      std::map<int64_t, double> warpInstructionCurve;
+      readPositiveIntegerMeasurementCurve(
+          *shuffle, "throughput_measurements", "warp_instruction/system_cycle",
+          microbench, reader, "simt.shuffle", warpInstructionCurve);
+      for (const auto &[warpCount, rate] : warpInstructionCurve)
+        hardware.simt.shuffleLanesPerCycleByWarpCount[warpCount] =
+            hardware.simt.issueWidth * rate;
     }
     if (const auto *memory = reader.object(*simt, "memory", "simt")) {
       hardware.simt.loadWarpInstructionsPerCycle = resolveNumberOrMeasurement(
@@ -513,45 +740,32 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
           *memory, "store_warp_instructions_per_system_cycle",
           "store_throughput_measurement", "warp_instruction/system_cycle",
           microbench, reader, "simt.memory");
+      readPositiveIntegerMeasurementCurve(
+          *memory, "load_throughput_measurements",
+          "warp_instruction/system_cycle", microbench, reader, "simt.memory",
+          hardware.simt.loadWarpInstructionsPerCycleByWarpCount);
+      readPositiveIntegerMeasurementCurve(
+          *memory, "store_throughput_measurements",
+          "warp_instruction/system_cycle", microbench, reader, "simt.memory",
+          hardware.simt.storeWarpInstructionsPerCycleByWarpCount);
     }
-    readStageResources(reader, *simt, "simt", hardware.simt);
+    readStageResources(reader, *simt, "simt", microbench, hardware.simt);
     if (const auto *resources = simt->getObject("stage_resources")) {
-      if (const auto *superblock = resources->getObject("superblock")) {
-        hardware.superblockUsefulFactorLimit =
-            reader.integer(*superblock, "useful_factor_limit", "superblock");
-        hardware.superblockPersistentStatePressureFreeFactor = reader.integer(
-            *superblock, "persistent_state_pressure_free_factor", "superblock");
-        hardware.superblockPersistentStateBytesPerCycle = reader.number(
-            *superblock, "persistent_state_bytes_per_system_cycle",
-            "superblock");
-      }
       if (const auto *handoff = resources->getObject("scope_handoff")) {
-        hardware.transition.fixedPairCycles = resolveNumberOrMeasurement(
-            *handoff, "fixed_pair_system_cycles", "fixed_pair_measurement",
-            "system_cycle", microbench, reader, "scope_handoff");
-        hardware.transition.simdUbLoadBytesPerCycle = reader.number(
-            *handoff, "simd_ub_load_bytes_per_system_cycle", "scope_handoff");
-        hardware.transition.simdUbStoreBytesPerCycle = reader.number(
-            *handoff, "simd_ub_store_bytes_per_system_cycle", "scope_handoff");
-        hardware.transition.simtUbLoadBytesPerThreadPerCycle = reader.number(
-            *handoff, "simt_ub_load_bytes_per_thread_per_system_cycle",
-            "scope_handoff");
-        hardware.transition.simtUbStoreBytesPerThreadPerCycle = reader.number(
-            *handoff, "simt_ub_store_bytes_per_thread_per_system_cycle",
-            "scope_handoff");
+        hardware.scopeHandoff.fixedScopeCycles = reader.number(
+            *handoff, "fixed_scope_system_cycles", "scope_handoff");
+        hardware.scopeHandoff.inputHandoffBytesPerCycle = reader.number(
+            *handoff, "input_handoff_bytes_per_system_cycle", "scope_handoff");
+        hardware.scopeHandoff.outputHandoffBytesPerCycle = reader.number(
+            *handoff, "output_handoff_bytes_per_system_cycle", "scope_handoff");
       }
     }
-    hardware.transition.simtWarpSize = hardware.simt.issueWidth;
   }
 
   if (reader.failed())
     return llvm::createStringError(
         std::errc::invalid_argument, "invalid SIMD/SIMT profile '%s': %s",
         path.c_str(), reader.getError().str().c_str());
-  if (hardware.profileVersion.empty())
-    return llvm::createStringError(
-        std::errc::invalid_argument,
-        "SIMD/SIMT profile_version must be non-empty");
   if (!microbench)
     return llvm::createStringError(std::errc::invalid_argument,
                                    "SIMD/SIMT profile must reference "
@@ -589,11 +803,10 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
 static llvm::Expected<StageCostModelSummary> evaluateStageModel(
     const SimdSimtFeatureSummary &features, const CandidateProfile &profile,
     unsigned numWarps, bool wholeKernelSuperblockMaterializable,
-    bool scopeSuperblockMaterializable,
-    int64_t maximumWholeKernelSuperblockFactor,
-    int64_t maximumScopeSuperblockFactor, int64_t logicalProgramCountHint,
-    int64_t physicalCoreCountHint, ModuleOp module,
-    const SimtAnchorPlan *anchorPlan) {
+    bool scopeSuperblockMaterializable, int64_t logicalProgramCountHint,
+    int64_t physicalCoreCountHint, int64_t physicalAiCoreCountHint,
+    ModuleOp module, const SimtAnchorPlan *anchorPlan,
+    const SimdSimtCostModelOptions &options) {
   StagePartitionerOptions partitionerOptions;
   partitionerOptions.tinyDotFlopsMax = profile.structural.tinyDotFlopsMax;
   const int64_t warpLimitedFactorUpperBound =
@@ -623,15 +836,28 @@ static llvm::Expected<StageCostModelSummary> evaluateStageModel(
   if (!partition)
     return partition.takeError();
 
+  for (LogicalStage &stage : partition->stages) {
+    llvm::erase_if(stage.legalSimtFactors, [&](int64_t factor) {
+      return !llvm::is_contained(options.wholeKernelSuperblockFactors, factor);
+    });
+    llvm::erase_if(stage.localSimtFactors, [&](int64_t factor) {
+      return !llvm::is_contained(options.scopeSuperblockFactors, factor);
+    });
+    stage.simtLegal &=
+        !stage.legalSimtFactors.empty() ||
+        (stage.localSimtMaterializable && !stage.localSimtFactors.empty());
+  }
+
   HardwareProfile hardwareProfile = profile.hardware;
-  hardwareProfile.logicalWarpGroupCount = std::max<int64_t>(1, numWarps);
+  hardwareProfile.baseSimtWarpCount = std::max<int64_t>(1, numWarps);
   StageCostEvaluator evaluator;
   auto costTable = evaluator.evaluate(*partition, hardwareProfile);
   if (!costTable)
     return costTable.takeError();
   costTable->logicalProgramCountHint = logicalProgramCountHint;
   costTable->physicalCoreCountHint = physicalCoreCountHint;
-  auto routes = solveStageRoutes(*costTable, hardwareProfile.transition);
+  costTable->physicalAiCoreCountHint = physicalAiCoreCountHint;
+  auto routes = solveStageRoutes(*costTable, hardwareProfile.scopeHandoff);
   if (!routes)
     return routes.takeError();
   return std::move(*routes);
@@ -825,6 +1051,15 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
   if (!profileOrError)
     return profileOrError.takeError();
   CandidateProfile profile = std::move(*profileOrError);
+  if (!options.actualTarget.empty() &&
+      llvm::none_of(profile.compatibleTargets, [&](llvm::StringRef pattern) {
+        return wildcardMatchInsensitive(pattern, options.actualTarget);
+      }))
+    return llvm::createStringError(std::errc::invalid_argument,
+                                   "SIMD/SIMT profile target '%s' is not "
+                                   "compatible with actual target '%s'",
+                                   profile.hardware.target.c_str(),
+                                   options.actualTarget.c_str());
 
   SimdSimtCostReport report;
   report.profileVersion = profile.hardware.profileVersion;
@@ -854,10 +1089,9 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
   auto stageModel = evaluateStageModel(
       features, profile, static_cast<unsigned>(numWarps),
       options.wholeKernelSuperblockMaterializable,
-      options.scopeSuperblockMaterializable,
-      options.maximumWholeKernelSuperblockFactor,
-      options.maximumScopeSuperblockFactor, options.logicalProgramCountHint,
-      options.physicalVectorCoreCountHint, module, anchorPlan);
+      options.scopeSuperblockMaterializable, options.logicalProgramCountHint,
+      options.physicalVectorCoreCountHint, options.physicalAiCoreCountHint,
+      module, anchorPlan, options);
   if (!stageModel)
     return stageModel.takeError();
   report.stageModel = std::move(*stageModel);

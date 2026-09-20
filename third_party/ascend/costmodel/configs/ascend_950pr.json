@@ -1,0 +1,442 @@
+{
+  "$schema": "./hardware_schema.json",
+  "name": "Ascend 950PR",
+  "vendor": "Huawei",
+  "version": "1.0",
+  "description": "Hardware topology, theoretical limits, and absolute-cost-model priors for Ascend950PR/dav-c310. Values are not all board measurements; consult field_metadata and calibration.description.",
+  "target": "Ascend950PR/dav-c310",
+  "hardware_identity": {
+    "product_model": "Ascend950PR_9579",
+    "npu_arch_id": 3510,
+    "compiler_arch": "dav-c310",
+    "description": "Product model is reported by torch/installed platform config; npu_arch_id=3510 is the ACL architecture number rather than the model name; dav-c310 is the compiler code-generation architecture."
+  },
+  "microbenchmark_profile": "../profiles/microbench/ascend_950pr_v1.json",
+  "clock": {
+    "description": "Installed CANN platform_config/Ascend950PR_9579.ini, retrieved from the matching physical machine on 2026-09-12. Binary capacity units; declared platform values, not measured throughput. Configured compute frequency only; SYS_CNT frequency and live frequency require separate measurement.",
+    "frequency_ghz": 1.65,
+    "cycles_per_us": 1650,
+    "field_metadata": {
+      "frequency_ghz": {
+        "description": "Installed CANN platform_config/Ascend950PR_9579.ini, retrieved from the matching physical machine on 2026-09-12. Binary capacity units; declared platform values, not measured throughput. Configured compute frequency only; SYS_CNT frequency and live frequency require separate measurement.",
+        "source": "Installed CANN platform_config/Ascend950PR_9579.ini, retrieved from the matching physical machine on 2026-09-12. Binary capacity units; declared platform values, not measured throughput.",
+        "confidence": "medium"
+      },
+      "cycles_per_us": {
+        "description": "Installed CANN platform_config/Ascend950PR_9579.ini, retrieved from the matching physical machine on 2026-09-12. Binary capacity units; declared platform values, not measured throughput. Configured compute frequency only; SYS_CNT frequency and live frequency require separate measurement.",
+        "source": "Installed CANN platform_config/Ascend950PR_9579.ini, retrieved from the matching physical machine on 2026-09-12. Binary capacity units; declared platform values, not measured throughput.",
+        "confidence": "medium"
+      }
+    }
+  },
+  "memory_spaces": {
+    "hbm": {
+      "type": "off_chip",
+      "size_gb": 128,
+      "runtime_reported_size_bytes": 132238016512,
+      "bandwidth_tbps": 1.6,
+      "latency_cycles": 200,
+      "description": "The platform declares 128 GiB nominal HBM. ACL/torch reports 132238016512 bytes after device/runtime reservations. Bandwidth and latency are separate, unverified model inputs.",
+      "field_metadata": {
+        "size_gb": {
+          "description": "Nominal capacity in GiB; not runtime free/allocatable memory.",
+          "source": "Installed CANN platform_config/Ascend950PR_9579.ini, retrieved from the matching physical machine on 2026-09-12. Binary capacity units; declared platform values, not measured throughput.",
+          "confidence": "high"
+        },
+        "bandwidth_tbps": {
+          "description": "Whole-device theoretical bandwidth seed in 10^12 byte/s; it is not the measured single-AIV GM bandwidth.",
+          "source": "Inherited Ascend 910B baseline from cost-model PR #237",
+          "confidence": "low"
+        },
+        "latency_cycles": {
+          "description": "Fixed HBM access-latency prior in device-compute cycles, used by latency-inclusive fallback estimates.",
+          "source": "Inherited model prior; no isolated Ascend950PR latency measurement is recorded",
+          "confidence": "low"
+        }
+      }
+    },
+    "l2": {
+      "type": "on_chip_shared",
+      "size_mb": 128,
+      "bandwidth_gbps": 3200,
+      "latency_cycles": 50,
+      "description": "L2 capacity verified against installed Ascend950PR_9579.ini (2026-09-12). Capacity fields use binary units. Bandwidth and latency are separate, unverified model inputs.",
+      "field_metadata": {
+        "size_mb": {
+          "description": "Model-specific platform capacity; not measured transfer speed.",
+          "source": "Installed CANN Ascend950PR_9579.ini, 2026-09-12",
+          "confidence": "high"
+        },
+        "bandwidth_gbps": {
+          "description": "Legacy bandwidth/latency input. Scope and isolated 950PR measurement still require validation; not derived from the capacity specification.",
+          "source": "Inherited absolute-model parameter; no new acceptance in this correction",
+          "confidence": "low"
+        },
+        "latency_cycles": {
+          "description": "Legacy bandwidth/latency input. Scope and isolated 950PR measurement still require validation; not derived from the capacity specification.",
+          "source": "Inherited absolute-model parameter; no new acceptance in this correction",
+          "confidence": "low"
+        }
+      }
+    },
+    "l1": {
+      "type": "on_chip_local",
+      "size_kb": 512,
+      "bandwidth_gbps": 6400,
+      "latency_cycles": 10,
+      "description": "L1 capacity verified against installed Ascend950PR_9579.ini (2026-09-12). Capacity fields use binary units. Bandwidth and latency are separate, unverified model inputs.",
+      "field_metadata": {
+        "size_kb": {
+          "description": "Model-specific platform capacity; not measured transfer speed.",
+          "source": "Installed CANN Ascend950PR_9579.ini, 2026-09-12",
+          "confidence": "high"
+        },
+        "bandwidth_gbps": {
+          "description": "Legacy bandwidth/latency input. Scope and isolated 950PR measurement still require validation; not derived from the capacity specification.",
+          "source": "Inherited absolute-model parameter; no new acceptance in this correction",
+          "confidence": "low"
+        },
+        "latency_cycles": {
+          "description": "Legacy bandwidth/latency input. Scope and isolated 950PR measurement still require validation; not derived from the capacity specification.",
+          "source": "Inherited absolute-model parameter; no new acceptance in this correction",
+          "confidence": "low"
+        }
+      }
+    },
+    "l0a": {
+      "type": "register_file",
+      "size_kb": 64,
+      "description": "L0A capacity verified against installed Ascend950PR_9579.ini (2026-09-12). Capacity fields use binary units. Bandwidth and latency are separate, unverified model inputs.",
+      "field_metadata": {
+        "size_kb": {
+          "description": "Model-specific platform capacity; not measured transfer speed.",
+          "source": "Installed CANN Ascend950PR_9579.ini, 2026-09-12",
+          "confidence": "high"
+        }
+      }
+    },
+    "l0b": {
+      "type": "register_file",
+      "size_kb": 64,
+      "description": "L0B capacity verified against installed Ascend950PR_9579.ini (2026-09-12). Capacity fields use binary units. Bandwidth and latency are separate, unverified model inputs.",
+      "field_metadata": {
+        "size_kb": {
+          "description": "Model-specific platform capacity; not measured transfer speed.",
+          "source": "Installed CANN Ascend950PR_9579.ini, 2026-09-12",
+          "confidence": "high"
+        }
+      }
+    },
+    "l0c": {
+      "type": "register_file",
+      "size_kb": 256,
+      "description": "L0C capacity verified against installed Ascend950PR_9579.ini (2026-09-12). Capacity fields use binary units. Bandwidth and latency are separate, unverified model inputs.",
+      "field_metadata": {
+        "size_kb": {
+          "description": "Model-specific platform capacity; not measured transfer speed.",
+          "source": "Installed CANN Ascend950PR_9579.ini, 2026-09-12",
+          "confidence": "high"
+        }
+      }
+    },
+    "ub": {
+      "type": "on_chip_local",
+      "size_kb": 248,
+      "physical_size_kb": 256,
+      "compiler_reserved_size_kb": 8,
+      "compiler_usable_size_kb": 248,
+      "runtime_reported_size_bytes": 221184,
+      "bandwidth_gbps": 3200,
+      "latency_cycles": 5,
+      "description": "Physical UB is 256 KiB. AscendNPU-IR reserves 8 KiB for the compiler, so the platform/compiler allocation limit and the loader-facing size_kb are 248 KiB. ACL_DEV_ATTR_UBUF_PER_VECTOR_CORE separately reports 221184 bytes (216 KiB); that runtime-query value is recorded but is not substituted for the compiler allocation limit.",
+      "field_metadata": {
+        "size_kb": {
+          "description": "Compiler-usable capacity: physical 256 KiB minus the explicit 8 KiB compiler reservation.",
+          "source": "Installed CANN Ascend950PR_9579.ini ub_size=253952 and AscendNPU-IR Ascend950_BaseSpec UbSize=248KiB",
+          "confidence": "high"
+        },
+        "bandwidth_gbps": {
+          "description": "Legacy bandwidth/latency input. Scope and isolated 950PR measurement still require validation; not derived from the capacity specification.",
+          "source": "Inherited absolute-model parameter; no new acceptance in this correction",
+          "confidence": "low"
+        },
+        "latency_cycles": {
+          "description": "Legacy bandwidth/latency input. Scope and isolated 950PR measurement still require validation; not derived from the capacity specification.",
+          "source": "Inherited absolute-model parameter; no new acceptance in this correction",
+          "confidence": "low"
+        }
+      }
+    }
+  },
+  "compute_units": {
+    "cube": {
+      "type": "matrix_engine",
+      "description": "Cube matrix engine topology, theoretical arithmetic rates, supported fractal shapes, and memory-space contract.",
+      "tflops_fp16": 448,
+      "tflops_fp32": 224,
+      "tflops_int8": 896,
+      "fractal_sizes": {
+        "fp16": {
+          "m": 16,
+          "k": 16,
+          "n": 16
+        },
+        "bf16": {
+          "m": 16,
+          "k": 16,
+          "n": 16
+        },
+        "fp32": {
+          "m": 16,
+          "k": 8,
+          "n": 16
+        },
+        "int8": {
+          "m": 16,
+          "k": 32,
+          "n": 16
+        }
+      },
+      "tile_m": 16,
+      "tile_n": 16,
+      "tile_k": 16,
+      "input_spaces": [
+        "l0a",
+        "l0b"
+      ],
+      "output_space": "l0c",
+      "supported_dtypes": [
+        "fp16",
+        "bf16",
+        "fp32",
+        "int8"
+      ]
+    },
+    "vector": {
+      "type": "simd_engine",
+      "description": "One AIV has a 256-byte vector register (64 FP32 elements per instruction). width_elements is a legacy steady-state elements-per-compute-cycle estimate, not a register lane count.",
+      "width_elements": 128,
+      "width_bytes": 256,
+      "tflops_fp32": 14,
+      "tflops_fp16": 28,
+      "compute_space": "ub",
+      "supported_ops": [
+        "add",
+        "sub",
+        "mul",
+        "div",
+        "max",
+        "min",
+        "exp",
+        "log",
+        "sqrt",
+        "rsqrt",
+        "tanh",
+        "sigmoid",
+        "relu",
+        "reduce_sum",
+        "reduce_max",
+        "reduce_min",
+        "cast",
+        "broadcast"
+      ],
+      "supported_dtypes": [
+        "fp32",
+        "fp16",
+        "bf16",
+        "int32",
+        "int8"
+      ],
+      "field_metadata": {
+        "width_bytes": {
+          "description": "Vector register bytes.",
+          "source": "Ascend950PR_9579.ini vector_reg_width=256",
+          "confidence": "high"
+        },
+        "width_elements": {
+          "description": "128 FP32 adds per configured compute cycle is consistent with 3.30 vector-add/SYS_CNT-tick * 64 / 1.65. This is saturated ADD throughput, not a dtype-independent instruction width or a latency.",
+          "source": "PR tput sweep 2026-09-12; isolated SYS_CNT approximately 1000 MHz; configured compute 1650 MHz",
+          "confidence": "medium"
+        },
+        "tflops_fp32": {
+          "description": "Legacy generic peak; cannot be validated by ADD-only throughput or applied as per-core without a scope.",
+          "source": "Inherited absolute-model input; pending operation/scope validation",
+          "confidence": "low"
+        },
+        "tflops_fp16": {
+          "description": "Legacy generic peak; pending FP16-specific measurement and scope validation.",
+          "source": "Inherited absolute-model input",
+          "confidence": "low"
+        }
+      }
+    }
+  },
+  "data_movers": {
+    "cube_mte2": {
+      "description": "Cube input: HBM to L1",
+      "src_space": "hbm",
+      "dst_space": "l1",
+      "bandwidth_gbps": 200,
+      "max_burst_bytes": 65536,
+      "alignment_bytes": 32
+    },
+    "mte1": {
+      "description": "Cube input: L1 to L0A/L0B",
+      "src_space": "l1",
+      "dst_spaces": [
+        "l0a",
+        "l0b"
+      ],
+      "bandwidth_gbps": 400,
+      "max_burst_bytes": 32768,
+      "alignment_bytes": 32
+    },
+    "fixpipe": {
+      "description": "Cube output: L0C to HBM",
+      "src_space": "l0c",
+      "dst_space": "hbm",
+      "bandwidth_gbps": 200,
+      "max_burst_bytes": 65536,
+      "alignment_bytes": 32,
+      "supports_accumulate": true,
+      "supports_cast": true
+    },
+    "vector_mte2": {
+      "description": "Vector input: HBM to UB",
+      "src_space": "hbm",
+      "dst_space": "ub",
+      "bandwidth_gbps": 75,
+      "max_burst_bytes": 65536,
+      "alignment_bytes": 32
+    },
+    "mte3": {
+      "description": "Vector output: UB to HBM",
+      "src_space": "ub",
+      "dst_space": "hbm",
+      "bandwidth_gbps": 71,
+      "max_burst_bytes": 65536,
+      "alignment_bytes": 32
+    }
+  },
+  "pipeline": {
+    "cube_path": {
+      "stages": [
+        "cube_mte2",
+        "mte1",
+        "cube",
+        "fixpipe"
+      ],
+      "description": "Matrix multiplication data flow",
+      "fully_pipelined": true
+    },
+    "vector_path": {
+      "stages": [
+        "vector_mte2",
+        "vector",
+        "mte3"
+      ],
+      "description": "Vector computation data flow",
+      "fully_pipelined": true
+    },
+    "hardware_units": {
+      "cube_mte2": {
+        "path": "cube",
+        "can_overlap": true
+      },
+      "mte1": {
+        "path": "cube",
+        "can_overlap": true
+      },
+      "cube": {
+        "path": "cube",
+        "can_overlap": true
+      },
+      "fixpipe": {
+        "path": "cube",
+        "can_overlap": true
+      },
+      "vector_mte2": {
+        "path": "vector",
+        "can_overlap": true
+      },
+      "vector": {
+        "path": "vector",
+        "can_overlap": true
+      },
+      "mte3": {
+        "path": "vector",
+        "can_overlap": true
+      }
+    },
+    "parallelism": {
+      "inter_path": {
+        "cube_path_and_vector_path": true,
+        "description": "Cube and Vector paths execute in parallel"
+      },
+      "intra_path": {
+        "cube_mte2_mte1_cube_fixpipe": true,
+        "vector_mte2_vector_mte3": true,
+        "description": "All units within each path can execute in parallel (pipelined)"
+      }
+    }
+  },
+  "performance_model": {
+    "description": "Documentary analytical formulas from the original model. The current HardwareConfig loader does not parse this block.",
+    "cube_cycles_per_tile": {
+      "description": "Nominal Cube tile-count formula; not currently consumed by HardwareConfig::loadFromJSON.",
+      "formula": "ceil(M/16) * ceil(N/16) * ceil(K/16)",
+      "base_cycles": 1
+    },
+    "vector_cycles_per_op": {
+      "description": "Nominal SIMD instruction-count formula; not currently consumed by HardwareConfig::loadFromJSON.",
+      "formula": "ceil(elements / 128)",
+      "base_cycles": 1
+    },
+    "memory_cycles": {
+      "description": "Nominal bandwidth-plus-latency formula; not currently consumed from this block.",
+      "formula": "bytes / bandwidth_per_cycle",
+      "include_latency": true
+    }
+  },
+  "calibration": {
+    "description": "Partial 950PR correction, 2026-09-12: capacities and topology verified against Ascend950PR_9579; 1650 MHz is configured compute frequency. Legacy startup, scalar, barrier and bandwidth priors are not newly calibrated. Several documentary fields are not consumed by the loader; consult each description.",
+    "startup_latencies": {
+      "description": "Absolute-model startup priors. The current JSON loader does not read this object; corresponding getters still use C++ defaults.",
+      "vector_startup_cycles": 35,
+      "mte2_startup_cycles": 50,
+      "mte3_startup_cycles": 40,
+      "cube_startup_cycles": 20,
+      "fixpipe_startup_cycles": 30
+    },
+    "vector_op_cycles_per_vec_instruction": {
+      "description": "Legacy per-vector-instruction cycle priors. This is the only calibration sub-object currently consumed by HardwareConfig::loadFromJSON.",
+      "exp": 4,
+      "log": 3,
+      "tanh": 3,
+      "sigmoid": 3,
+      "sqrt": 2,
+      "rsqrt": 2,
+      "div": 3,
+      "simple_ops_add_sub_mul_etc": 1
+    },
+    "scalar_overhead": {
+      "description": "Observed scalar/compute ratios retained as calibration evidence; the current JSON loader does not consume these fields.",
+      "aiv_scalar_to_vec_ratio_steady_state": 1.27,
+      "aic_scalar_to_mac_ratio_steady_state": 8.4,
+      "aiv_vec_ratio_observed": 0.211,
+      "aiv_scalar_overhead_factor": 3.74
+    },
+    "parallelism": {
+      "num_aic_cores": 28,
+      "num_aiv_cores": 56,
+      "description": "Installed CANN platform_config/Ascend950PR_9579.ini, retrieved from the matching physical machine on 2026-09-12. Binary capacity units; declared platform values, not measured throughput."
+    },
+    "pipe_barrier": {
+      "description": "Legacy barrier-overhead prior; the current JSON loader does not consume this object.",
+      "cycles_per_inner_iteration": 7500
+    },
+    "wave_overhead": {
+      "description": "Legacy 910B documentary prior; no measured 950PR validation and not loaded from this object."
+    }
+  }
+}

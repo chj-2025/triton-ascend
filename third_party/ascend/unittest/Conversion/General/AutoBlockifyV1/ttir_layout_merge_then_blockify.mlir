@@ -1,5 +1,5 @@
 // RUN: triton-opt %s --ttir-layout-merge \
-// RUN:   --ta-simt-auto-blockify-v1="physical-vector-core-count=64 superblock-factor=1" \
+// RUN:   --ta-auto-blockify-v1="physical-vector-core-count=64 superblock-factor=1" \
 // RUN:   | FileCheck %s
 
 // The route model consumes this post-transform TTIR shape: layout coalescing
@@ -14,12 +14,13 @@
 // CHECK-SAME: ta.ttir_layout_merge.applied
 // CHECK-LABEL: tt.func public @layout_then_blockify
 // CHECK-SAME: attributes {ta.auto_blockify_v1, ta.auto_blockify_v1.superblock_factor = 1 : i32}
-// CHECK: tt.get_program_id x {{.*}} : i32
+// CHECK: gpu.linear_block_id
 // CHECK: scf.for
 // CHECK-NOT: tt.get_program_id
 // CHECK: tt.load {{.*}} : tensor<16x16x!tt.ptr<f32>>
 // CHECK: tt.store
-// CHECK: } {ta.auto_blockify_v1.loop, ta.auto_blockify_v1.schedule}
+// CHECK: } {ta.auto_blockify_v1.loop, ta.auto_blockify_v1.schedule
+// CHECK-SAME: ta.auto_blockify_v1.superblock_factor = 1 : i32}
 // CHECK-NOT: linalg.
 
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {

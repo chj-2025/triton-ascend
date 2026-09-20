@@ -1,4 +1,4 @@
-//===- SIMTAutoBlockifyV1.cpp ----------------------------------*- C++ -*-===//
+//===- AutoBlockifyV1.cpp --------------------------------------*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Triton-Adapter port of the NPUIR SIMT AutoBlockify V1 transform.
+// Triton-Adapter port of the NPUIR AutoBlockify V1 transform.
 //
 // V1 preserves the tile tensor shapes of one logical Triton program.  It caps
 // the physical launch to one vector-core wave and executes the original
@@ -15,6 +15,7 @@
 //   chunk = ceildiv(logicalGridSize, physicalVectorCoreCount)
 //   for linear in [hwBlockId * chunk,
 //                  min((hwBlockId + 1) * chunk, logicalGridSize)):
+//     linear += (warp_id % factor)  // when factor > 1, with step=factor
 //     (pidX, pidY, pidZ) = unflatten(linear, gridX, gridY)
 //
 // AutoBlockify V2 lives in ascend/lib/AutoBlockify.  It changes tensor tile
@@ -26,17 +27,16 @@
 #include "ascend/include/Utils/SuperBlockFactor.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/MathExtras.h"
 
-#define DEBUG_TYPE "ta-simt-auto-blockify-v1"
+#define DEBUG_TYPE "ta-auto-blockify-v1"
 
 namespace mlir::triton {
-#define GEN_PASS_DEF_TASIMTAUTOBLOCKIFYV1
-#define GEN_PASS_DEF_TAREFINESIMTAUTOBLOCKIFYV1SUPERBLOCK
+#define GEN_PASS_DEF_TAAUTOBLOCKIFYV1
+#define GEN_PASS_DEF_TAREFINEAUTOBLOCKIFYV1SUPERBLOCK
 #include "ascend/include/AutoBlockifyV1/Passes.h.inc"
 } // namespace mlir::triton
 
@@ -85,13 +85,13 @@ static LogicalProgramIds buildLogicalProgramIds(OpBuilder &builder,
   };
 }
 
-class TASIMTAutoBlockifyV1Pass
-    : public impl::TASIMTAutoBlockifyV1Base<TASIMTAutoBlockifyV1Pass> {
+class TAAutoBlockifyV1Pass
+    : public impl::TAAutoBlockifyV1Base<TAAutoBlockifyV1Pass> {
 public:
-  using Base = impl::TASIMTAutoBlockifyV1Base<TASIMTAutoBlockifyV1Pass>;
+  using Base = impl::TAAutoBlockifyV1Base<TAAutoBlockifyV1Pass>;
   using Base::Base;
 
-  explicit TASIMTAutoBlockifyV1Pass(const TASIMTAutoBlockifyV1Options &options)
+  explicit TAAutoBlockifyV1Pass(const TAAutoBlockifyV1Options &options)
       : Base(options) {}
 
   void runOnOperation() override {
@@ -137,24 +137,37 @@ public:
     GridValues grid = buildGridValues(builder, loc);
     Value yz = builder.create<arith::MulIOp>(loc, grid.y, grid.z);
     Value logicalBlockCount = builder.create<arith::MulIOp>(loc, grid.x, yz);
-    // Keep the physical block id in TTIR.  The pre-existing logical program-id
-    // operations were collected above and are replaced below, while this new
-    // operation deliberately remains as the launcher's physical block id.
-    // Unlike gpu.block_id, tt.get_program_id is legal in both the SIMD/Linalg
-    // and pure-SIMT lowering paths.
+    // Triton-Adapter's V1 contract represents the physical launch id with
+    // tt.get_program_id x.  The NPUIR lowering consumes this value as the
+    // flattened physical-block index; there is no gpu.linear_block_id
+    // operation in the Triton dialect used by this pass.  Keep the original
+    // tt.get_program_id operations in `programIdOps`; they are replaced below
+    // with the unflattened logical ids.
     Value blockIdx = builder.create<GetProgramIdOp>(loc, ProgramIDDim::X);
     Value physicalBlockCount = builder.create<arith::ConstantIntOp>(
         loc, physicalCoreCount, /*width=*/32);
-    Value chunk = builder.create<arith::CeilDivUIOp>(loc, logicalBlockCount,
-                                                     physicalBlockCount);
-    Value lowerBound = builder.create<arith::MulIOp>(loc, blockIdx, chunk);
+    // Match NPUIR's Triton-level AutoBlockify V1 schedule: each physical
+    // block owns one contiguous chunk of logical programs.  The factor only
+    // changes how that chunk is consumed by the SuperBlock; it does not turn
+    // the chunk into a global strided loop or change the tile shape.
+    Value chunk = builder.create<arith::CeilDivUIOp>(
+        loc, logicalBlockCount, physicalBlockCount);
+    Value lowerBound =
+        builder.create<arith::MulIOp>(loc, blockIdx, chunk);
     Value end = builder.create<arith::AddIOp>(loc, lowerBound, chunk);
-    Value upperBound =
-        builder.create<arith::MinUIOp>(loc, end, logicalBlockCount);
+    Value upperBound = builder.create<arith::MinUIOp>(
+        loc, end, logicalBlockCount);
     Value one = builder.create<arith::ConstantIntOp>(loc, 1, 32);
 
-    auto forOp = builder.create<scf::ForOp>(loc, lowerBound, upperBound, one);
+    auto forOp = builder.create<scf::ForOp>(loc, lowerBound, upperBound,
+                                           one);
     forOp->setAttr(autoBlockifyV1LoopAttr, builder.getUnitAttr());
+    // Keep the selected factor on the scheduling loop as well as on the
+    // function.  NPUIR exposes this loop-local fact and downstream scope
+    // materialization uses it to distinguish an F1 V1 loop from a refined
+    // SuperBlock loop.  The function attribute remains for route metadata.
+    forOp->setAttr(autoBlockifyV1SuperBlockFactorAttr,
+                   builder.getI32IntegerAttr(factor));
     builder.create<ReturnOp>(loc);
 
     if (originalFuncHasOneBlock) {
@@ -181,13 +194,14 @@ public:
     if (factor > 1) {
       Value iv = forOp.getInductionVar();
       builder.setInsertionPoint(forOp);
-      Value factorValue =
-          builder.create<arith::ConstantIntOp>(loc, iv.getType(), factor);
-      Value warpSize =
-          builder.create<arith::ConstantIntOp>(loc, iv.getType(), 32);
-      forOp.setStep(factorValue);
-
+      Value factorValue = builder.create<arith::ConstantIntOp>(
+          loc, iv.getType(), factor);
+      // Keep the warp-size constant outside the loop body, as in NPUIR.  It
+      // is a schedule parameter, not per-logical-program work.
+      Value warpSize = builder.create<arith::ConstantIntOp>(
+          loc, iv.getType(), 32);
       Block *loopBody = forOp.getBody();
+      forOp.setStep(factorValue);
       OpBuilder bodyBuilder(loopBody, loopBody->begin());
       Value tidIndex =
           bodyBuilder.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
@@ -250,16 +264,16 @@ public:
   }
 };
 
-class TARefineSIMTAutoBlockifyV1SuperBlockPass
-    : public impl::TARefineSIMTAutoBlockifyV1SuperBlockBase<
-          TARefineSIMTAutoBlockifyV1SuperBlockPass> {
+class TARefineAutoBlockifyV1SuperBlockPass
+    : public impl::TARefineAutoBlockifyV1SuperBlockBase<
+          TARefineAutoBlockifyV1SuperBlockPass> {
 public:
-  using Base = impl::TARefineSIMTAutoBlockifyV1SuperBlockBase<
-      TARefineSIMTAutoBlockifyV1SuperBlockPass>;
+  using Base = impl::TARefineAutoBlockifyV1SuperBlockBase<
+      TARefineAutoBlockifyV1SuperBlockPass>;
   using Base::Base;
 
-  explicit TARefineSIMTAutoBlockifyV1SuperBlockPass(
-      const TARefineSIMTAutoBlockifyV1SuperBlockOptions &options)
+  explicit TARefineAutoBlockifyV1SuperBlockPass(
+      const TARefineAutoBlockifyV1SuperBlockOptions &options)
       : Base(options) {}
 
   void runOnOperation() override {
@@ -311,10 +325,14 @@ public:
     }
 
     Value iv = forOp.getInductionVar();
+    Value oldUpper = forOp.getUpperBound();
     Location loc = forOp.getLoc();
     OpBuilder beforeLoop(forOp);
     Value factorValue =
         beforeLoop.create<arith::ConstantIntOp>(loc, iv.getType(), factor);
+    // The existing factor-1 loop already has NPUIR's contiguous per-core
+    // chunk bounds. Refinement only changes the consumption stride within
+    // that chunk; it must not rewrite the chunk bounds or physical schedule.
     forOp.setStep(factorValue);
 
     OpBuilder bodyBuilder(loopBody, loopBody->begin());
@@ -326,10 +344,11 @@ public:
         bodyBuilder.create<arith::IndexCastOp>(loc, iv.getType(), tidIndex);
     Value warpId = bodyBuilder.create<arith::DivUIOp>(loc, tid, warpSize);
     Value taskId = bodyBuilder.create<arith::RemUIOp>(loc, warpId, factorValue);
-    Value logicalProgramId = bodyBuilder.create<arith::AddIOp>(loc, iv, taskId);
+    Value logicalProgramId =
+        bodyBuilder.create<arith::AddIOp>(loc, iv, taskId);
     Value inBounds = bodyBuilder.create<arith::CmpIOp>(
         loc, arith::CmpIPredicate::slt, logicalProgramId,
-        forOp.getUpperBound());
+        oldUpper);
     auto ifOp = bodyBuilder.create<scf::IfOp>(loc, inBounds);
 
     for (OpOperand &use : llvm::make_early_inc_range(iv.getUses()))
@@ -350,6 +369,8 @@ public:
       op->setAttr(autoBlockifyV1ScheduleAttr, attrBuilder.getUnitAttr());
     ttFunc->setAttr(autoBlockifyV1SuperBlockFactorAttr,
                     attrBuilder.getI32IntegerAttr(factor));
+    forOp->setAttr(autoBlockifyV1SuperBlockFactorAttr,
+                   attrBuilder.getI32IntegerAttr(factor));
     ttFunc->getParentOfType<ModuleOp>()->setAttr(
         "ta.auto_blockify_v1.superblock_refined",
         attrBuilder.getI32IntegerAttr(factor));
@@ -359,14 +380,14 @@ public:
 } // namespace
 
 std::unique_ptr<OperationPass<FuncOp>>
-createTASIMTAutoBlockifyV1Pass(const TASIMTAutoBlockifyV1Options &options) {
-  return std::make_unique<TASIMTAutoBlockifyV1Pass>(options);
+createTAAutoBlockifyV1Pass(const TAAutoBlockifyV1Options &options) {
+  return std::make_unique<TAAutoBlockifyV1Pass>(options);
 }
 
 std::unique_ptr<OperationPass<FuncOp>>
-createTARefineSIMTAutoBlockifyV1SuperBlockPass(
-    const TARefineSIMTAutoBlockifyV1SuperBlockOptions &options) {
-  return std::make_unique<TARefineSIMTAutoBlockifyV1SuperBlockPass>(options);
+createTARefineAutoBlockifyV1SuperBlockPass(
+    const TARefineAutoBlockifyV1SuperBlockOptions &options) {
+  return std::make_unique<TARefineAutoBlockifyV1SuperBlockPass>(options);
 }
 
 } // namespace mlir::triton

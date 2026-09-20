@@ -18,7 +18,7 @@ std::string get910BConfigPath() {
 std::string getDavidConfigPath() {
   namespace fs = std::filesystem;
   fs::path src = fs::path(__FILE__).parent_path().parent_path().parent_path();
-  fs::path cfg = src / "costmodel" / "configs" / "ascend_davidv100.json";
+  fs::path cfg = src / "costmodel" / "configs" / "ascend_950pr.json";
   return cfg.string();
 }
 
@@ -26,7 +26,7 @@ std::string getDavidMicrobenchmarkProfilePath() {
   namespace fs = std::filesystem;
   fs::path src = fs::path(__FILE__).parent_path().parent_path().parent_path();
   fs::path profile = src / "costmodel" / "profiles" / "microbench" /
-                     "ascend_davidv100_v1.json";
+                     "ascend_950pr_v1.json";
   return profile.string();
 }
 
@@ -123,7 +123,7 @@ TEST(CostModelHardwareConfigTest,
       "clock.device_compute.frequency_mhz");
   if (!converted)
     FAIL() << llvm::toString(converted.takeError());
-  EXPECT_NEAR(*converted, 3.30 * 988.9 / 1650.0, 1.0e-12);
+  EXPECT_NEAR(*converted, 3.30 * 1000.0 / 1650.0, 1.0e-12);
 
   auto wrongUnit =
       profile->requireValue("simd.f32.add.throughput", "byte/system_cycle");
@@ -149,7 +149,7 @@ TEST(CostModelHardwareConfigTest,
             "david-v100-shared-microbench-20260914-v3");
   EXPECT_NEAR(
       cfg->getMicrobenchmarkRatePerDeviceCycle("simd.f32.add.throughput"),
-      3.30 * 988.9 / 1650.0, 1.0e-12);
+      3.30 * 1000.0 / 1650.0, 1.0e-12);
 }
 
 TEST(CostModelHardwareConfigTest, EstimationAPIsReturnNonNegative) {

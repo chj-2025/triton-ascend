@@ -438,42 +438,117 @@
       },
       "additionalProperties": false
     },
-    "atomic_rate": {
+    "simt_source_fit": {
       "type": "object",
-      "required": [
-        "logical_elements_per_system_cycle",
-        "operation_startup_system_cycles",
-        "result_dependency_system_cycles",
-        "unknown_contention_multiplier",
-        "source",
-        "confidence"
-      ],
+      "description": "Optional non-negative offline fit from TTIR source facts to generated instruction work.",
       "properties": {
-        "logical_elements_per_system_cycle": {
-          "type": "number",
-          "exclusiveMinimum": 0,
-          "description": "Effective source-level atomic elements processed per system-cycle selection score."
+        "enabled": {
+          "type": "boolean"
         },
-        "operation_startup_system_cycles": {
+        "intercept": {
           "type": "number",
           "minimum": 0
         },
-        "result_dependency_system_cycles": {
+        "direct_instruction_weight": {
+          "type": "number",
+          "minimum": 0
+        },
+        "segment_weight": {
+          "type": "number",
+          "minimum": 0
+        },
+        "stride_ratio_weight": {
+          "type": "number",
+          "minimum": 0
+        },
+        "masked_weight": {
+          "type": "number",
+          "minimum": 0
+        },
+        "peak_live_register_weight": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "layout_memory_curve": {
+      "type": "object",
+      "required": [
+        "first_system_cycles",
+        "incremental_system_cycles",
+        "min_count",
+        "max_count"
+      ],
+      "properties": {
+        "first_system_cycles": {
+          "type": "number",
+          "minimum": 0
+        },
+        "incremental_system_cycles": {
+          "type": "number",
+          "minimum": 0
+        },
+        "min_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "shared_local_load_instructions_per_access": {
           "type": "number",
           "minimum": 0,
-          "description": "Additional latency per dynamic TTIR atomic invocation when its returned old value is consumed."
+          "description": "Post-TTIR LDS work per matched semantic access."
         },
-        "unknown_contention_multiplier": {
+        "shared_local_store_instructions_per_access": {
           "type": "number",
-          "minimum": 1,
-          "description": "Route-relative conservative multiplier when TTIR cannot prove the runtime address collision distribution."
+          "minimum": 0,
+          "description": "Post-TTIR STS work per matched semantic access."
         },
-        "source": {
-          "type": "string",
-          "minLength": 1
+        "private_stack_load_instructions_per_access": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Post-TTIR LDK work per matched semantic access."
         },
-        "confidence": {
-          "$ref": "#/definitions/confidence"
+        "private_stack_store_instructions_per_access": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Post-TTIR STK work per matched semantic access."
+        },
+        "synchronization_system_cycles_per_access": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Measured SIMT thread-block rendezvous cost per matched access."
+        },
+        "evidence": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "layout_memory": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "base_warp_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "load": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/layout_memory_curve"
+          }
+        },
+        "store": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/layout_memory_curve"
+          }
         }
       },
       "additionalProperties": false
@@ -507,6 +582,100 @@
         "spill_transactions_per_system_cycle": {
           "type": "number",
           "exclusiveMinimum": 0
+        },
+        "register_budget_per_thread": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "SIMT register budget per thread in 32-bit register units before allocator spill."
+        },
+        "spill_transaction_coverage": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Calibrated spill transactions generated per excess 32-bit register unit."
+        },
+        "generated_vector_traffic": {
+          "type": "object",
+          "description": "Optional post-TTIR LDS/STS and LDK/STK instruction rates. Zero or absent entries fall back to aggregate RVECLD/RVECST rates.",
+          "properties": {
+            "shared_local_load_instructions_per_system_cycle": {
+              "type": "number",
+              "minimum": 0
+            },
+            "shared_local_store_instructions_per_system_cycle": {
+              "type": "number",
+              "minimum": 0
+            },
+            "private_stack_load_instructions_per_system_cycle": {
+              "type": "number",
+              "minimum": 0
+            },
+            "private_stack_store_instructions_per_system_cycle": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "global_load_source_fit": {
+          "$ref": "#/definitions/simt_source_fit"
+        },
+        "global_store_source_fit": {
+          "$ref": "#/definitions/simt_source_fit"
+        },
+        "shared_load_source_fit": {
+          "$ref": "#/definitions/simt_source_fit"
+        },
+        "shared_store_source_fit": {
+          "$ref": "#/definitions/simt_source_fit"
+        },
+        "private_load_source_fit": {
+          "$ref": "#/definitions/simt_source_fit"
+        },
+        "private_store_source_fit": {
+          "$ref": "#/definitions/simt_source_fit"
+        },
+        "layout_memory": {
+          "$ref": "#/definitions/layout_memory"
+        },
+        "fit_evidence": {
+          "type": "object",
+          "description": "Audit metadata for source-to-generated-instruction fits promoted from offline CaModel/assembly evidence.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "source_sha256": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "fit_sha256": {
+                "type": "string"
+              },
+              "training_rows": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "held_out_rows": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "max_held_out_relative_error": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "formula": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "fit_sha256",
+              "training_rows"
+            ],
+            "additionalProperties": false
+          }
         },
         "prefix_scan": {
           "type": "object",

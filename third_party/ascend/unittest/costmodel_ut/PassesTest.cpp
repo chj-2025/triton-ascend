@@ -17,11 +17,15 @@
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -155,7 +159,7 @@ TEST(CostModelPassesTest, EstimateCyclesAnnotatesComputeAndTransferOps) {
   EXPECT_TRUE(storeOp->getAttrOfType<StringAttr>("hw_unit"));
 }
 
-TEST(CostModelPassesTest, DavidF32AddConsumesSharedThroughputInAbsoluteModel) {
+TEST(CostModelPassesTest, Ascend950PRF32AddConsumesSharedThroughputInAbsoluteModel) {
   mlir::MLIRContext context;
   auto module = parseModule(context, R"mlir(
 module {
@@ -169,7 +173,7 @@ module {
   ASSERT_TRUE(module);
 
   EstimateCyclesPassOptions options;
-  options.hardwareConfigPath = TRITON_ASCEND_DAVID_TEST_CONFIG_PATH;
+  options.hardwareConfigPath = TRITON_ASCEND_950PR_TEST_CONFIG_PATH;
   ASSERT_TRUE(runPasses(*module, createEstimateCyclesPass(options)));
 
   Operation *addOp = findFirstOp(*module, "ascend.add");
@@ -307,6 +311,7 @@ module {
   const auto &anchor = plan.anchors.front();
   EXPECT_EQ(anchor.kind,
             mlir::ascend::SimtAnchorKind::PlainOneDimensionalCumsum);
+  // The SIMD scan template is supported; scan cost decides between modes.
   EXPECT_TRUE(anchor.lowerability.allSimd);
   EXPECT_TRUE(anchor.lowerability.allSimtOnly);
   EXPECT_TRUE(anchor.lowerability.mixed);
@@ -593,6 +598,159 @@ TEST(CostModelPassesTest, SimdSimtScoresGenericSemanticStages) {
   auto reportReason = reportObject->getString("application_reason");
   ASSERT_TRUE(reportReason);
   EXPECT_EQ(*reportReason, "report_mode");
+}
+
+TEST(CostModelPassesTest, SimdSimtProfileRejectsDifferentProductTarget) {
+  mlir::MLIRContext context;
+  auto module = parseModule(context, kOutOfSimdSimtCoverageModule);
+  ASSERT_TRUE(module);
+
+  SelectSimdSimtCostModelPassOptions options;
+  options.mode = "report";
+  options.profilePath = TRITON_ASCEND_SIMD_SIMT_TEST_PROFILE_PATH;
+  options.actualTarget = "Ascend950DT_9582";
+  options.numWarps = 4;
+  options.compileOn91095 = true;
+  EXPECT_FALSE(
+      runPasses(*module, createSelectSimdSimtCostModelPass(options)));
+}
+
+TEST(CostModelPassesTest, SimtSetupUsesMeasuredWarpCountCurve) {
+  auto setupForWarps = [](unsigned numWarps) -> std::optional<double> {
+    mlir::MLIRContext context;
+    auto module = parseModule(context, kOutOfSimdSimtCoverageModule);
+    if (!module)
+      return std::nullopt;
+    SelectSimdSimtCostModelPassOptions options;
+    options.mode = "report";
+    options.profilePath = TRITON_ASCEND_SIMD_SIMT_TEST_PROFILE_PATH;
+    options.actualTarget = "Ascend950PR_9579";
+    options.numWarps = numWarps;
+    options.compileOn91095 = true;
+    if (!runPasses(*module, createSelectSimdSimtCostModelPass(options)))
+      return std::nullopt;
+    auto reportAttr =
+        (*module)->getAttrOfType<StringAttr>("ascend.simt_costmodel.report_json");
+    if (!reportAttr)
+      return std::nullopt;
+    auto report = llvm::json::parse(reportAttr.getValue());
+    if (!report)
+      return std::nullopt;
+    auto *stages = report->getAsObject()
+                       ->getObject("stage_model")
+                       ->getArray("logical_stages");
+    if (!stages || stages->empty())
+      return std::nullopt;
+    auto *implementations =
+        (*stages)[0].getAsObject()->getArray("implementations");
+    if (!implementations)
+      return std::nullopt;
+    for (const auto &candidate : *implementations) {
+      auto *cost = candidate.getAsObject();
+      auto *implementation = cost->getObject("implementation");
+      auto mode = implementation ? implementation->getString("mode")
+                                 : std::nullopt;
+      auto *resources = cost->getObject("resource_system_cycles");
+      if (mode && *mode == "simt" && resources)
+        return resources->getNumber("setup");
+    }
+    return std::nullopt;
+  };
+
+  auto fourWarps = setupForWarps(4);
+  auto thirtyTwoWarps = setupForWarps(32);
+  ASSERT_TRUE(fourWarps);
+  ASSERT_TRUE(thirtyTwoWarps);
+  EXPECT_NEAR(*fourWarps, 196.31, 1e-6);
+  EXPECT_NEAR(*thirtyTwoWarps, 224.50, 1e-6);
+}
+
+TEST(CostModelPassesTest, SimdSimtProfileRejectsNullThroughputMeasurement) {
+  auto sourceOrError =
+      llvm::MemoryBuffer::getFile(TRITON_ASCEND_SIMD_SIMT_TEST_PROFILE_PATH);
+  ASSERT_TRUE(static_cast<bool>(sourceOrError));
+  auto profile = llvm::json::parse((*sourceOrError)->getBuffer());
+  ASSERT_TRUE(static_cast<bool>(profile));
+
+  auto *root = profile->getAsObject();
+  ASSERT_NE(root, nullptr);
+  auto *simd = root->getObject("simd");
+  ASSERT_NE(simd, nullptr);
+  auto *ops = simd->getObject("ops");
+  ASSERT_NE(ops, nullptr);
+  auto *sub = ops->getObject("f32.sub");
+  ASSERT_NE(sub, nullptr);
+  (*sub)["throughput_measurement"] = nullptr;
+
+  llvm::SmallString<256> microbenchPath(
+      TRITON_ASCEND_SIMD_SIMT_TEST_PROFILE_PATH);
+  llvm::sys::path::remove_filename(microbenchPath);
+  llvm::sys::path::append(microbenchPath, "..", "microbench",
+                          "ascend_950pr_v1.json");
+  llvm::sys::path::remove_dots(microbenchPath, true);
+  (*root)["microbenchmark_profile"] = microbenchPath.str().str();
+
+  llvm::SmallString<128> profilePath;
+  int profileFd = -1;
+  ASSERT_FALSE(llvm::sys::fs::createTemporaryFile(
+      "simd_simt_null_measurement", "json", profileFd, profilePath));
+  {
+    llvm::raw_fd_ostream profileFile(profileFd, true);
+    profileFile << llvm::formatv("{0:2}", *profile);
+  }
+
+  mlir::MLIRContext context;
+  auto module = parseModule(context, kOutOfSimdSimtCoverageModule);
+  ASSERT_TRUE(module);
+  SelectSimdSimtCostModelPassOptions options;
+  options.mode = "report";
+  options.profilePath = profilePath.str().str();
+  options.actualTarget = "Ascend950PR_9579";
+  options.numWarps = 4;
+  options.compileOn91095 = true;
+  const bool succeeded =
+      runPasses(*module, createSelectSimdSimtCostModelPass(options));
+  llvm::sys::fs::remove(profilePath);
+  EXPECT_FALSE(succeeded);
+}
+
+TEST(CostModelPassesTest, BackendFactorSetIsNotRegeneratedByStageLegality) {
+  for (int64_t factor : {0, 1, 2, 4}) {
+    mlir::MLIRContext context;
+    auto module = parseModule(context, kOutOfSimdSimtCoverageModule);
+    ASSERT_TRUE(module);
+    SelectSimdSimtCostModelPassOptions options;
+    options.mode = "report";
+    options.profilePath = TRITON_ASCEND_SIMD_SIMT_TEST_PROFILE_PATH;
+    options.actualTarget = "Ascend950PR_9579";
+    options.numWarps = 4;
+    options.compileOn91095 = true;
+    options.wholeKernelSuperblockMaterializable = true;
+    options.routeTransformCapabilityJSON =
+        "{\"whole_kernel_superblock_factors\":[" +
+        (factor ? std::to_string(factor) : std::string()) +
+        "],\"scope_superblock_factors\":[]}";
+    ASSERT_TRUE(runPasses(*module, createSelectSimdSimtCostModelPass(options)));
+    auto report = llvm::json::parse(
+        (*module)
+            ->getAttrOfType<StringAttr>("ascend.simt_costmodel.report_json")
+            .getValue());
+    ASSERT_TRUE(static_cast<bool>(report));
+    auto *stages = report->getAsObject()
+                       ->getObject("stage_model")
+                       ->getArray("logical_stages");
+    ASSERT_NE(stages, nullptr);
+    ASSERT_FALSE(stages->empty());
+    for (const auto &stage : *stages) {
+      auto *factors = stage.getAsObject()->getArray("legal_simt_factors");
+      ASSERT_NE(factors, nullptr);
+      ASSERT_EQ(factors->size(), factor ? 1u : 0u)
+          << llvm::formatv("{0:2}", *report).str();
+      if (factor)
+        EXPECT_EQ((*factors)[0].getAsInteger(), factor);
+      EXPECT_TRUE(stage.getAsObject()->getArray("local_simt_factors")->empty());
+    }
+  }
 }
 
 TEST(CostModelPassesTest, SimdSimtSelectionUsesExternalAnalysisIR) {

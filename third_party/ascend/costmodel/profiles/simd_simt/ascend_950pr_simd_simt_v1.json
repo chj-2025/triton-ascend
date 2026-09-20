@@ -1,0 +1,483 @@
+{
+  "$schema": "./simd_simt_profile_schema.json",
+  "schema_version": 14,
+  "profile_version": "ascend-950pr-simd-simt-20260918-v41",
+  "target": "Ascend950PR/dav-c310",
+  "description": "Stage Route Model hardware profile. Stage partitions and workloads are generated online from transformed TTIR; this file contains no workload-specific Stage template or route multiplier.",
+  "microbenchmark_profile": "../microbench/ascend_950pr_v1.json",
+  "compatible_targets": [
+    "Ascend950PR_*",
+    "Ascend910_95*",
+    "dav-c310"
+  ],
+  "score_unit": "system_cycle_selection_score",
+  "selection_calibration": {
+    "description": "The only structural threshold consumed by the Stage partitioner. Numerical Stage costs come from mode-specific resource formulas and referenced measurements; obsolete route penalties and multipliers have been removed.",
+    "tiny_dot_flops_max": 16384,
+    "source": "StagePartitioner uses this architecture-independent boundary to select the tiny-dot formula family. It is a semantic model-domain limit, not a fitted route multiplier."
+  },
+  "simd": {
+    "description": "Inputs used to estimate the all-SIMD candidate: SIMD width, setup, operation, memory, and dot costs.",
+    "vector_width_measurement": "simd.vector_width_bits",
+    "startup_system_cycles": {
+      "description": "One-time SIMD Stage startup proxy measured with a compile-time-specialized minimal observable vector body and matching barrier-only subtraction.",
+      "vector": 36.376276,
+      "vector_measurement": "simd.setup.serialized_minimal_net",
+      "source": "Shared Ascend950PR microbenchmark profile",
+      "confidence": "medium",
+      "note": "The consumed vector value is measured; memory-transfer startup is modeled per logical memory operation."
+    },
+    "ops": {
+      "f32.add": {
+        "description": "Measured FP32 SIMD add base throughput resolved from the shared microbenchmark profile.",
+        "throughput_measurement": "simd.f32.add.throughput"
+      },
+      "f32.sub": {
+        "description": "Measured FP32 SIMD subtract throughput.",
+        "throughput_measurement": "simd.f32.sub.throughput"
+      },
+      "f32.mul": {
+        "description": "Measured FP32 SIMD multiply throughput.",
+        "throughput_measurement": "simd.f32.mul.throughput"
+      },
+      "f32.div": {
+        "description": "Measured FP32 SIMD divide throughput.",
+        "throughput_measurement": "simd.f32.div.throughput"
+      },
+      "f32.max": {
+        "description": "Measured FP32 SIMD maximum throughput.",
+        "throughput_measurement": "simd.f32.max.throughput"
+      },
+      "f32.abs": {
+        "description": "Measured FP32 SIMD absolute-value throughput.",
+        "throughput_measurement": "simd.f32.abs.throughput"
+      },
+      "f32.exp": {
+        "description": "Measured effective FP32 SIMD exponential throughput.",
+        "throughput_measurement": "simd.f32.exp.throughput"
+      },
+      "f32.log": {
+        "description": "Measured effective FP32 SIMD logarithm throughput.",
+        "throughput_measurement": "simd.f32.log.throughput"
+      },
+      "predicate.cmp": {
+        "description": "Measured standalone semantic SIMD comparison throughput.",
+        "throughput_measurement": "simd.predicate.cmp.throughput"
+      },
+      "predicate.select": {
+        "description": "Measured SIMD select throughput.",
+        "throughput_measurement": "simd.predicate.select.throughput"
+      },
+      "convert.cast": {
+        "description": "Measured effective SIMD cast throughput per semantic cast.",
+        "throughput_measurement": "simd.convert.cast.throughput"
+      },
+      "f32.clamp": {
+        "description": "Measured effective SIMD throughput per semantic clamp.",
+        "throughput_measurement": "simd.f32.clamp.throughput"
+      }
+    },
+    "memory": {
+      "description": "Model-specific all-SIMD memory rates consumed by StageCostModel.",
+      "vector_mte2_bytes_per_system_cycle": 167.557775299,
+      "mte3_bytes_per_system_cycle": 213.125675219,
+      "load_operation_startup_system_cycles": 105.309240226,
+      "store_operation_startup_system_cycles": 90.954331652,
+      "load_throughput_measurement": "simd.memory.load.throughput",
+      "store_throughput_measurement": "simd.memory.store.throughput",
+      "load_startup_measurement": "simd.memory.load.startup",
+      "store_startup_measurement": "simd.memory.store.startup",
+      "source": "Shared Ascend950PR contiguous-memory joint fit",
+      "confidence": "high",
+      "note": "Each cost is startup per logical load/store operation plus bytes divided by the fitted asymptotic throughput."
+    },
+    "dot": {
+      "description": "SIMD tiny-dot cost: dynamic matrix instances times setup plus aggregate FLOPs divided by dependent-chain throughput.",
+      "startup_system_cycles": 134.510204,
+      "startup_measurement": "simd.dot.tiny.dependent.startup",
+      "flops_per_system_cycle": 568.16419,
+      "throughput_measurement": "simd.dot.tiny.dependent.throughput",
+      "source": "Ascend950PR dependent N=16/N=32 dot-chain joint fit with one final store",
+      "confidence": "medium"
+    },
+    "stage_resources": {
+      "description": "Generic SIMD front-end inputs. Unclassified scalar and control instructions contribute only to the measured shared issue lower bound. Independent control latency is unsupported until a composite signature curve is identifiable. The measured loaded-index curve is restricted to FP16 shapes with matching byte and warp-instruction totals; unmatched indirect memory is unsupported.",
+      "issue_instructions_per_system_cycle": 3.298629007,
+      "issue_instructions_per_system_cycle_measurement": "simd.frontend.effective_issue_floor",
+      "prefix_scan": {
+        "step_latency_system_cycles": 1.818,
+        "step_latency_measurement": "simd.f32.add.dependent_latency",
+        "description": "One SIMD sequence is an R-1 dependent vector-add chain; independent sequences are packed by vector width. The model uses this measured step latency separately from the aggregate add issue floor."
+      },
+      "loop_carried_recurrence": {
+        "description": "Measured lower bound for one physical group's iteration of a reduction recurrence. The work-size key is reduction lane-steps per logical program; SIMD has only factor 1.",
+        "reduction_group_iteration_system_cycle_measurements": {
+          "1": {
+            "1024": "simd.recurrence.reduction_lane_steps_1024.factor_1.group_incremental_cost",
+            "4096": "simd.recurrence.reduction_lane_steps_4096.factor_1.group_incremental_cost"
+          }
+        }
+      },
+      "continuous_memory": {
+        "description": "Measured physical-group execution envelope for ordinary contiguous FP32 transfers. Curves are consumed only inside the measured byte interval; operation count is multiplied once and route composition multiplies runtime waves once.",
+        "load_group_operation_system_cycle_measurements": {
+          "1": {
+            "1024": "simd.continuous_load.fp32.bytes_1024.factor_1.group_incremental_cost"
+          }
+        },
+        "store_group_operation_system_cycle_measurements": {
+          "1": {
+            "1024": "simd.continuous_store.fp32.bytes_1024.factor_1.group_incremental_cost"
+          }
+        }
+      },
+      "indirect_memory": {
+        "load_system_cycle_measurements": {
+          "8": "simd.indirect_load.fp16.warp_instructions_8.incremental_cost",
+          "16": "simd.indirect_load.fp16.warp_instructions_16.incremental_cost"
+        },
+        "load_startup_system_cycle_measurements": {
+          "8": "simd.indirect_load.fp16.warp_instructions_8.startup_cost",
+          "16": "simd.indirect_load.fp16.warp_instructions_16.startup_cost"
+        }
+      },
+      "source": "Ascend950PR versioned microbenchmark evidence. The issue floor is an observable conservative bound, not a claimed microarchitecture peak. Control instructions enter that shared floor but do not receive fabricated additive latency. Loaded-index loads use the measured operation-shape curve; unmatched indirect accesses are unsupported."
+    }
+  },
+  "simt": {
+    "description": "Inputs used to estimate the all-SIMT candidate and the SIMT portion of a mixed candidate.",
+    "warp_size_measurement": "simt.warp_size",
+    "setup_system_cycles": {
+      "description": "Completion-inclusive minimal-SIMT-VF net setup selected by launched warp count. All entries use compile-time-specialized binaries and subtract the matching barrier-only loop.",
+      "empty_launch_measurement": "simt.setup.serialized_minimal_net.warps_1",
+      "empty_launch_measurements": {
+        "1": "simt.setup.serialized_minimal_net.warps_1",
+        "2": "simt.setup.serialized_minimal_net.warps_2",
+        "4": "simt.setup.serialized_minimal_net.warps_4",
+        "8": "simt.setup.serialized_minimal_net.warps_8",
+        "16": "simt.setup.serialized_minimal_net.warps_16",
+        "32": "simt.setup.serialized_minimal_net.warps_32"
+      }
+    },
+    "ops": {
+      "f32.add": {
+        "description": "Measured FP32 SIMT scalar-add base throughput resolved from the shared microbenchmark profile.",
+        "throughput_measurement": "simt.f32.add.throughput",
+        "throughput_measurements": {
+          "1": "simt.f32.add.throughput.warps_1",
+          "2": "simt.f32.add.throughput.warps_2",
+          "4": "simt.f32.add.throughput.warps_4",
+          "8": "simt.f32.add.throughput.warps_8",
+          "16": "simt.f32.add.throughput.warps_16",
+          "32": "simt.f32.add.throughput.warps_32"
+        }
+      },
+      "f32.sub": {
+        "description": "Measured FP32 SIMT scalar-subtract throughput.",
+        "throughput_measurement": "simt.f32.sub.throughput",
+        "throughput_measurements": {
+          "1": "simt.f32.sub.throughput.warps_1",
+          "2": "simt.f32.sub.throughput.warps_2",
+          "4": "simt.f32.sub.throughput.warps_4",
+          "8": "simt.f32.sub.throughput.warps_8",
+          "16": "simt.f32.sub.throughput.warps_16",
+          "32": "simt.f32.sub.throughput.warps_32"
+        }
+      },
+      "f32.mul": {
+        "description": "Measured FP32 SIMT scalar-multiply throughput.",
+        "throughput_measurement": "simt.f32.mul.throughput",
+        "throughput_measurements": {
+          "1": "simt.f32.mul.throughput.warps_1",
+          "2": "simt.f32.mul.throughput.warps_2",
+          "4": "simt.f32.mul.throughput.warps_4",
+          "8": "simt.f32.mul.throughput.warps_8",
+          "16": "simt.f32.mul.throughput.warps_16",
+          "32": "simt.f32.mul.throughput.warps_32"
+        }
+      },
+      "f32.div": {
+        "description": "Measured FP32 SIMT scalar-divide throughput.",
+        "throughput_measurement": "simt.f32.div.throughput",
+        "throughput_measurements": {
+          "1": "simt.f32.div.throughput.warps_1",
+          "2": "simt.f32.div.throughput.warps_2",
+          "4": "simt.f32.div.throughput.warps_4",
+          "8": "simt.f32.div.throughput.warps_8",
+          "16": "simt.f32.div.throughput.warps_16",
+          "32": "simt.f32.div.throughput.warps_32"
+        }
+      },
+      "f32.max": {
+        "description": "Measured FP32 SIMT scalar-maximum throughput.",
+        "throughput_measurement": "simt.f32.max.throughput",
+        "throughput_measurements": {
+          "1": "simt.f32.max.throughput.warps_1",
+          "2": "simt.f32.max.throughput.warps_2",
+          "4": "simt.f32.max.throughput.warps_4",
+          "8": "simt.f32.max.throughput.warps_8",
+          "16": "simt.f32.max.throughput.warps_16",
+          "32": "simt.f32.max.throughput.warps_32"
+        }
+      },
+      "f32.abs": {
+        "description": "Measured FP32 SIMT scalar-absolute-value throughput.",
+        "throughput_measurement": "simt.f32.abs.throughput",
+        "throughput_measurements": {
+          "1": "simt.f32.abs.throughput.warps_1",
+          "2": "simt.f32.abs.throughput.warps_2",
+          "4": "simt.f32.abs.throughput.warps_4",
+          "8": "simt.f32.abs.throughput.warps_8",
+          "16": "simt.f32.abs.throughput.warps_16",
+          "32": "simt.f32.abs.throughput.warps_32"
+        }
+      },
+      "f32.exp": {
+        "description": "Measured effective FP32 SIMT exponential throughput.",
+        "throughput_measurement": "simt.f32.exp.throughput",
+        "throughput_measurements": {
+          "1": "simt.f32.exp.throughput.warps_1",
+          "2": "simt.f32.exp.throughput.warps_2",
+          "4": "simt.f32.exp.throughput.warps_4",
+          "8": "simt.f32.exp.throughput.warps_8",
+          "16": "simt.f32.exp.throughput.warps_16",
+          "32": "simt.f32.exp.throughput.warps_32"
+        }
+      },
+      "f32.log": {
+        "description": "Measured effective FP32 SIMT logarithm throughput.",
+        "throughput_measurement": "simt.f32.log.throughput",
+        "throughput_measurements": {
+          "1": "simt.f32.log.throughput.warps_1",
+          "2": "simt.f32.log.throughput.warps_2",
+          "4": "simt.f32.log.throughput.warps_4",
+          "8": "simt.f32.log.throughput.warps_8",
+          "16": "simt.f32.log.throughput.warps_16",
+          "32": "simt.f32.log.throughput.warps_32"
+        }
+      },
+      "predicate.cmp": {
+        "description": "Measured standalone semantic SIMT comparison throughput.",
+        "throughput_measurement": "simt.predicate.cmp.throughput",
+        "throughput_measurements": {
+          "1": "simt.predicate.cmp.throughput.warps_1",
+          "2": "simt.predicate.cmp.throughput.warps_2",
+          "4": "simt.predicate.cmp.throughput.warps_4",
+          "8": "simt.predicate.cmp.throughput.warps_8",
+          "16": "simt.predicate.cmp.throughput.warps_16",
+          "32": "simt.predicate.cmp.throughput.warps_32"
+        }
+      },
+      "predicate.select": {
+        "description": "Measured SIMT select throughput.",
+        "throughput_measurement": "simt.predicate.select.throughput",
+        "throughput_measurements": {
+          "1": "simt.predicate.select.throughput.warps_1",
+          "2": "simt.predicate.select.throughput.warps_2",
+          "4": "simt.predicate.select.throughput.warps_4",
+          "8": "simt.predicate.select.throughput.warps_8",
+          "16": "simt.predicate.select.throughput.warps_16",
+          "32": "simt.predicate.select.throughput.warps_32"
+        }
+      },
+      "convert.cast": {
+        "description": "Measured effective SIMT cast throughput per semantic cast.",
+        "throughput_measurement": "simt.convert.cast.throughput",
+        "throughput_measurements": {
+          "1": "simt.convert.cast.throughput.warps_1",
+          "2": "simt.convert.cast.throughput.warps_2",
+          "4": "simt.convert.cast.throughput.warps_4",
+          "8": "simt.convert.cast.throughput.warps_8",
+          "16": "simt.convert.cast.throughput.warps_16",
+          "32": "simt.convert.cast.throughput.warps_32"
+        }
+      },
+      "f32.clamp": {
+        "description": "Measured effective SIMT throughput per semantic clamp.",
+        "throughput_measurement": "simt.f32.clamp.throughput",
+        "throughput_measurements": {
+          "1": "simt.f32.clamp.throughput.warps_1",
+          "2": "simt.f32.clamp.throughput.warps_2",
+          "4": "simt.f32.clamp.throughput.warps_4",
+          "8": "simt.f32.clamp.throughput.warps_8",
+          "16": "simt.f32.clamp.throughput.warps_16",
+          "32": "simt.f32.clamp.throughput.warps_32"
+        }
+      }
+    },
+    "dot": {
+      "description": "SIMT tiny-dot cost: dynamic matrix instances times setup plus aggregate FLOPs divided by dependent-chain throughput.",
+      "startup_system_cycles": 171.994898,
+      "startup_measurement": "simt.dot.tiny.dependent.startup",
+      "flops_per_system_cycle": 32.21056,
+      "throughput_measurement": "simt.dot.tiny.dependent.throughput",
+      "source": "Ascend950PR dependent N=16/N=32 dot-chain joint fit with one final store",
+      "confidence": "medium"
+    },
+    "shuffle": {
+      "description": "SIMT workload-effective shuffle rate resolved from the shared runtime-loop microbenchmark. Route-level generalization confidence is intentionally lower than measurement repeatability.",
+      "throughput_measurement": "simt.shuffle.throughput",
+      "throughput_measurements": {
+        "1": "simt.shuffle.throughput.warps_1",
+        "2": "simt.shuffle.throughput.warps_2",
+        "4": "simt.shuffle.throughput.warps_4",
+        "8": "simt.shuffle.throughput.warps_8",
+        "16": "simt.shuffle.throughput.warps_16",
+        "32": "simt.shuffle.throughput.warps_32"
+      },
+      "confidence": "low"
+    },
+    "memory": {
+      "description": "SIMT workload-effective GM load/store rates resolved from sequential rotating runtime-loop measurements. Indirect/random/coalescing behavior is not calibrated by these rates.",
+      "load_throughput_measurement": "simt.gm.load.throughput",
+      "store_throughput_measurement": "simt.gm.store.throughput",
+      "load_throughput_measurements": {
+        "1": "simt.gm.load.throughput.warps_1",
+        "2": "simt.gm.load.throughput.warps_2",
+        "4": "simt.gm.load.throughput.warps_4",
+        "8": "simt.gm.load.throughput.warps_8",
+        "16": "simt.gm.load.throughput.warps_16",
+        "32": "simt.gm.load.throughput.warps_32"
+      },
+      "store_throughput_measurements": {
+        "1": "simt.gm.store.throughput.warps_1",
+        "2": "simt.gm.store.throughput.warps_2",
+        "4": "simt.gm.store.throughput.warps_4",
+        "8": "simt.gm.store.throughput.warps_8",
+        "16": "simt.gm.store.throughput.warps_16",
+        "32": "simt.gm.store.throughput.warps_32"
+      },
+      "confidence": "low"
+    },
+    "stage_resources": {
+      "description": "Generic SIMT front-end inputs. Unclassified scalar and control instructions contribute only to the measured shared issue lower bound. Prefix-scan issue accounting preserves one shuffle, predicate and add instruction per sequence and level. Independent control latency is unsupported until a composite signature curve is identifiable. The measured loaded-index curve is restricted to FP16 shapes with matching byte and warp-instruction totals; unmatched indirect memory is unsupported.",
+      "issue_instructions_per_system_cycle": 3.2985811913125,
+      "issue_instructions_per_system_cycle_measurement": "simt.frontend.effective_issue_floor",
+      "prefix_scan": {
+        "step_latency_system_cycles": 27.278581,
+        "step_latency_measurement": "simt.shuffle.dependent_latency",
+        "description": "One SIMT sequence is a ceil(log2(R)) dependent shuffle/add/control chain. Independent sequences add an aggregate issue floor but do not lengthen this critical path."
+      },
+      "loop_carried_recurrence": {
+        "description": "Measured lower bound for one physical SuperBlock group's iteration of a reduction recurrence. Each inner work-size key is reduction lane-steps in one logical program; the measured value already includes all F logical programs in the physical group.",
+        "base_warp_count": 4,
+        "reduction_group_iteration_system_cycle_measurements": {
+          "1": {
+            "1024": "simt.recurrence.reduction_lane_steps_1024.factor_1.group_incremental_cost",
+            "4096": "simt.recurrence.reduction_lane_steps_4096.factor_1.group_incremental_cost"
+          },
+          "2": {
+            "1024": "simt.recurrence.reduction_lane_steps_1024.factor_2.group_incremental_cost",
+            "4096": "simt.recurrence.reduction_lane_steps_4096.factor_2.group_incremental_cost"
+          },
+          "4": {
+            "1024": "simt.recurrence.reduction_lane_steps_1024.factor_4.group_incremental_cost",
+            "4096": "simt.recurrence.reduction_lane_steps_4096.factor_4.group_incremental_cost"
+          }
+        }
+      },
+      "continuous_memory": {
+        "description": "Measured physical-group execution envelope for ordinary contiguous FP32 transfers. Each factor-specific value already includes all logical programs grouped by that SuperBlock factor; the Stage formula must not multiply it by F again.",
+        "base_warp_count": 4,
+        "load_group_operation_system_cycle_measurements": {
+          "1": {
+            "1024": "simt.continuous_load.fp32.bytes_1024.factor_1.group_incremental_cost"
+          },
+          "2": {
+            "1024": "simt.continuous_load.fp32.bytes_1024.factor_2.group_incremental_cost"
+          },
+          "4": {
+            "1024": "simt.continuous_load.fp32.bytes_1024.factor_4.group_incremental_cost"
+          }
+        },
+        "store_group_operation_system_cycle_measurements": {
+          "1": {
+            "1024": "simt.continuous_store.fp32.bytes_1024.factor_1.group_incremental_cost"
+          },
+          "2": {
+            "1024": "simt.continuous_store.fp32.bytes_1024.factor_2.group_incremental_cost"
+          },
+          "4": {
+            "1024": "simt.continuous_store.fp32.bytes_1024.factor_4.group_incremental_cost"
+          }
+        }
+      },
+      "layout_memory": {
+        "description": "950PR strided-wide FP32 solve_tril layout model. The exact 16x16, row=64 B, row-stride=8192 B, masked layout is matched by the full key below. S6 uses one unified per-load L (first=incremental), so four loads are charged as 4*L; route scheduling supplies the logical-program iteration count. S22 keeps the measured store envelope L+(n-1)*II for the ten grouped stores. These entries are SIMT-only and factor-specific by active warp count.",
+        "load": {
+          "strided_wide:r=2:row=64:stride=8192:rows=16:bits=32:masked=1:shape=16,16,:strides=2048,1,:warps=4:factor=1": {
+            "first_system_cycles": 133.490279103,
+            "incremental_system_cycles": 133.490279103,
+            "min_count": 1,
+            "max_count": 4,
+            "evidence": "950pr_simt_layout_memory_grouped_healthy_fit_20260918.json; unified no-first/steady S6 load fit from two fence=0 stride columns"
+          },
+          "strided_wide:r=2:row=64:stride=8192:rows=16:bits=32:masked=1:shape=16,16,:strides=2048,1,:warps=8:factor=2": {
+            "first_system_cycles": 145.771767653,
+            "incremental_system_cycles": 145.771767653,
+            "min_count": 1,
+            "max_count": 4,
+            "evidence": "950pr_simt_layout_memory_README.md; S6 confirmed definition C_S6=L*4*5 with L=145.772 ticks/load"
+          },
+          "strided_wide:r=2:row=64:stride=8192:rows=16:bits=32:masked=1:shape=16,16,:strides=2048,1,:warps=16:factor=4": {
+            "first_system_cycles": 168.131142653,
+            "incremental_system_cycles": 168.131142653,
+            "min_count": 1,
+            "max_count": 4,
+            "evidence": "950pr_simt_layout_memory_grouped_healthy_fit_20260918.json; unified no-first/steady S6 load fit from two fence=0 stride columns"
+          }
+        },
+        "store": {
+          "strided_wide:r=2:row=64:stride=8192:rows=16:bits=32:masked=1:shape=16,16,:strides=2048,1,:warps=4:factor=1": {
+            "first_system_cycles": 90.339217557,
+            "incremental_system_cycles": 31.193702290,
+            "min_count": 1,
+            "max_count": 10,
+            "evidence": "950pr_simt_layout_memory_grouped_healthy_fit_20260918.json; fence=0 4-warp store envelope"
+          },
+          "strided_wide:r=2:row=64:stride=8192:rows=16:bits=32:masked=1:shape=16,16,:strides=2048,1,:warps=8:factor=2": {
+            "first_system_cycles": 120.899332061,
+            "incremental_system_cycles": 55.910782443,
+            "min_count": 1,
+            "max_count": 10,
+            "evidence": "950pr_simt_layout_memory_grouped_healthy_fit_20260918.json; fence=0 8-warp composite store envelope. Its measured L+(n-1)*II already includes the lowering/layout service seen in the generated store path; do not add LDS/STS/LDK/STK or barrier residuals a second time."
+          },
+          "strided_wide:r=2:row=64:stride=8192:rows=16:bits=32:masked=1:shape=16,16,:strides=2048,1,:warps=16:factor=4": {
+            "first_system_cycles": 172.406965649,
+            "incremental_system_cycles": 108.966125954,
+            "min_count": 1,
+            "max_count": 10,
+            "evidence": "950pr_simt_layout_memory_grouped_healthy_fit_20260918.json; fence=0 16-warp store envelope"
+          }
+        }
+      },
+      "indirect_memory": {
+        "load_system_cycle_measurements": {
+          "8": "simt.indirect_load.fp16.warp_instructions_8.incremental_cost",
+          "16": "simt.indirect_load.fp16.warp_instructions_16.incremental_cost"
+        },
+        "load_startup_system_cycle_measurements": {
+          "8": "simt.indirect_load.fp16.warp_instructions_8.startup_cost",
+          "16": "simt.indirect_load.fp16.warp_instructions_16.startup_cost"
+        }
+      },
+      "scope_handoff": {
+        "fixed_scope_system_cycles": 1336,
+        "input_handoff_bytes_per_system_cycle": 85.33333333333333,
+        "output_handoff_bytes_per_system_cycle": 102.4,
+        "description": "One Stage materializes as one compound scope.scope; Mixed is illegal for a single Stage. The route formula is C_scope = C_body + C_boundary_data + C_fixed_scope, where C_boundary_data = F*B_in/R_in + F*B_out/R_out is charged to the selected Stage body and C_fixed_scope is the only per-physical-group scope handoff term. These uncalibrated fallbacks preserve the previous full-active-lane numerical result (668+668, 1/(1/256+1/128), 1/(1/128+1/512)) but do not claim independently measurable directional constants or per-thread UB bandwidth. Replace them with exact-lowering empty/input/output scope sweeps."
+      },
+      "source": "Ascend950PR versioned microbenchmark evidence. The issue floor is an observable conservative bound, not a claimed microarchitecture peak. Control instructions enter that shared floor but do not receive fabricated additive latency. Loaded-index loads use the measured operation-shape curve; scope hand-off retains explicitly marked fallback parameters.",
+      "store_footprint_service": {
+        "unit_bytes": 128,
+        "system_cycles_per_unit": 1.8409989336914707,
+        "issue_floor_by_warps": {
+          "4": 20.987595419847327,
+          "8": 29.989026724663223,
+          "16": 61.518129775042766
+        },
+        "evidence": "950pr_simt_layout_service_20260918.json reproduces the fit: 950PR device4, full sweep ew6SfU, 36 held-out layout/warp points, max slope error 5.216%. SYS_CNT, 64-bit/lane, hot GM. Online use restricted to nonpacked nonoverlapping rows: packed issue-floor transfer failed in grouped repeat Xw1NYC. Service estimate only, not first-round, barrier, private/shared, layout-conversion or complete Stage calibration."
+      }
+    }
+  }
+}
