@@ -187,7 +187,7 @@ llvm::json::Object AtomicWorkload::toJSON() const {
 }
 
 bool StageWorkload::isFiniteAndNonNegative() const {
-  const std::array<double, 15> values = {scalarOperations,
+  const std::array<double, 17> values = {scalarOperations,
                                          loadBytes,
                                          storeBytes,
                                          loadWarpInstructions,
@@ -201,7 +201,9 @@ bool StageWorkload::isFiniteAndNonNegative() const {
                                          scanShuffleLaneSteps,
                                          dotFlops,
                                          issueElements,
-                                         estimatedSpillTransactions};
+                                         estimatedSpillTransactions,
+                                         scalarLoadCount,
+                                         scalarStoreCount};
   if (!std::all_of(
           values.begin(), values.end(),
           [](double value) { return std::isfinite(value) && value >= 0.0; }) ||
@@ -253,6 +255,8 @@ llvm::json::Object StageWorkload::toJSON() const {
   result["issue_elements_per_iteration"] = issueElements;
   result["estimated_spill_transactions_per_iteration"] =
       estimatedSpillTransactions;
+  result["scalar_load_count_per_iteration"] = scalarLoadCount;
+  result["scalar_store_count_per_iteration"] = scalarStoreCount;
   result["pays_kernel_setup"] = paysKernelSetup;
   return result;
 }

@@ -25,7 +25,8 @@ using namespace mlir::ascend;
 namespace {
 
 static void recomputeIssueElements(StageWorkload &work) {
-  double elements = work.scalarOperations + work.predicateElements;
+  double elements = work.scalarOperations + work.predicateElements +
+                    work.scalarLoadCount + work.scalarStoreCount;
   for (const auto &entry : work.operationElements)
     elements += entry.second;
   elements += 32.0 * (work.loadWarpInstructions + work.storeWarpInstructions);
@@ -251,6 +252,9 @@ static AtomicWorkload getAtomicWorkload(Operation *operation) {
   return atomic;
 }
 
+static bool isScalarLoadOperation(Operation *op);
+static bool isScalarStoreOperation(Operation *op);
+
 static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
   if (!operation || operation->hasTrait<OpTrait::IsTerminator>())
     return;
@@ -260,6 +264,10 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
   if ((name == "tt.load" || name == "tt.gather") &&
       operation->getNumResults() > 0) {
     Value result = operation->getResult(0);
+    if (isScalarLoadOperation(operation)) {
+      work.scalarLoadCount += 1.0;
+      return;
+    }
     const double bytes = getValueBytes(result);
     const double logicalMemoryGroups = std::ceil(elements / 32.0);
     work.loadBytes += bytes;
@@ -272,6 +280,10 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
   }
   if (name == "tt.store" && operation->getNumOperands() > 1) {
     Value value = operation->getOperand(1);
+    if (isScalarStoreOperation(operation)) {
+      work.scalarStoreCount += 1.0;
+      return;
+    }
     const double bytes = getValueBytes(value);
     const double logicalMemoryGroups =
         std::ceil(getTypeElementCount(value.getType()) / 32.0);
@@ -328,6 +340,8 @@ static void scaleWorkload(StageWorkload &work, double scale) {
   work.scanShuffleLaneSteps *= scale;
   work.dotFlops *= scale;
   work.estimatedSpillTransactions *= scale;
+  work.scalarLoadCount *= scale;
+  work.scalarStoreCount *= scale;
   for (auto &entry : work.operationElements)
     entry.second *= scale;
   recomputeIssueElements(work);
@@ -426,6 +440,8 @@ static void mergeWorkload(StageWorkload &into, StageWorkload from) {
   into.scanShuffleLaneSteps += from.scanShuffleLaneSteps;
   into.dotFlops += from.dotFlops;
   into.estimatedSpillTransactions += from.estimatedSpillTransactions;
+  into.scalarLoadCount += from.scalarLoadCount;
+  into.scalarStoreCount += from.scalarStoreCount;
   for (const auto &[name, elements] : from.operationElements)
     into.operationElements[name] += elements;
   recomputeIssueElements(into);
@@ -623,6 +639,33 @@ static bool operationTreeHasAnyName(Operation *root,
   });
 }
 
+/// A scalar GM access has a non-shaped value/result; tile accesses are shaped.
+static bool isScalarLoadOperation(Operation *op) {
+  return op && op->getName().getStringRef() == "tt.load" &&
+         op->getNumResults() > 0 &&
+         !isa<ShapedType>(op->getResult(0).getType());
+}
+
+static bool isScalarStoreOperation(Operation *op) {
+  return op && op->getName().getStringRef() == "tt.store" &&
+         op->getNumOperands() > 1 &&
+         !isa<ShapedType>(op->getOperand(1).getType());
+}
+
+static bool operationTreeHasScalarMemory(Operation *root, bool wantStore) {
+  auto matches = [&](Operation *op) {
+    return wantStore ? isScalarStoreOperation(op) : isScalarLoadOperation(op);
+  };
+  bool found = matches(root);
+  if (found || !root)
+    return found;
+  root->walk([&](Operation *nested) {
+    if (!found)
+      found = matches(nested);
+  });
+  return found;
+}
+
 /// Operand index of the (optional) mask predicate of a memory operation.
 static std::optional<unsigned> getMemoryMaskOperandIndex(Operation *operation) {
   const llvm::StringRef name = operation->getName().getStringRef();
@@ -789,6 +832,12 @@ static StageCostModelKind classifySemanticRoot(Operation *root) {
           root, {"tt.fp_to_fp", "arith.extf", "arith.truncf", "arith.fptosi",
                  "arith.fptoui", "arith.sitofp", "arith.uitofp"}))
     return StageCostModelKind::ConversionPack;
+  const bool hasScalarLoad = operationTreeHasScalarMemory(root, false);
+  const bool hasScalarStore = operationTreeHasScalarMemory(root, true);
+  if (hasScalarStore && !hasScalarLoad)
+    return StageCostModelKind::ScalarStore;
+  if (hasScalarLoad || hasScalarStore)
+    return StageCostModelKind::ScalarLoad;
   const bool hasLoad = operationTreeHasAnyName(root, {"tt.load"});
   const bool hasStore = operationTreeHasAnyName(root, {"tt.store"});
   if (hasStore && !hasLoad)
@@ -1100,6 +1149,9 @@ static int semanticKindPriority(StageCostModelKind kind) {
   case StageCostModelKind::PredicateMask:
   case StageCostModelKind::LoopPredicate:
     return 20;
+  case StageCostModelKind::ScalarLoad:
+  case StageCostModelKind::ScalarStore:
+    return 35;
   case StageCostModelKind::IndexGeneration:
     return 10;
   default:
@@ -1348,11 +1400,15 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
       if (name.contains("barrier") || name.contains("sync"))
         ++facts.synchronizationCount;
       if (name == "tt.load" || name == "tt.store" || name == "tt.gather") {
-        hasMemory = true;
-        const bool indirect =
-            isLoadedIndexDependentMemoryOp(operation) || name == "tt.gather";
-        facts.hasIndirectMemory |= indirect;
-        hasContiguousMemory |= !indirect;
+        const bool scalarLoad = isScalarLoadOperation(operation);
+        const bool scalarStore = isScalarStoreOperation(operation);
+        if (!scalarLoad && !scalarStore) {
+          hasMemory = true;
+          const bool indirect =
+              isLoadedIndexDependentMemoryOp(operation) || name == "tt.gather";
+          facts.hasIndirectMemory |= indirect;
+          hasContiguousMemory |= !indirect;
+        }
       }
       if (name.starts_with("tt.atomic")) {
         hasMemory = true;
@@ -1395,8 +1451,8 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
                                          int64_t tinyDotFlopsMax) const {
   if (!partition.operationOwnershipComplete)
     return llvm::Error::success();
-  auto compatible = [](StageCostModelKind kind,
-                       const StageModelFeatures &facts) {
+  auto compatible = [](StageCostModelKind kind, const StageModelFeatures &facts,
+                       const StageWorkload &workload) {
     switch (kind) {
     case StageCostModelKind::LoopCarriedRecurrence:
       return facts.hasLoopCarriedDataDependency;
@@ -1421,6 +1477,10 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
       return facts.hasContiguousMemory;
     case StageCostModelKind::ConversionPack:
       return facts.hasConversionPack;
+    case StageCostModelKind::ScalarLoad:
+      return workload.scalarLoadCount > 0.0 && !facts.hasContiguousMemory;
+    case StageCostModelKind::ScalarStore:
+      return workload.scalarStoreCount > 0.0 && !facts.hasContiguousMemory;
     default:
       return true;
     }
@@ -1459,6 +1519,10 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
         return StageCostModelKind::IndirectGatherMemory;
       if (facts.hasConversionPack)
         return StageCostModelKind::ConversionPack;
+      if (stage.workload.scalarLoadCount > 0.0 && !facts.hasContiguousMemory)
+        return StageCostModelKind::ScalarLoad;
+      if (stage.workload.scalarStoreCount > 0.0 && !facts.hasContiguousMemory)
+        return StageCostModelKind::ScalarStore;
       if (facts.hasContiguousMemory)
         return stage.workload.storeBytes > 0.0 &&
                        stage.workload.loadBytes == 0.0
@@ -1470,9 +1534,9 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
     // Strong operation-graph semantics are authoritative.  Scalar
     // sub-kinds remain useful only when no dominant structure is present.
     if (semanticKindPriority(derived) > 0 ||
-        !compatible(stage.costModelKind, facts))
+        !compatible(stage.costModelKind, facts, stage.workload))
       stage.costModelKind = derived;
-    if (!compatible(stage.costModelKind, facts) ||
+    if (!compatible(stage.costModelKind, facts, stage.workload) ||
         (stage.costModelKind == StageCostModelKind::TinyCubeRoofline &&
          stage.workload.dotFlops * stage.iterationCount >
              static_cast<double>(std::max<int64_t>(1, tinyDotFlopsMax))))

@@ -192,7 +192,19 @@
         "divergent_branch_penalty_system_cycles": 0.0,
         "synchronization_system_cycles": 1.0
       },
-      "source": "Ascend950 microarchitecture issue limits plus provisional conservative dependency rates; replace numeric seeds only through versioned CaModel/microbenchmark evidence."
+      "source": "Ascend950 microarchitecture issue limits plus provisional conservative dependency rates; replace numeric seeds only through versioned CaModel/microbenchmark evidence.",
+      "scalar_memory": {
+        "description": "SIMD scalar white-box: MainScalar load T=prep+fill+max(0,K-outstanding)*extra_line+(K-1)*issue; Triton scalar store lowers to MTE3 T=prep+fill for the K=1 stages used by the target kernels. Values are CAModel core cycles converted by 988.9/1800.",
+        "main_load_prep_system_cycles": 3.8457222222222223,
+        "main_load_fill_system_cycles": 241.73111111111112,
+        "main_load_issue_system_cycles": 1.6481666666666668,
+        "main_load_outstanding_line_count": 2,
+        "main_load_extra_line_low_system_cycles": 137.34722222222223,
+        "main_load_extra_line_high_system_cycles": 192.28611111111113,
+        "main_load_extra_line_high_threshold": 4,
+        "mte3_store_prep_system_cycles": 10.98777777777778,
+        "mte3_store_fill_system_cycles": 247.22500000000002
+      }
     }
   },
   "simt": {
@@ -383,7 +395,14 @@
         "simt_ub_store_bytes_per_thread_per_system_cycle": 4.0,
         "description": "Only exact tensor values captured by or returned from scope.scope are charged. A value crosses the distinct SIMD/SIMT register files through UB: producer store plus consumer load. The fixed pair is the measured operational intercept of one complete local SIMD-to-SIMT-to-SIMD scope and includes VF entry/prologue and exit/epilogue, but excludes tensor handoff bytes and SIMT body work. One scope-local SuperBlock group pays this fixed pair once, so the per-logical-program route score amortizes only the fixed term by factor; UB bytes and Stage work remain unscaled."
       },
-      "source": "Ascend950 SIMT issue limits plus provisional conservative dependency/reconvergence, SuperBlock state-pressure, and scope hand-off rates; replace numeric seeds only through versioned CaModel/microbenchmark evidence."
+      "source": "Ascend950 SIMT issue limits plus provisional conservative dependency/reconvergence, SuperBlock state-pressure, and scope hand-off rates; replace numeric seeds only through versioned CaModel/microbenchmark evidence.",
+      "scalar_memory": {
+        "description": "SIMT warp-uniform scalar white-box: diff-line load T=prep+fill+(K-1)*issue (fill=480 joint refit); first scalar store T=base. Values are CAModel core cycles converted by 988.9/1800.",
+        "uniform_load_prep_system_cycles": 3.2963333333333336,
+        "uniform_load_fill_system_cycles": 263.7066666666667,
+        "uniform_load_diff_line_issue_system_cycles": 0.5493888888888889,
+        "uniform_store_base_system_cycles": 247.22500000000002
+      }
     },
     "mixed_setup_fallback": {
       "1": {

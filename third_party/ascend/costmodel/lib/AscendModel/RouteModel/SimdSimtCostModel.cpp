@@ -248,6 +248,46 @@ static void readStageResources(ProfileJSONReader &reader,
   if (const auto *scan = resources->getObject("prefix_scan"))
     profile.prefixScanDependencyFactor =
         reader.number(*scan, "dependency_factor", prefix + ".prefix_scan");
+  if (const auto *scalar = reader.object(*resources, "scalar_memory", prefix)) {
+    const std::string path = prefix + ".scalar_memory";
+    profile.mainScalarLoadPrepCycles =
+        reader.optionalNumber(*scalar, "main_load_prep_system_cycles",
+                              profile.mainScalarLoadPrepCycles);
+    profile.mainScalarLoadFillCycles =
+        reader.optionalNumber(*scalar, "main_load_fill_system_cycles",
+                              profile.mainScalarLoadFillCycles);
+    profile.mainScalarLoadIssueCycles =
+        reader.optionalNumber(*scalar, "main_load_issue_system_cycles",
+                              profile.mainScalarLoadIssueCycles);
+    profile.mainScalarLoadOutstandingLines =
+        reader.optionalNumber(*scalar, "main_load_outstanding_line_count",
+                              profile.mainScalarLoadOutstandingLines);
+    profile.mainScalarLoadExtraLineLowCycles =
+        reader.optionalNumber(*scalar, "main_load_extra_line_low_system_cycles",
+                              profile.mainScalarLoadExtraLineLowCycles);
+    profile.mainScalarLoadExtraLineHighCycles = reader.optionalNumber(
+        *scalar, "main_load_extra_line_high_system_cycles",
+        profile.mainScalarLoadExtraLineHighCycles);
+    profile.mainScalarLoadExtraLineHighThreshold =
+        reader.optionalNumber(*scalar, "main_load_extra_line_high_threshold",
+                              profile.mainScalarLoadExtraLineHighThreshold);
+    profile.simtUniformLoadPrepCycles =
+        reader.optionalNumber(*scalar, "uniform_load_prep_system_cycles",
+                              profile.simtUniformLoadPrepCycles);
+    profile.simtUniformLoadFillCycles =
+        reader.optionalNumber(*scalar, "uniform_load_fill_system_cycles",
+                              profile.simtUniformLoadFillCycles);
+    profile.simtUniformLoadDiffLineIssueCycles = reader.optionalNumber(
+        *scalar, "uniform_load_diff_line_issue_system_cycles",
+        profile.simtUniformLoadDiffLineIssueCycles);
+    profile.mte3StorePrepCycles = reader.optionalNumber(
+        *scalar, "mte3_store_prep_system_cycles", profile.mte3StorePrepCycles);
+    profile.mte3StoreFillCycles = reader.optionalNumber(
+        *scalar, "mte3_store_fill_system_cycles", profile.mte3StoreFillCycles);
+    profile.simtUniformStoreBaseCycles =
+        reader.optionalNumber(*scalar, "uniform_store_base_system_cycles",
+                              profile.simtUniformStoreBaseCycles);
+  }
   if (const auto *indirect =
           reader.object(*resources, "indirect_memory", prefix)) {
     const std::string path = prefix + ".indirect_memory";
