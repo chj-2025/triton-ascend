@@ -58,6 +58,33 @@ static bool permitsSimdOverlap(const LogicalStage &stage) {
          stage.features.permitsSimdRoofline();
 }
 
+// Scalar white-box terms, already in the profile's SYS_CNT cycle domain.
+static double mainScalarLoadCycles(double count,
+                                   const StageModeProfile &profile) {
+  const double k = std::max(1.0, count);
+  const double perLine = k <= profile.mainScalarLoadExtraLineHighThreshold
+                             ? profile.mainScalarLoadExtraLineLowCycles
+                             : profile.mainScalarLoadExtraLineHighCycles;
+  return profile.mainScalarLoadPrepCycles + profile.mainScalarLoadFillCycles +
+         std::max(0.0, k - profile.mainScalarLoadOutstandingLines) * perLine +
+         (k - 1.0) * profile.mainScalarLoadIssueCycles;
+}
+
+static double simtUniformLoadCycles(double count,
+                                    const StageModeProfile &profile) {
+  return profile.simtUniformLoadPrepCycles + profile.simtUniformLoadFillCycles +
+         (std::max(1.0, count) - 1.0) *
+             profile.simtUniformLoadDiffLineIssueCycles;
+}
+
+static double mte3StoreCycles(const StageModeProfile &profile) {
+  return profile.mte3StorePrepCycles + profile.mte3StoreFillCycles;
+}
+
+static double simtUniformStoreCycles(const StageModeProfile &profile) {
+  return profile.simtUniformStoreBaseCycles;
+}
+
 static StageResourceCycles
 materializeControlFlow(const LogicalStage &stage, StageMode mode,
                        StageResourceCycles resources,
@@ -140,6 +167,15 @@ static StageResourceCycles mapWorkload(const LogicalStage &stage,
     if (atomic.resultUsed)
       resources.atomic +=
           atomic.logicalOperationInstances * atomicRate.resultDependencyCycles;
+  }
+  if (work.scalarLoadCount > 0.0) {
+    resources.load +=
+        simd ? mainScalarLoadCycles(work.scalarLoadCount, profile)
+             : simtUniformLoadCycles(work.scalarLoadCount, profile);
+  }
+  if (work.scalarStoreCount > 0.0) {
+    resources.store +=
+        simd ? mte3StoreCycles(profile) : simtUniformStoreCycles(profile);
   }
   resources.predicate =
       (simd ? std::ceil(work.predicateElements /
@@ -378,6 +414,10 @@ llvm::StringRef mlir::ascend::stringifyStageCostModel(StageCostModelKind kind) {
     return "scalar_control";
   case StageCostModelKind::ScalarMath:
     return "scalar_math";
+  case StageCostModelKind::ScalarLoad:
+    return "scalar_load";
+  case StageCostModelKind::ScalarStore:
+    return "scalar_store";
   case StageCostModelKind::IndexGeneration:
     return "index_generation";
   case StageCostModelKind::PredicateMask:

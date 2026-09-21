@@ -28,6 +28,8 @@ enum class StageCostModelKind {
   ScalarIssue,
   ScalarControl,
   ScalarMath,
+  ScalarLoad,
+  ScalarStore,
   IndexGeneration,
   PredicateMask,
   LoopPredicate,
@@ -139,6 +141,20 @@ struct StageModeProfile {
   double scalarOperationsPerCycle = 0.0;
   double issueOperationsPerCycle = 0.0;
   double spillTransactionsPerCycle = 0.0;
+  /// Scalar white-box terms in SYS_CNT cycles (CAModel 1.8GHz + 988.9/1800).
+  double mainScalarLoadPrepCycles = 0.0;
+  double mainScalarLoadFillCycles = 0.0;
+  double mainScalarLoadIssueCycles = 0.0;
+  double mainScalarLoadOutstandingLines = 0.0;
+  double mainScalarLoadExtraLineLowCycles = 0.0;
+  double mainScalarLoadExtraLineHighCycles = 0.0;
+  double mainScalarLoadExtraLineHighThreshold = 0.0;
+  double simtUniformLoadPrepCycles = 0.0;
+  double simtUniformLoadFillCycles = 0.0;
+  double simtUniformLoadDiffLineIssueCycles = 0.0;
+  double mte3StorePrepCycles = 0.0;
+  double mte3StoreFillCycles = 0.0;
+  double simtUniformStoreBaseCycles = 0.0;
   /// Loaded-index memory cannot use the continuous MTE/LSU throughput model.
   /// These rates operate on logical warp/transaction counts and include one
   /// uncovered dependency latency per Stage iteration.

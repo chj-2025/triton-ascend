@@ -134,6 +134,9 @@ struct StageWorkload {
   double dotFlops = 0.0;
   double issueElements = 0.0;
   double estimatedSpillTransactions = 0.0;
+  /// Scalar GM operations owned by this Stage per iteration.
+  double scalarLoadCount = 0.0;
+  double scalarStoreCount = 0.0;
   bool paysKernelSetup = false;
 
   bool isFiniteAndNonNegative() const;
