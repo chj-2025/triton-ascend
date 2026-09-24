@@ -415,16 +415,18 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
 
   const auto *simd = reader.object(*root, "simd", "profile");
   if (simd) {
+    int64_t vectorWidthBits = 0;
     if (simd->getString("vector_width_measurement")) {
-      hardware.simd.vectorWidth = std::max<int64_t>(
-          1, static_cast<int64_t>(std::llround(resolveNumberOrMeasurement(
-                 *simd, "vector_width_bits", "vector_width_measurement", "bit",
-                 microbench, reader, "simd"))) /
-                 32);
+      vectorWidthBits =
+          static_cast<int64_t>(std::llround(resolveNumberOrMeasurement(
+              *simd, "vector_width_bits", "vector_width_measurement", "bit",
+              microbench, reader, "simd")));
     } else {
-      hardware.simd.vectorWidth = std::max<int64_t>(
-          1, reader.integer(*simd, "vector_width_bits", "simd") / 32);
+      vectorWidthBits = reader.integer(*simd, "vector_width_bits", "simd");
     }
+    hardware.simd.vectorWidthBits = std::max<int64_t>(1, vectorWidthBits);
+    hardware.simd.vectorWidth =
+        std::max<int64_t>(1, hardware.simd.vectorWidthBits / 32);
     hardware.simd.issueWidth = hardware.simd.vectorWidth;
     if (const auto *startup =
             reader.object(*simd, "startup_system_cycles", "simd"))
@@ -469,6 +471,7 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
       hardware.simt.issueWidth = reader.integer(*simt, "warp_size", "simt");
     }
     hardware.simt.vectorWidth = 1;
+    hardware.simt.vectorWidthBits = 1;
     if (const auto *setup =
             reader.object(*simt, "setup_system_cycles", "simt")) {
       hardware.simt.setupCycles = resolveNumberOrMeasurement(

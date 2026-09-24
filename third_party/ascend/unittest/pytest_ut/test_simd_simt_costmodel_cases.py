@@ -98,6 +98,200 @@ def _assert_performance(case, launch, profile_root, documented_us, tolerance=1.2
     assert duration_us <= maximum_us
 
 
+# The original TopK validation matrix has device-reference failures in cases
+# 02/03/05/06/07/10.  Keep only the four shapes that passed the device
+# reference check, while covering both expected route families.
+TOPK_INDEX_MERGE_CASES = [
+    pytest.param(1, 1, 256, 4, 2, "all_simd", id="01-b1-h1-b256-k4-c2"),
+    pytest.param(8, 8, 2048, 32, 8, "all_simt_only", id="04-b8-h8-b2048-k32-c8"),
+    pytest.param(8, 8, 4096, 32, 8, "all_simt_only", id="08-b8-h8-b4096-k32-c8"),
+    pytest.param(8, 4, 8192, 32, 8, "all_simt_only", id="09-b8-h4-b8192-k32-c8"),
+]
+
+TOPK_INDEX_MERGE_HEURISTICS = {
+    "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"]),
+    "BLOCK_SIZE_K": lambda args: triton.next_power_of_2(args["num_topk_chunks"] * triton.next_power_of_2(args["topk"])),
+}
+
+
+@triton.jit
+def _topk_compare_and_swap(x, ids, flip, i: tl.constexpr, n_dims: tl.constexpr):
+    n_outer: tl.constexpr = x.numel >> n_dims
+    shape: tl.constexpr = [n_outer * 2**i, 2, 2**(n_dims - i - 1)]
+    y = tl.reshape(x, shape)
+    mask = tl.arange(0, 2)[None, :, None]
+    left = tl.broadcast_to(tl.sum(y * (1 - mask), 1)[:, None, :], shape).to(y.dtype)
+    right = tl.broadcast_to(tl.sum(y * mask, 1)[:, None, :], shape).to(y.dtype)
+    left = tl.reshape(left, x.shape)
+    right = tl.reshape(right, x.shape)
+    y_idx = tl.reshape(ids, shape)
+    left_idx = tl.broadcast_to(tl.sum(y_idx * (1 - mask), 1)[:, None, :], shape)
+    right_idx = tl.broadcast_to(tl.sum(y_idx * mask, 1)[:, None, :], shape)
+    left_idx = tl.reshape(left_idx, x.shape).to(y_idx.dtype)
+    right_idx = tl.reshape(right_idx, x.shape).to(y_idx.dtype)
+    idtype = tl.core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
+    ileft = left.to(idtype, bitcast=True)
+    iright = right.to(idtype, bitcast=True)
+    ix = x.to(idtype, bitcast=True)
+    cond = (left > right) != flip
+    values = ix ^ tl.where(cond, ileft ^ iright, tl.zeros_like(ix))
+    new_ids = ids ^ tl.where(cond, left_idx ^ right_idx, tl.zeros_like(ids))
+    return values.to(x.dtype, bitcast=True), new_ids
+
+
+@triton.jit
+def _topk_bitonic_merge(x, ids, stage: tl.constexpr, order: tl.constexpr, n_dims: tl.constexpr):
+    n_outer: tl.constexpr = x.numel >> n_dims
+    tl.static_assert(stage <= n_dims)
+    if order == 2:
+        shape: tl.constexpr = [n_outer * 2**(n_dims - 1 - stage), 2, 2**stage]
+        flip = tl.reshape(tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape)
+    else:
+        flip = order
+    for i in tl.static_range(stage):
+        x, ids = _topk_compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
+    return x, ids
+
+
+@triton.heuristics(TOPK_INDEX_MERGE_HEURISTICS)
+@triton.jit(do_not_specialize=["num_topk_chunks", "decode_query_len"])
+def topk_index_merge_costmodel_kernel(
+    partial_scores,
+    partial_indices,
+    final_indices,
+    sequence_lengths,
+    block_size: tl.constexpr,
+    topk: tl.constexpr,
+    decode_query_len,
+    stride_scores_chunk,
+    stride_scores_head,
+    stride_scores_batch,
+    stride_scores_topk,
+    stride_indices_chunk,
+    stride_indices_head,
+    stride_indices_batch,
+    stride_indices_topk,
+    stride_final_head,
+    stride_final_batch,
+    stride_final_topk,
+    num_topk_chunks,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    pid_batch = tl.program_id(0)
+    pid_head = tl.program_id(1)
+    request_id = pid_batch // decode_query_len
+    query_offset = pid_batch - request_id * decode_query_len
+    sequence_length = tl.load(sequence_lengths + request_id)
+    kv_length = tl.maximum(sequence_length - decode_query_len + query_offset + 1, 0)
+    num_blocks = (kv_length + block_size - 1) // block_size
+    offset = tl.arange(0, BLOCK_SIZE_K)
+    chunk_index = offset // BLOCK_SIZE_T
+    in_chunk_index = offset % BLOCK_SIZE_T
+    valid = chunk_index < num_topk_chunks
+    score_offset = (chunk_index * stride_scores_chunk + pid_head * stride_scores_head +
+                    pid_batch * stride_scores_batch + in_chunk_index * stride_scores_topk)
+    index_offset = (chunk_index * stride_indices_chunk + pid_head * stride_indices_head +
+                    pid_batch * stride_indices_batch + in_chunk_index * stride_indices_topk)
+    scores = tl.load(partial_scores + score_offset, mask=valid, other=-1e30).to(tl.float32)
+    scores = tl.where(scores != scores, -1e30, scores)
+    indices = tl.load(partial_indices + index_offset, mask=valid, other=0).to(tl.int32)
+    n_dims: tl.constexpr = tl.standard._log2(BLOCK_SIZE_K)
+    for stage in tl.static_range(1, n_dims):
+        scores, indices = _topk_bitonic_merge(scores, indices, stage, 2, n_dims)
+    scores, indices = _topk_bitonic_merge(scores, indices, n_dims, True, n_dims)
+    extract = tl.arange(0, BLOCK_SIZE_K // BLOCK_SIZE_T) == 0
+    result = tl.sum(
+        extract[:, None] * tl.reshape(indices - 1, [BLOCK_SIZE_K // BLOCK_SIZE_T, BLOCK_SIZE_T]),
+        axis=0,
+    )
+    topk_offset = tl.arange(0, BLOCK_SIZE_T)
+    output = (final_indices + pid_head * stride_final_head + pid_batch * stride_final_batch +
+              topk_offset * stride_final_topk)
+    result = tl.where(topk_offset < tl.minimum(topk, num_blocks), result, -1)
+    tl.store(output, result, mask=topk_offset < topk)
+
+
+def _topk_index_merge_reference(scores, indices, topk):
+    heads, total_queries = scores.shape[1:3]
+    flat_scores = scores.permute(1, 2, 0, 3).reshape(heads, total_queries, -1)
+    flat_indices = indices.permute(1, 2, 0, 3).reshape(heads, total_queries, -1)
+    selected = flat_scores.topk(topk, dim=-1).indices
+    return torch.gather(flat_indices, -1, selected) - 1
+
+
+@simd_simt_910_95_only
+@pytest.mark.parametrize(
+    "batch,heads,max_block,topk,num_topk_chunks,expected_route",
+    TOPK_INDEX_MERGE_CASES,
+)
+def test_costmodel_topk_index_merge_end_to_end(
+    batch,
+    heads,
+    max_block,
+    topk,
+    num_topk_chunks,
+    expected_route,
+    tmp_path,
+):
+    torch.manual_seed(1234)
+    query_length = 1
+    block_size = 128
+    block_topk = triton.next_power_of_2(topk)
+    sequence_lengths = torch.full((batch, ), max_block * block_size, dtype=torch.int32, device="npu")
+    partial_scores = torch.randn(
+        (num_topk_chunks, heads, batch * query_length, block_topk),
+        device="npu",
+    )
+    partial_indices = torch.randint(
+        1,
+        128,
+        partial_scores.shape,
+        dtype=torch.int32,
+        device="npu",
+    )
+    final_indices = torch.empty((heads, batch * query_length, topk), dtype=torch.int32, device="npu")
+    report_path = tmp_path / "topk_index_merge_route.json"
+    logical_programs = batch * query_length * heads
+
+    topk_index_merge_costmodel_kernel[(batch * query_length, heads)](
+        partial_scores,
+        partial_indices,
+        final_indices,
+        sequence_lengths,
+        block_size,
+        topk,
+        query_length,
+        partial_scores.stride(0),
+        partial_scores.stride(1),
+        partial_scores.stride(2),
+        partial_scores.stride(3),
+        partial_indices.stride(0),
+        partial_indices.stride(1),
+        partial_indices.stride(2),
+        partial_indices.stride(3),
+        final_indices.stride(0),
+        final_indices.stride(1),
+        final_indices.stride(2),
+        num_topk_chunks,
+        **_launch_options(report_path, logical_programs),
+    )
+    torch.npu.synchronize()
+
+    expected = _topk_index_merge_reference(partial_scores.cpu(), partial_indices.cpu(), topk)
+    # The kernel contract does not require an order among the selected
+    # indices. Sorting both sides preserves multiplicity, unlike the old
+    # set-based validation used by the out-of-tree performance harness.
+    torch.testing.assert_close(
+        final_indices.cpu().sort(dim=-1).values,
+        expected.sort(dim=-1).values,
+        rtol=0,
+        atol=0,
+    )
+    report = _load_route_report(report_path, expected_route)
+    assert report["logical_program_count_hint"] == logical_programs
+
+
 @triton.jit
 def gather_dot_min(
     a_ptr,

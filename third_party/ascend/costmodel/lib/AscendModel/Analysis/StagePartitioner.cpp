@@ -168,6 +168,123 @@ static llvm::StringRef getProfileOperationName(Operation *operation) {
       .Default("generic.issue");
 }
 
+static RankedTensorType getRepresentativeTensorType(Operation *operation) {
+  RankedTensorType representative;
+  int64_t maximumElements = -1;
+  auto consider = [&](Type type) {
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    if (!tensor || !tensor.hasStaticShape())
+      return;
+    const int64_t elements = tensor.getNumElements();
+    if (elements > maximumElements) {
+      representative = tensor;
+      maximumElements = elements;
+    }
+  };
+  for (Type type : operation->getResultTypes())
+    consider(type);
+  if (!representative)
+    for (Value operand : operation->getOperands())
+      consider(operand.getType());
+  return representative;
+}
+
+// Project the dense, static pointwise subset of HIVM's uniform reassociation.
+// Flatten first drops unit dimensions, then merges adjacent dimensions only
+// when all operands agree on their broadcast role. The returned width is the
+// final collapse group's extent, not the original TTIR last dimension.
+// Physical UB strides, inline transposes and inter-op layout constraints are
+// not present in TTIR: this is a projection, not an invocation of lowering.
+static int64_t getPostFlattenPointwiseRun(Operation *operation,
+                                          RankedTensorType outputType) {
+  SmallVector<int64_t> activeAxes;
+  for (int64_t axis = 0; axis < outputType.getRank(); ++axis)
+    if (outputType.getDimSize(axis) > 1)
+      activeAxes.push_back(axis);
+  if (activeAxes.empty())
+    return 1;
+  SmallVector<bool> mergeWithPrevious(activeAxes.size(), true);
+  for (Value operand : operation->getOperands()) {
+    if (Operation *producer = operand.getDefiningOp()) {
+      const llvm::StringRef producerName = producer->getName().getStringRef();
+      if (producerName == "tt.broadcast" && producer->getNumOperands() == 1)
+        operand = producer->getOperand(0);
+    }
+    auto input = dyn_cast<RankedTensorType>(operand.getType());
+    if (!input || !input.hasStaticShape() ||
+        input.getRank() != outputType.getRank())
+      continue;
+    // A scalar splat does not introduce a row boundary.
+    if (input.getNumElements() == 1)
+      continue;
+    for (size_t i = 1; i < activeAxes.size(); ++i) {
+      const int64_t left = activeAxes[i - 1];
+      const int64_t right = activeAxes[i];
+      // HIVM's broadcast path checks input consistency as well as target
+      // dimensions; do not merge across either side of a broadcast axis.
+      if (input.getDimSize(left) != outputType.getDimSize(left) ||
+          input.getDimSize(right) != outputType.getDimSize(right))
+        mergeWithPrevious[i] = false;
+    }
+  }
+  int64_t run = outputType.getDimSize(activeAxes.back());
+  for (size_t i = activeAxes.size() - 1; i > 0 && mergeWithPrevious[i]; --i)
+    run *= outputType.getDimSize(activeAxes[i - 1]);
+  return run;
+}
+
+static void accumulateTensorOperationWorkload(Operation *operation,
+                                              llvm::StringRef profileName,
+                                              double elements,
+                                              StageWorkload &work) {
+  RankedTensorType tensor = getRepresentativeTensorType(operation);
+  if (!tensor || tensor.getRank() == 0 || !tensor.hasStaticShape())
+    return;
+  int64_t elementBits = getScalarBitWidth(tensor.getElementType());
+  // Comparison results are i1 masks, not the width of the compared data.
+  if (profileName == "predicate.cmp")
+    for (Value operand : operation->getOperands())
+      elementBits = std::max(elementBits, getScalarBitWidth(operand.getType()));
+  // TTIR rank is not physical vector geometry: Auto Flatten can collapse
+  // dense pointwise operations, including rows shorter than a data block.
+  // Geometry follows operation semantics, not the profile's lookup key.
+  // Integer arithmetic/select may use generic.issue but are still pointwise.
+  // Non-pointwise operations retain their original segment estimate.
+  const bool knownPointwise = operation->hasTrait<OpTrait::Elementwise>();
+  const int64_t contiguousElements =
+      knownPointwise ? getPostFlattenPointwiseRun(operation, tensor)
+                     : tensor.getShape().back();
+  if (elementBits <= 0 || contiguousElements <= 0)
+    return;
+  const double segments = elements / static_cast<double>(contiguousElements);
+  // An empty or unknown-geometry tensor clamps its element count to one,
+  // which can yield a fractional segment count. Fractional geometry does
+  // not describe a real tensor; skip the group so mapWorkload falls back
+  // to the legacy per-operation estimate instead of underpricing it.
+  if (segments <= 0.0 || segments != std::floor(segments))
+    return;
+  // Shape alone does not prove scalar lowering, especially on the register
+  // vector backend. Do not infer it from the pre-flatten row stride.
+  // TODO: Model scalar fallback only from proven lowered layout information.
+
+  for (TensorOperationWorkload &group : work.tensorOperationWorkloads) {
+    if (group.operation == profileName &&
+        group.elementBitWidth == elementBits &&
+        group.contiguousElementsPerSegment == contiguousElements) {
+      group.logicalElements += elements;
+      group.segmentCount += segments;
+      return;
+    }
+  }
+  TensorOperationWorkload group;
+  group.operation = profileName.str();
+  group.elementBitWidth = elementBits;
+  group.logicalElements = elements;
+  group.segmentCount = segments;
+  group.contiguousElementsPerSegment = contiguousElements;
+  work.tensorOperationWorkloads.push_back(std::move(group));
+}
+
 static void accumulateDotWorkload(Operation *operation, StageWorkload &work) {
   if (operation->getNumOperands() < 2)
     return;
@@ -307,6 +424,8 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
     accumulateReductionWorkload(operation, work, name == "tt.scan");
   if (name == "arith.cmpi" || name == "arith.cmpf") {
     work.predicateElements += elements;
+    accumulateTensorOperationWorkload(operation, "predicate.cmp", elements,
+                                      work);
     return;
   }
   if (name == "scf.for" || name == "scf.if" || name == "scf.while")
@@ -316,7 +435,9 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
     work.scalarOperations += 1.0;
     return;
   }
-  work.operationElements[getProfileOperationName(operation)] += elements;
+  const llvm::StringRef profileName = getProfileOperationName(operation);
+  work.operationElements[profileName] += elements;
+  accumulateTensorOperationWorkload(operation, profileName, elements, work);
 }
 
 static void mergeWorkload(StageWorkload &into, StageWorkload from);
@@ -334,6 +455,10 @@ static void scaleWorkload(StageWorkload &work, double scale) {
   for (AtomicWorkload &atomic : work.atomicWorkloads) {
     atomic.logicalElements *= scale;
     atomic.logicalOperationInstances *= scale;
+  }
+  for (TensorOperationWorkload &tensor : work.tensorOperationWorkloads) {
+    tensor.logicalElements *= scale;
+    tensor.segmentCount *= scale;
   }
   work.predicateElements *= scale;
   work.shuffleLaneSteps *= scale;
@@ -363,10 +488,24 @@ static int64_t getLoopTripCount(Operation *operation,
   if (name == "scf.for" && operation->getNumOperands() >= 3) {
     const std::optional<int64_t> lower =
         getConstantInteger(operation->getOperand(0));
-    const std::optional<int64_t> upper =
-        getConstantInteger(operation->getOperand(1));
+    std::optional<int64_t> upper = getConstantInteger(operation->getOperand(1));
     const std::optional<int64_t> step =
         getConstantInteger(operation->getOperand(2));
+    // Price a clipped dynamic loop using its static iteration cap instead of
+    // a single iteration. This is an upper-bound cost estimate: a partial
+    // tile may execute fewer iterations at runtime.
+    if (!upper) {
+      Operation *bound = operation->getOperand(1).getDefiningOp();
+      if (bound && bound->getName().getStringRef() == "arith.minsi" &&
+          bound->getNumOperands() == 2) {
+        const auto lhs = getConstantInteger(bound->getOperand(0));
+        const auto rhs = getConstantInteger(bound->getOperand(1));
+        if (lhs && rhs)
+          upper = std::min(*lhs, *rhs);
+        else
+          upper = lhs ? lhs : rhs;
+      }
+    }
     if (lower && upper && step && *step > 0 && *upper > *lower)
       return (*upper - *lower + *step - 1) / *step;
   }
@@ -435,6 +574,22 @@ static void mergeWorkload(StageWorkload &into, StageWorkload from) {
   into.indirectLoadTransactions += from.indirectLoadTransactions;
   into.indirectStoreTransactions += from.indirectStoreTransactions;
   llvm::append_range(into.atomicWorkloads, std::move(from.atomicWorkloads));
+  for (TensorOperationWorkload &source : from.tensorOperationWorkloads) {
+    auto destination =
+        llvm::find_if(into.tensorOperationWorkloads,
+                      [&](const TensorOperationWorkload &item) {
+                        return item.operation == source.operation &&
+                               item.elementBitWidth == source.elementBitWidth &&
+                               item.contiguousElementsPerSegment ==
+                                   source.contiguousElementsPerSegment;
+                      });
+    if (destination == into.tensorOperationWorkloads.end()) {
+      into.tensorOperationWorkloads.push_back(std::move(source));
+      continue;
+    }
+    destination->logicalElements += source.logicalElements;
+    destination->segmentCount += source.segmentCount;
+  }
   into.predicateElements += from.predicateElements;
   into.shuffleLaneSteps += from.shuffleLaneSteps;
   into.scanShuffleLaneSteps += from.scanShuffleLaneSteps;
@@ -1429,8 +1584,9 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
     }
     facts.hasContiguousMemory = hasMemory && hasContiguousMemory;
     if (algorithmLoopCount > 0 && stage.iterationCount > 1) {
-      if (facts.hasLoopCarriedDataDependency)
-        facts.parallelRecurrenceGroupCount = algorithmLoopCount;
+      // Multiple loop operations in one stage do not prove concurrent
+      // execution. In particular, adjacent scf.for loops execute serially;
+      // counting them as parallel groups discounts their dependent work.
       facts.loopBackedgeCount = 1;
       facts.conditionalBranchCount =
           std::max<int64_t>(facts.conditionalBranchCount > 0 ? 1 : 0,
