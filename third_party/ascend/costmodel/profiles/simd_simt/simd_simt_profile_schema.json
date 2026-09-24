@@ -24,7 +24,7 @@
     },
     "schema_version": {
       "const": 12,
-      "description": "Machine-readable Stage Route Model hardware-profile layout. Version 11 adds independent atomic-RMW rates and an explicit unknown-contention policy. Version 12 represents local scope fixed overhead as one measured SIMD-to-SIMT-to-SIMD pair instead of two synthetic directional values."
+      "description": "Machine-readable Stage Route Model hardware-profile layout. Version 11 adds independent atomic-RMW rates and an explicit unknown-contention policy. Version 12 retains the legacy SIMT logical-tensor capacity field and represents local scope fixed overhead as one measured SIMD-to-SIMT-to-SIMD pair instead of two synthetic directional values."
     },
     "profile_version": {
       "type": "string",

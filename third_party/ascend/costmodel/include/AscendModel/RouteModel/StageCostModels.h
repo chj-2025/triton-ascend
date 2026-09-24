@@ -126,6 +126,9 @@ struct StageAtomicRate {
 
 struct StageModeProfile {
   double setupCycles = 0.0;
+  /// Physical SIMD instruction width.  Unlike vectorWidth, this preserves
+  /// bytes/bits so FP16 and FP32 short-axis segments are priced correctly.
+  int64_t vectorWidthBits = 1;
   int64_t vectorWidth = 1;
   int64_t issueWidth = 1;
   llvm::StringMap<StageOperationRate> operationRates;
