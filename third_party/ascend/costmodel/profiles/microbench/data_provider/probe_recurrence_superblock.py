@@ -26,11 +26,8 @@ def row_prefix(row, columns: tl.constexpr):
 
 
 @triton.jit(do_not_specialize=["trips"])
-def recurrence_superblock_probe(source, output, trips,
-                                recurrence_groups: tl.constexpr,
-                                columns: tl.constexpr = 16,
-                                row_stride: tl.constexpr = 16,
-                                grid_x: tl.constexpr = 0,
+def recurrence_superblock_probe(source, output, trips, recurrence_groups: tl.constexpr, columns: tl.constexpr = 16,
+                                row_stride: tl.constexpr = 16, grid_x: tl.constexpr = 0,
                                 diagonal_stride: tl.constexpr = 0):
     pid = tl.program_id(0)
     lane = tl.arange(0, 16)
@@ -97,28 +94,24 @@ def reference(source: torch.Tensor, trips: int, groups: int, columns: int = 16,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--mode", choices=("simd", "simt_only"),
-                        default="simt_only")
+    parser.add_argument("--mode", choices=("simd", "simt_only"), default="simt_only")
     parser.add_argument("--factor", type=int, choices=(1, 2, 4), default=1)
-    parser.add_argument("--trips", type=int, choices=(0, 1, 2, 4, 8, 14),
-                        required=True)
-    parser.add_argument("--recurrence-groups", type=int, choices=(1, 4),
-                        default=4)
+    parser.add_argument("--trips", type=int, choices=(0, 1, 2, 4, 8, 14), required=True)
+    parser.add_argument("--recurrence-groups", type=int, choices=(1, 4), default=4)
     parser.add_argument("--columns", type=int, choices=(8, 16), default=16)
     parser.add_argument("--row-stride", type=int, choices=(16, 2048), default=16)
-    parser.add_argument("--grid-x", type=int, default=0,
-                        help="Zero: disjoint program tiles. Positive: x-fastest logical IDs with 64-column tiles interleaved in each row.")
-    parser.add_argument("--diagonal-stride", type=int, choices=(0, 16), default=0)
     parser.add_argument(
-        "--logical-programs", type=int, default=0,
-        help="Logical grid size; zero uses four waves before SuperBlock grouping.")
+        "--grid-x", type=int, default=0, help=
+        "Zero: disjoint program tiles. Positive: x-fastest logical IDs with 64-column tiles interleaved in each row.")
+    parser.add_argument("--diagonal-stride", type=int, choices=(0, 16), default=0)
+    parser.add_argument("--logical-programs", type=int, default=0,
+                        help="Logical grid size; zero uses four waves before SuperBlock grouping.")
     args = parser.parse_args()
     if args.mode == "simd" and args.factor != 1:
         parser.error("SIMD recurrence measurements require --factor=1")
     args.output.mkdir(parents=True, exist_ok=False)
 
-    vector_cores = int(driver.active.utils.get_device_properties(
-        torch.npu.current_device())["num_vectorcore"])
+    vector_cores = int(driver.active.utils.get_device_properties(torch.npu.current_device())["num_vectorcore"])
     logical_programs = args.logical_programs or vector_cores * 4
     if logical_programs < 1:
         raise ValueError("logical-programs must be positive")
@@ -136,21 +129,20 @@ def main():
             for pid in range(logical_programs)
         ])
     source = source_cpu.npu()
-    output = torch.empty((logical_programs, args.columns), dtype=torch.float32,
-                         device="npu")
+    output = torch.empty((logical_programs, args.columns), dtype=torch.float32, device="npu")
 
     def launch():
         options = {"compile_mode": args.mode, "num_warps": 4}
         if args.mode == "simt_only":
             options["superblock_factor"] = args.factor
-        return recurrence_superblock_probe[(logical_programs,)](
-            source, output, args.trips, args.recurrence_groups,
-            args.columns, args.row_stride, args.grid_x, args.diagonal_stride, **options)
+        return recurrence_superblock_probe[(logical_programs, )](source, output, args.trips, args.recurrence_groups,
+                                                                 args.columns, args.row_stride, args.grid_x,
+                                                                 args.diagonal_stride, **options)
 
     binary = launch()
     torch.testing.assert_close(
-        output.cpu(), reference(reference_source, args.trips, args.recurrence_groups, args.columns, args.diagonal_stride),
-        rtol=2e-3, atol=2e-3)
+        output.cpu(), reference(reference_source, args.trips, args.recurrence_groups, args.columns,
+                                args.diagonal_stride), rtol=2e-3, atol=2e-3)
     for key in ("ttir", "ttadapter", "npuir", "bcmlir", "npubin"):
         value = binary.asm.get(key)
         if isinstance(value, str):
@@ -162,9 +154,8 @@ def main():
         launch()
     torch.npu.synchronize()
     with torch_npu.profiler.profile(
-        activities=[torch_npu.profiler.ProfilerActivity.NPU],
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-            str(args.output / "profile")),
+            activities=[torch_npu.profiler.ProfilerActivity.NPU],
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(args.output / "profile")),
     ) as profiler:
         for _ in range(20):
             launch()
@@ -180,8 +171,8 @@ def main():
     if len(samples) != 20:
         raise RuntimeError(f"expected 20 samples, got {len(samples)}")
     torch.testing.assert_close(
-        output.cpu(), reference(reference_source, args.trips, args.recurrence_groups, args.columns, args.diagonal_stride),
-        rtol=2e-3, atol=2e-3)
+        output.cpu(), reference(reference_source, args.trips, args.recurrence_groups, args.columns,
+                                args.diagonal_stride), rtol=2e-3, atol=2e-3)
     result = {
         "mode": args.mode,
         "factor": args.factor,
@@ -196,17 +187,16 @@ def main():
         "probe_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "binary_metadata": dict(binary.metadata._asdict()),
         "npubin_sha256": hashlib.sha256((args.output / "kernel.npubin").read_bytes()).hexdigest(),
-        "environment": {key: os.environ.get(key) for key in (
-            "ASCEND_RT_VISIBLE_DEVICES", "TRITON_DEBUG",
-            "TRITON_DISABLE_LINE_INFO", "TRITON_CACHE_DIR")},
-        "interpretation": "Whole-kernel shape probe, not an isolated Mixed scope. Full 16-element row loads and reduction depth remain unchanged; slopes require verified group scheduling.",
+        "environment": {
+            key: os.environ.get(key)
+            for key in ("ASCEND_RT_VISIBLE_DEVICES", "TRITON_DEBUG", "TRITON_DISABLE_LINE_INFO", "TRITON_CACHE_DIR")
+        },
+        "interpretation":
+        "Whole-kernel shape probe, not an isolated Mixed scope. Full 16-element row loads and reduction depth remain unchanged; slopes require verified group scheduling.",
         "logical_programs": logical_programs,
-        "physical_programs":
-            (logical_programs + args.factor - 1) // args.factor,
+        "physical_programs": (logical_programs + args.factor - 1) // args.factor,
         "vector_cores": vector_cores,
-        "expected_waves":
-            ((logical_programs + args.factor - 1) // args.factor +
-             vector_cores - 1) // vector_cores,
+        "expected_waves": ((logical_programs + args.factor - 1) // args.factor + vector_cores - 1) // vector_cores,
         "sample_count": len(samples),
         "median_us": statistics.median(samples),
         "samples_us": samples,

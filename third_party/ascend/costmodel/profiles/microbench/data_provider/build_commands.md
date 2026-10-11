@@ -145,7 +145,6 @@ Files:
 
 | Purpose | File |
 |---|---|
-| CAModel experiment plan | `camodel/camodel_experiment_matrix.json` |
 | CAModel count-to-SYS_CNT parser | `camodel/extract_camodel_system_cycle_profile.py` |
 
 ## SIMT dot operand-path diagnostics

@@ -119,5 +119,41 @@ def _apply_ascend_patch():
         except Exception as e:
             logging.warning(f"[Ascend Patch] Failed to install dtype guard: {e}")
 
+    # Keep launch-value handling in the Ascend plugin. The binder result feeds
+    # the in-memory kernel cache key, while _pack_args feeds the same values to
+    # NPUOptions and the native route model.
+    from triton.runtime import jit as _jit_module
+
+    if not getattr(_jit_module, "_ascend_runtime_compile_options_patch_applied", False):
+        _original_create_function_from_signature = _jit_module.create_function_from_signature
+        _original_pack_args = _jit_module.JITFunction._pack_args
+
+        def _patched_create_function_from_signature(signature, kernel_params, backend):
+            binder = _original_create_function_from_signature(signature, kernel_params, backend)
+            runtime_option_hook = getattr(backend, "get_runtime_compile_options", None)
+            if runtime_option_hook is None:
+                return binder
+
+            def _binder_with_runtime_options(*args, **kwargs):
+                bound_args, specialization, options = binder(*args, **kwargs)
+                runtime_options = runtime_option_hook(bound_args, specialization, options)
+                if runtime_options:
+                    options.update(runtime_options)
+                return bound_args, specialization, options
+
+            return _binder_with_runtime_options
+
+        def _patched_pack_args(self, backend, kwargs, bound_args, specialization, options):
+            runtime_option_hook = getattr(backend, "get_runtime_compile_options", None)
+            if runtime_option_hook is not None:
+                runtime_options = runtime_option_hook(bound_args, specialization, options)
+                if runtime_options:
+                    kwargs = {**kwargs, **runtime_options}
+            return _original_pack_args(self, backend, kwargs, bound_args, specialization, options)
+
+        _jit_module.create_function_from_signature = _patched_create_function_from_signature
+        _jit_module.JITFunction._pack_args = _patched_pack_args
+        _jit_module._ascend_runtime_compile_options_patch_applied = True
+
 
 __all__ = ["do_bench_npu"]

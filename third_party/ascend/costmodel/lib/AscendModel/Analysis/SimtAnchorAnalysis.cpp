@@ -103,6 +103,16 @@ static bool pointerDependsOnLoadedIndex(Operation *memoryOp) {
     if (!visited.insert(value).second)
       continue;
 
+    // Only shaped SSA values can carry a loaded index independently across
+    // tensor lanes.  Once a tensor has been reduced/extracted to a scalar,
+    // broadcasting that scalar changes the common base (or stride) but does
+    // not create a gather.  Following the scalar back through a reduction
+    // incorrectly classified regular tiles such as
+    //   splat(reduce(load(indices))) + row * stride + column
+    // as one indirect access per element.
+    if (!isa<ShapedType>(value.getType()))
+      continue;
+
     if (auto argument = dyn_cast<BlockArgument>(value)) {
       Operation *parent = argument.getOwner()->getParentOp();
       unsigned number = argument.getArgNumber();
@@ -120,8 +130,9 @@ static bool pointerDependsOnLoadedIndex(Operation *memoryOp) {
     if (!producer)
       continue;
     llvm::StringRef name = producer->getName().getStringRef();
-    if (name == "tt.load" || name == "tt.gather")
+    if (name == "tt.load" || name == "tt.gather") {
       return true;
+    }
     llvm::append_range(worklist, producer->getOperands());
   }
   return false;

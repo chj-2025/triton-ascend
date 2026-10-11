@@ -581,6 +581,39 @@ def test_make_launcher_ceil_divides_layout_coalesced_grid(
     assert src.count("gridX = (gridX + 8 - 1) / 8;") == 2
 
 
+@patch.object(driver, "NPUUtils")
+@patch.object(driver, "_is_auto_map_parallel_blocks_enabled", return_value=False)
+@patch.object(driver, "force_disable_ffts", return_value=False)
+@patch.object(driver, "is_ffts_supported", return_value=True)
+@patch.object(driver, "get_ascend_arch_from_env", return_value="Ascend910B")
+@patch.object(driver, "get_backend_func", side_effect=_mock_backend_func)
+def test_make_launcher_decodes_unordered_sync_block_lock_layout(
+    _mock_backend_func_patch,
+    _mock_arch,
+    _mock_ffts,
+    _mock_disable_ffts,
+    _mock_auto_map,
+    mock_npu_utils,
+):
+    mock_npu_utils.return_value.get_aivector_core_num.return_value = 40
+    mock_npu_utils.return_value.get_aicore_num.return_value = 20
+    metadata = _make_metadata()
+    # Two unordered locks plus one legacy ordered-lock cache line (8 i64).
+    metadata.sync_block_lock_layout = (2 << 32) | 8
+
+    src = driver.make_launcher(
+        constants={},
+        signature={0: "*fp32", 1: "*fp32"},
+        metadata=metadata,
+    )
+
+    assert "syncBlockLockOrderedI64Count = 8" in src
+    assert "syncBlockLockUnorderedCount = 2" in src
+    assert "(1 + 2 * syncBlockLockParticipantNum)" in src
+    assert "lockInitData[lockOffset]" in src
+    assert "static_cast<int64_t>(syncBlockLockParticipantNum)" in src
+
+
 @patch("importlib.util.module_from_spec")
 @patch("importlib.util.spec_from_file_location")
 @patch.object(driver, "make_npu_launcher_stub", return_value="/tmp/fake_launcher.so")

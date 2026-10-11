@@ -26,7 +26,10 @@ static unsigned long us() {
 
 static char *readBin(const char *f, uint32_t *sz) {
   ifstream s(f, ios::binary);
-  if (!s) { fprintf(stderr, "Cannot open %s\n", f); exit(EXIT_FAILURE); }
+  if (!s) {
+    fprintf(stderr, "Cannot open %s\n", f);
+    exit(EXIT_FAILURE);
+  }
   s.seekg(0, ios::end);
   size_t n = s.tellg();
   s.seekg(0);
@@ -66,27 +69,33 @@ static long long runK(const char *fn, rtStream_t s, void *dout, int K,
   ai.argsSize = sizeof(a);
   rtTaskCfgInfo_t c = {};
   c.localMemorySize = 192 * 1024;
-  check(rtKernelLaunchWithFlagV2((void *)fn, 1, &ai, 0, s, 0, &c), "rtKernelLaunchWithFlagV2");
+  check(rtKernelLaunchWithFlagV2((void *)fn, 1, &ai, 0, s, 0, &c),
+        "rtKernelLaunchWithFlagV2");
   check(rtStreamSynchronize(s), "rtStreamSynchronize");
   long long results[1025] = {};
   check(rtMemcpy(results, sizeof(results), dout, sizeof(results),
-                 RT_MEMCPY_DEVICE_TO_HOST), "rtMemcpy");
+                 RT_MEMCPY_DEVICE_TO_HOST),
+        "rtMemcpy");
   int count = mode == 0 ? nwarp * 32 : nwarp * 64;
   for (int index = 0; index < count; ++index) {
-    long long expected = mode == 0
-        ? 8LL * (index % 32 + index / 32 + 1) + 28 + 8LL * iters
-        : 1LL + K * iters;
+    long long expected =
+        mode == 0 ? 8LL * (index % 32 + index / 32 + 1) + 28 + 8LL * iters
+                  : 1LL + K * iters;
     float actual = reinterpret_cast<float *>(results + 4)[index];
-    if (actual < expected - 0.01 || actual > expected + 0.01 || actual != actual) {
+    if (actual < expected - 0.01 || actual > expected + 0.01 ||
+        actual != actual) {
       fprintf(stderr, "Wrong result mode=%d index=%d got=%f expected=%lld\n",
               mode, index, actual, expected);
       exit(EXIT_FAILURE);
     }
   }
   long long cyc = results[0];
-  if (cyc <= 0) { fprintf(stderr, "Invalid counter delta\n"); exit(EXIT_FAILURE); }
-  printf("RAW K=%d lanes=%d warps=%d iters=%d mode=%d ticks=%lld\n",
-         K, nlane, nwarp, iters, mode, cyc);
+  if (cyc <= 0) {
+    fprintf(stderr, "Invalid counter delta\n");
+    exit(EXIT_FAILURE);
+  }
+  printf("RAW K=%d lanes=%d warps=%d iters=%d mode=%d ticks=%lld\n", K, nlane,
+         nwarp, iters, mode, cyc);
   return cyc;
 }
 
@@ -122,7 +131,8 @@ int main() {
   rtStream_t s;
   check(rtStreamCreate(&s, 0), "rtStreamCreate");
   void *dout;
-  check(rtMalloc(&dout, 1025 * sizeof(long long), RT_MEMORY_HBM, 0), "rtMalloc");
+  check(rtMalloc(&dout, 1025 * sizeof(long long), RT_MEMORY_HBM, 0),
+        "rtMalloc");
 
   runK(fn, s, dout, 10, 32, 32, 100, 0); // warmup
 

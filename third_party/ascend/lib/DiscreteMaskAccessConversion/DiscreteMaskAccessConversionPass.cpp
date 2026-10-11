@@ -263,6 +263,11 @@ static void markSyncBlockLockUnordered(Operation *op) {
 static constexpr const char *routeDiscreteMaskToSimtAttrName =
     "route_discrete_mask_to_simt";
 
+static void markSyncBlockLockUnordered(Operation *op) {
+  op->setAttr(hivm::SyncBlockLockUnorderedAttr::name,
+              UnitAttr::get(op->getContext()));
+}
+
 static bool traceUserToTargetOp(Value val) {
   llvm::SmallVector<Value, 32> worklist;
   llvm::SmallPtrSet<Value, 32> visited;
