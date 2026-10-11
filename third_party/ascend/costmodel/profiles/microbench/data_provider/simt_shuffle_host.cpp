@@ -3,8 +3,8 @@
 #include <acl/acl.h>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
 #include <cstdlib>
+#include <fstream>
 #include <vector>
 
 using namespace std;
@@ -18,14 +18,17 @@ static void check(int code, const char *name) {
 
 static char *readBin(const char *f, uint32_t *sz) {
   ifstream s(f, ios::binary);
-  if (!s) exit(1);
+  if (!s)
+    exit(1);
   s.seekg(0, ios::end);
   size_t n = s.tellg();
-  if (!n) exit(1);
+  if (!n)
+    exit(1);
   s.seekg(0);
   char *b = new char[n];
   s.read(b, n);
-  if (!s) exit(1);
+  if (!s)
+    exit(1);
   *sz = n;
   return b;
 }
@@ -60,15 +63,18 @@ static long long runK(const char *fn, rtStream_t stream, void *dout, int K,
   ai.argsSize = sizeof(args);
   rtTaskCfgInfo_t cfg = {};
   cfg.localMemorySize = 192 * 1024;
-  check(rtKernelLaunchWithFlagV2((void *)fn, 1, &ai, 0, stream, 0, &cfg), "launch");
+  check(rtKernelLaunchWithFlagV2((void *)fn, 1, &ai, 0, stream, 0, &cfg),
+        "launch");
   check(rtStreamSynchronize(stream), "synchronize");
   long long cycles = 0;
   check(rtMemcpy(&cycles, sizeof(cycles), dout, sizeof(cycles),
-                 RT_MEMCPY_DEVICE_TO_HOST), "copy ticks");
+                 RT_MEMCPY_DEVICE_TO_HOST),
+        "copy ticks");
   vector<float> values(nwarp * 32);
   check(rtMemcpy(values.data(), values.size() * sizeof(float),
                  static_cast<char *>(dout) + 32, values.size() * sizeof(float),
-                 RT_MEMCPY_DEVICE_TO_HOST), "copy output");
+                 RT_MEMCPY_DEVICE_TO_HOST),
+        "copy output");
   for (int warp = 0; warp < nwarp; ++warp) {
     float x[4][32];
     for (int chain = 0; chain < 4; ++chain)
@@ -121,7 +127,8 @@ int main() {
   rtStream_t stream;
   check(rtStreamCreate(&stream, 0), "stream");
   void *dout = nullptr;
-  check(rtMalloc(&dout, 32 + 1024 * sizeof(float), RT_MEMORY_HBM, 0), "allocate");
+  check(rtMalloc(&dout, 32 + 1024 * sizeof(float), RT_MEMORY_HBM, 0),
+        "allocate");
 
   runK(fn, stream, dout, 2, 4, 16, 0);
   printf("SIMT __shfl_up dependent and ILP4 throughput\n");

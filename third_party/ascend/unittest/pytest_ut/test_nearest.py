@@ -28,8 +28,8 @@ import pytest
 
 
 @triton.jit
-def nearest_resize_kernel(img_src_ptr, img_dst_ptr, src_rows, src_cols, dst_rows, dst_cols, RR_H, RR_W, C, stride_in_h,
-                          stride_in_w, stride_in_c, stride_out_h, stride_out_w, stride_out_c, BLOCK_SIZE: tl.constexpr):
+def nearest_resize_kernel(img_src_ptr, img_dst_ptr, src_rows, src_cols, dst_rows, dst_cols, C, stride_in_h, stride_in_w,
+                          stride_in_c, stride_out_h, stride_out_w, stride_out_c, BLOCK_SIZE: tl.constexpr):
     #RR_H和RR_W分别为高和宽的缩放比例
     block_id_c = tl.program_id(0)
     block_id_h = tl.program_id(1)
@@ -39,26 +39,21 @@ def nearest_resize_kernel(img_src_ptr, img_dst_ptr, src_rows, src_cols, dst_rows
     dest_offs = (block_id_c[None, None] * stride_out_c + dest_h_offs[:, None] * stride_out_h +
                  dest_w_offs[None, :] * stride_out_w)
     #根据output image的坐标值(dest_h_offs, dest_w_offs)计算input image的坐标值(sy, sx)
-    fy = dest_h_offs * RR_H
-    sy = tl.floor(fy)
-    fx = dest_w_offs * RR_W
-    sx = tl.floor(fx)
+    # All coordinates are non-negative. Integer division computes the exact
+    # nearest-neighbour source index and avoids rounding on integer boundaries.
+    sy = (dest_h_offs * src_rows) // dst_rows
+    sx = (dest_w_offs * src_cols) // dst_cols
 
-    src_offsets = (block_id_c[None, None] * stride_in_c +
-                   tl.minimum(tl.maximum(sy, 0), src_rows - 1)[:, None].to(tl.int32) * stride_in_h +
-                   tl.minimum(tl.maximum(sx, 0), src_cols - 1)[None, :].to(tl.int32) * stride_in_w)
-    src_val = tl.load(img_src_ptr + src_offsets)
     dst_mask = (dest_h_offs[:, None] < dst_rows) & (dest_w_offs[None, :] < dst_cols)
+    src_offsets = (block_id_c[None, None] * stride_in_c + sy[:, None].to(tl.int32) * stride_in_h +
+                   sx[None, :].to(tl.int32) * stride_in_w)
+    src_val = tl.load(img_src_ptr + src_offsets, mask=dst_mask, other=0.0)
     tl.store(img_dst_ptr + dest_offs, src_val, mask=dst_mask)
 
 
 def triton_kernel(img_src, img_dst):
     N, C, src_rows, src_cols = img_src.shape
     _, _, dst_rows, dst_cols = img_dst.shape
-    R_H = float(dst_rows) / src_rows
-    R_W = float(dst_cols) / src_cols
-    RR_H = 1.0 / R_H
-    RR_W = 1.0 / R_W
     stride_in_n, stride_in_c, stride_in_h, stride_in_w = img_src.stride()
     stride_out_n, stride_out_c, stride_out_h, stride_out_w = img_dst.stride()
     bs = 16
@@ -67,8 +62,8 @@ def triton_kernel(img_src, img_dst):
         triton.cdiv(dst_rows, meta["BLOCK_SIZE"]),
         triton.cdiv(dst_cols, meta["BLOCK_SIZE"]),
     )
-    nearest_resize_kernel[grid](img_src, img_dst, src_rows, src_cols, dst_rows, dst_cols, RR_H, RR_W, C, stride_in_h,
-                                stride_in_w, stride_in_c, stride_out_h, stride_out_w, stride_out_c, bs)
+    nearest_resize_kernel[grid](img_src, img_dst, src_rows, src_cols, dst_rows, dst_cols, C, stride_in_h, stride_in_w,
+                                stride_in_c, stride_out_h, stride_out_w, stride_out_c, bs)
     return img_dst
 
 
@@ -99,7 +94,8 @@ def test_nearest(shapes):
     img_dst = torch.zeros((1, img_src.shape[1], dst_rows, dst_cols), dtype=img_src.dtype, device=img_src.device)
     torch_ref = nearest_resize_cpu(img_src.cpu(), img_dst.cpu())
     triton_cal = triton_kernel(img_src, img_dst)
-    torch.testing.assert_close(torch_ref.npu(), triton_cal)
+    torch.npu.synchronize()
+    torch.testing.assert_close(torch_ref, triton_cal.cpu())
 
 
 if __name__ == "__main__":
@@ -112,5 +108,6 @@ if __name__ == "__main__":
         0] == 1, "currently supports only shape[0] == 1 which does not change the functionality of thie case"
     torch_ref = nearest_resize_cpu(img_src.cpu(), img_dst.cpu())
     triton_cal = triton_kernel(img_src, img_dst)
-    torch.testing.assert_close(torch_ref.npu(), triton_cal)
+    torch.npu.synchronize()
+    torch.testing.assert_close(torch_ref, triton_cal.cpu())
     print("success")

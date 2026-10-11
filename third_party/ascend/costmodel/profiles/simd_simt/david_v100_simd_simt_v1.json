@@ -1,15 +1,14 @@
 {
   "$schema": "./simd_simt_profile_schema.json",
-  "schema_version": 12,
-  "profile_version": "david-v100-simd-simt-20260918-v27-segmented-issue-fixed-transition",
-  "target": "Ascend950PR/dav-c310",
-  "description": "Stage Route Model hardware profile. Stage partitions and workloads are generated online from transformed TTIR; this file contains no workload-specific Stage template or route multiplier.",
-  "microbenchmark_profile": "../microbench/ascend_davidv100_v1.json",
   "compatible_targets": [
     "Ascend950*",
     "Ascend910_95*",
     "dav-c310"
   ],
+  "description": "Stage Route Model hardware profile. Stage partitions and workloads are generated online from transformed TTIR; this file contains no workload-specific Stage template or route multiplier.",
+  "microbenchmark_profile": "../microbench/ascend_davidv100_v1.json",
+  "profile_version": "david-v100-simd-simt-20260903-v20",
+  "schema_version": 12,
   "score_unit": "system_cycle_selection_score",
   "selection_calibration": {
     "description": "Cost parameters used by Stage models. They influence numerical cost only; coverage, confidence, Event validation, and gain-margin admission gates are not part of online route selection.",
@@ -35,15 +34,21 @@
   },
   "simd": {
     "description": "Inputs used to estimate the all-SIMD candidate: SIMD width, setup, operation, memory, and dot costs.",
-    "vector_width_measurement": "simd.vector_width_bits",
-    "startup_system_cycles": {
-      "description": "Legacy SIMD pipeline startup priors in SYS_CNT cycles. Only vector is currently consumed by Route Model scoring.",
-      "vector": 21.212121,
-      "mte2": 30.303030,
-      "mte3": 24.242424,
-      "source": "Legacy selection-model seed inherited from device-cycle startup values",
+    "dot": {
+      "description": "All-SIMD dot setup and throughput seed used for every dot operation; current calibrated admission is narrower and covers only tiny irregular dot.",
+      "startup_system_cycles": 128.0,
+      "flops_per_system_cycle": 4096.0,
+      "source": "AscendModel cube startup/throughput seed; CaModel and profiler data refine scheduled lowering",
+      "confidence": "low"
+    },
+    "memory": {
+      "description": "Model-specific all-SIMD memory fallback rates. vector_mte2 and mte3 plus confidence are consumed; hbm is retained only as documentary legacy context.",
+      "hbm_bytes_per_system_cycle": 1617.96,
+      "vector_mte2_bytes_per_system_cycle": 202.25,
+      "mte3_bytes_per_system_cycle": 202.25,
+      "source": "Selection-model seed retained for v4 score continuity; 202.25 B/SYS_CNT-cycle corresponds to 200 GB/s and must not be presented as the davidV100 75/71 GB/s data-mover specification",
       "confidence": "low",
-      "note": "Not isolated davidV100 microbenchmark evidence; kept outside the shared catalog"
+      "note": "Model-specific fallback, not shared microbenchmark evidence"
     },
     "ops": {
       "f32.add": {
@@ -72,6 +77,12 @@
         "description": "Estimated FP32 SIMD maximum cost relative to f32.add; factor multiplies the base cycle estimate.",
         "relative_to": "f32.add",
         "factor": 1.2,
+        "confidence": "medium"
+      },
+      "f32.relu": {
+        "description": "Estimated ReLU helper cost from the maximum-class vector throughput, kept as a distinct semantic operation.",
+        "relative_to": "f32.max",
+        "factor": 1.0,
         "confidence": "medium"
       },
       "f32.abs": {
@@ -135,37 +146,27 @@
         "confidence": "low"
       }
     },
-    "memory": {
-      "description": "Model-specific all-SIMD memory fallback rates. vector_mte2 and mte3 plus confidence are consumed; hbm is retained only as documentary legacy context.",
-      "hbm_bytes_per_system_cycle": 1617.96,
-      "vector_mte2_bytes_per_system_cycle": 202.25,
-      "mte3_bytes_per_system_cycle": 202.25,
-      "source": "Selection-model seed retained for v4 score continuity; 202.25 B/SYS_CNT-cycle corresponds to 200 GB/s and must not be presented as the davidV100 75/71 GB/s data-mover specification",
-      "confidence": "low",
-      "note": "Model-specific fallback, not shared microbenchmark evidence"
-    },
-    "dot": {
-      "description": "All-SIMD dot setup and throughput seed used for every dot operation; current calibrated admission is narrower and covers only tiny irregular dot.",
-      "startup_system_cycles": 128.0,
-      "flops_per_system_cycle": 4096.0,
-      "source": "AscendModel cube startup/throughput seed; CaModel and profiler data refine scheduled lowering",
-      "confidence": "low"
-    },
     "stage_resources": {
-      "description": "Generic SIMD front-end, spill, indirect-memory, and control-flow rates used by every SIMD StageCostModel. The indirect values are provisional seeds pending the next same-shape CaModel calibration.",
-      "scalar_operations_per_system_cycle": 1.0,
-      "issue_instructions_per_system_cycle": 6.0,
-      "spill_transactions_per_system_cycle": 1.0,
-      "register_budget_per_thread": 32.0,
-      "spill_transaction_coverage": 1.0,
-      "prefix_scan": {
-        "dependency_factor": 42.45581534582609,
-        "description": "Normalize the recorded A5 batch-8, extent-16 identity-subtracted scan ratio by base shuffle rates: factor_SIMD = (143.398 / 8.267) * 64 / (32 * 0.817124) * factor_SIMT. The model charges lane_steps / lane_rate * factor, so the measured time ratio is not itself the factor. This effective calibration includes lowering effects, not intrinsic latency or forward/reverse asymmetry. Recalibrate if base rates or lowering change."
-      },
-      "indirect_memory": {
-        "load_transactions_per_system_cycle": 0.125,
-        "store_transactions_per_system_cycle": 0.125,
-        "dependency_latency_system_cycles": 200.0
+      "atomic_memory": {
+        "description": "Atomic RMW is priced independently from ordinary store and from loaded-index load traffic. Unknown runtime contention uses a route-relative conservative multiplier; it is a selection-score policy, not an absolute latency claim.",
+        "default": {
+          "logical_elements_per_system_cycle": 4.0,
+          "operation_startup_system_cycles": 0.0,
+          "result_dependency_system_cycles": 200.0,
+          "unknown_contention_multiplier": 1.0,
+          "source": "Compatibility fallback converted from the former SIMD indirect-store seed: 0.125 logical 32-lane transactions/system_cycle.",
+          "confidence": "low"
+        },
+        "operations": {
+          "fadd.f32": {
+            "logical_elements_per_system_cycle": 4.0,
+            "operation_startup_system_cycles": 0.0,
+            "result_dependency_system_cycles": 200.0,
+            "unknown_contention_multiplier": 1.0,
+            "source": "Normalized endpoint calibration in atomic_profile_benchmark.py. SIMD is the reference scale; route-relative ratios are constrained by unique-address and all-hotspot measurements.",
+            "confidence": "medium"
+          }
+        }
       },
       "atomic_memory": {
         "description": "Atomic RMW is priced independently from ordinary store and from loaded-index load traffic. Unknown runtime contention uses a route-relative conservative multiplier; it is a selection-score policy, not an absolute latency claim.",
@@ -194,7 +195,18 @@
         "divergent_branch_penalty_system_cycles": 0.0,
         "synchronization_system_cycles": 1.0
       },
-      "source": "Ascend950 microarchitecture issue limits plus provisional conservative dependency rates; replace numeric seeds only through versioned CaModel/microbenchmark evidence.",
+      "description": "Generic SIMD front-end, spill, indirect-memory, and control-flow rates used by every SIMD StageCostModel. The indirect values are provisional seeds pending the next same-shape CaModel calibration.",
+      "indirect_memory": {
+        "load_transactions_per_system_cycle": 0.125,
+        "store_transactions_per_system_cycle": 0.125,
+        "dependency_latency_system_cycles": 200.0
+      },
+      "issue_instructions_per_system_cycle": 6.0,
+      "prefix_scan": {
+        "dependency_factor": 17.35,
+        "description": "SIMD prefix-scan dependency factor calibrated from the identity-baseline-subtracted A5 batch-8, extent-16 scan sweep (143.398 us SIMD scan increment versus 8.267 us SIMT, ratio 17.345); unlike reduction throughput, successive scan levels remain dependent."
+      },
+      "register_budget_per_thread": 32.0,
       "scalar_memory": {
         "description": "SIMD scalar white-box: MainScalar load T=prep+fill+max(0,K-outstanding)*extra_line+(K-1)*issue; Triton scalar store lowers to MTE3 T=prep+fill for the K=1 stages used by the target kernels. Values are CAModel core cycles converted by 988.9/1800.",
         "main_load_prep_system_cycles": 3.8457222222222223,
@@ -206,15 +218,83 @@
         "main_load_extra_line_high_threshold": 4,
         "mte3_store_prep_system_cycles": 10.98777777777778,
         "mte3_store_fill_system_cycles": 247.22500000000002
-      }
-    }
+      },
+      "scalar_operations_per_system_cycle": 1.0,
+      "source": "Ascend950 microarchitecture issue limits plus provisional conservative dependency rates; replace numeric seeds only through versioned CaModel/microbenchmark evidence.",
+      "spill_transaction_coverage": 1.0,
+      "spill_transactions_per_system_cycle": 1.0
+    },
+    "startup_system_cycles": {
+      "description": "Legacy SIMD pipeline startup priors in SYS_CNT cycles. Only vector is currently consumed by Route Model scoring.",
+      "vector": 21.212121,
+      "mte2": 30.30303,
+      "mte3": 24.242424,
+      "source": "Legacy selection-model seed inherited from device-cycle startup values",
+      "confidence": "low",
+      "note": "Not isolated davidV100 microbenchmark evidence; kept outside the shared catalog"
+    },
+    "vector_width_measurement": "simd.vector_width_bits"
   },
   "simt": {
+    "camodel_effective": {
+      "description": "Workload-effective CaModel issue rates retained as fallback calibration context. The current Route Model consumes only the predicate rate from the nested rate map.",
+      "scope": "FBGEMM scope_b8; 13 active veccores",
+      "simulator_clock_mhz": 1650.0,
+      "conversion": "ops_per_system_cycle = aggregate_ops_per_simulator_cycle * simulator_clock_mhz / SYS_CNT_mhz",
+      "warp_instructions_per_system_cycle": {
+        "memory": 2.1411,
+        "float_alu": 0.6429,
+        "shuffle": 0.3763,
+        "predicate": 0.038,
+        "control": 0.2431,
+        "int_alu": 0.2325
+      },
+      "warp_size": 32,
+      "source": "simt_camodel_calibration_scope_b8.json; remote OPPROF_20260712042738_MECSEVSNUOCUDPXV",
+      "confidence": "low",
+      "note": "These are effective issue rates for one FBGEMM workload, including its dependencies and stalls. They are fallback calibration seeds, not isolated instruction peak throughput or latency."
+    },
     "description": "Inputs used to estimate the all-SIMT candidate and the SIMT portion of a mixed candidate.",
-    "warp_size_measurement": "simt.warp_size",
-    "setup_system_cycles": {
-      "description": "Conservative standalone SIMT setup proxy resolved from the serialized empty-VF shared measurement; it is completion-inclusive but still contains a UB write, barrier, and runtime-loop control.",
-      "empty_launch_measurement": "simt.setup.empty_with_barrier"
+    "dot": {
+      "description": "All-SIMT dot setup and scalar-FMA throughput seed used for every dot operation; current calibrated admission is narrower and covers only tiny irregular dot.",
+      "startup_system_cycles": 64.0,
+      "flops_per_system_cycle": 141.0,
+      "source": "SIMT scalar FMA issue seed plus fixed tiny-dot setup; calibrated by gather-dot ranking",
+      "confidence": "low"
+    },
+    "memory": {
+      "description": "SIMT workload-effective GM load/store rates resolved from sequential rotating runtime-loop measurements. Indirect/random/coalescing behavior is not calibrated by these rates.",
+      "load_throughput_measurement": "simt.gm.load.throughput",
+      "store_throughput_measurement": "simt.gm.store.throughput",
+      "confidence": "low"
+    },
+    "mixed_setup_fallback": {
+      "1": {
+        "description": "Low-confidence mixed setup fallback for one warp, sourced from a standalone empty-VF net probe rather than a mixed transition.",
+        "measurement": "simt.setup.transition_harness_net.warps_1"
+      },
+      "2": {
+        "description": "Low-confidence mixed setup fallback for two warps, sourced from a standalone empty-VF net probe rather than a mixed transition.",
+        "measurement": "simt.setup.transition_harness_net.warps_2"
+      },
+      "4": {
+        "description": "Low-confidence mixed setup fallback for four warps, sourced from a standalone empty-VF net probe rather than a mixed transition.",
+        "measurement": "simt.setup.transition_harness_net.warps_4"
+      },
+      "8": {
+        "description": "Low-confidence mixed setup fallback for eight warps, sourced from a standalone empty-VF net probe rather than a mixed transition.",
+        "measurement": "simt.setup.transition_harness_net.warps_8"
+      },
+      "16": {
+        "description": "Low-confidence mixed setup fallback for sixteen warps, sourced from a standalone empty-VF net probe rather than a mixed transition.",
+        "measurement": "simt.setup.transition_harness_net.warps_16"
+      },
+      "32": {
+        "description": "Low-confidence mixed setup fallback for thirty-two warps, sourced from a standalone empty-VF net probe rather than a mixed transition.",
+        "measurement": "simt.setup.transition_harness_net.warps_32"
+      },
+      "confidence": "low",
+      "note": "These values are mode1(empty SIMT plus tail barrier) minus mode6(barrier only) in a branch-heavy harness. They contain no SIMD Stage and are used only as conservative setup fallbacks. Directional SIMD-to-SIMT, SIMT-to-SIMD, and dependent UB hand-off costs remain unmeasured."
     },
     "ops": {
       "f32.add": {
@@ -243,6 +323,12 @@
         "description": "Estimated FP32 SIMT maximum cost relative to f32.add; factor multiplies the base cycle estimate.",
         "relative_to": "f32.add",
         "factor": 1.2,
+        "confidence": "medium"
+      },
+      "f32.relu": {
+        "description": "Estimated SIMT ReLU helper cost from the maximum-class scalar throughput, kept as a distinct semantic operation.",
+        "relative_to": "f32.max",
+        "factor": 1.0,
         "confidence": "medium"
       },
       "f32.abs": {
@@ -306,57 +392,36 @@
         "confidence": "low"
       }
     },
-    "dot": {
-      "description": "All-SIMT dot setup and scalar-FMA throughput seed used for every dot operation; current calibrated admission is narrower and covers only tiny irregular dot.",
-      "startup_system_cycles": 64.0,
-      "flops_per_system_cycle": 141.0,
-      "source": "SIMT scalar FMA issue seed plus fixed tiny-dot setup; calibrated by gather-dot ranking",
-      "confidence": "low"
-    },
-    "camodel_effective": {
-      "description": "Workload-effective CaModel issue rates retained as fallback calibration context. The current Route Model consumes only the predicate rate from the nested rate map.",
-      "scope": "FBGEMM scope_b8; 13 active veccores",
-      "simulator_clock_mhz": 1650.0,
-      "conversion": "ops_per_system_cycle = aggregate_ops_per_simulator_cycle * simulator_clock_mhz / SYS_CNT_mhz",
-      "warp_instructions_per_system_cycle": {
-        "memory": 2.1411,
-        "float_alu": 0.6429,
-        "shuffle": 0.3763,
-        "predicate": 0.0380,
-        "control": 0.2431,
-        "int_alu": 0.2325
-      },
-      "warp_size": 32,
-      "source": "simt_camodel_calibration_scope_b8.json; remote OPPROF_20260712042738_MECSEVSNUOCUDPXV",
-      "confidence": "low",
-      "note": "These are effective issue rates for one FBGEMM workload, including its dependencies and stalls. They are fallback calibration seeds, not isolated instruction peak throughput or latency."
+    "setup_system_cycles": {
+      "description": "Conservative standalone SIMT setup proxy resolved from the serialized empty-VF shared measurement; it is completion-inclusive but still contains a UB write, barrier, and runtime-loop control.",
+      "empty_launch_measurement": "simt.setup.empty_with_barrier"
     },
     "shuffle": {
       "description": "SIMT workload-effective shuffle rate resolved from the shared runtime-loop microbenchmark. Route-level generalization confidence is intentionally lower than measurement repeatability.",
       "throughput_measurement": "simt.shuffle.throughput",
       "confidence": "low"
     },
-    "memory": {
-      "description": "SIMT workload-effective GM load/store rates resolved from sequential rotating runtime-loop measurements. Indirect/random/coalescing behavior is not calibrated by these rates.",
-      "load_throughput_measurement": "simt.gm.load.throughput",
-      "store_throughput_measurement": "simt.gm.store.throughput",
-      "confidence": "low"
-    },
     "stage_resources": {
-      "description": "Generic SIMT front-end, spill, indirect-memory, and control-flow rates used by every SIMT StageCostModel. The indirect values are provisional seeds pending the next same-shape CaModel calibration.",
-      "scalar_operations_per_system_cycle": 4.0,
-      "issue_instructions_per_system_cycle": 4.0,
-      "spill_transactions_per_system_cycle": 1.0,
-      "register_budget_per_thread": 32.0,
-      "spill_transaction_coverage": 1.0,
-      "prefix_scan": {
-        "dependency_factor": 1.0,
-        "description": "SIMT shuffle throughput already represents the lane dependency chain measured by the A5 scan sweep."
-      },
-      "indirect_memory": {
-        "load_transactions_per_system_cycle": 0.5,
-        "store_transactions_per_system_cycle": 0.5,
-        "dependency_latency_system_cycles": 100.0
+      "atomic_memory": {
+        "description": "Atomic RMW is priced independently from ordinary store and loaded-index load traffic. For loaded-index fadd.f32, the unknown-contention multiplier conservatively preserves the measured hotspot ordering while retaining the measured unique-address base ordering.",
+        "default": {
+          "logical_elements_per_system_cycle": 16.0,
+          "operation_startup_system_cycles": 0.0,
+          "result_dependency_system_cycles": 100.0,
+          "unknown_contention_multiplier": 1.0,
+          "source": "Compatibility fallback converted from the former SIMT indirect-store seed: 0.5 logical 32-lane transactions/system_cycle.",
+          "confidence": "low"
+        },
+        "operations": {
+          "fadd.f32": {
+            "logical_elements_per_system_cycle": 7.758851730654868,
+            "operation_startup_system_cycles": 0.0,
+            "result_dependency_system_cycles": 100.0,
+            "unknown_contention_multiplier": 3.1106050790699937,
+            "source": "Normalized endpoint calibration: unique addresses SIMD/SIMT=464.167491/239.297003 us fixes the base throughput ratio; all-hotspot SIMD/SIMT=8503.260612/13636.185646 us fixes the relative unknown-contention multiplier.",
+            "confidence": "medium"
+          }
+        }
       },
       "atomic_memory": {
         "description": "Atomic RMW is priced independently from ordinary store and loaded-index load traffic. For loaded-index fadd.f32, the unknown-contention multiplier conservatively preserves the measured hotspot ordering while retaining the measured unique-address base ordering.",
@@ -385,56 +450,46 @@
         "divergent_branch_penalty_system_cycles": 4.0,
         "synchronization_system_cycles": 1.0
       },
-      "superblock": {
-        "useful_factor_limit": 4,
-        "persistent_state_pressure_free_factor": 2,
-        "persistent_state_bytes_per_system_cycle": 8.0,
-        "description": "Independent logical programs may continue hiding latency through F4. The 8 B/system-cycle persistent-state rate is shared by the generic SIMD loop-carried-state term and by the extra pressure of replicating that state in SIMT SuperBlock; state replication is pressure-free only through F2. The rule consumes SSA live-out bytes and contains no workload-name check."
+      "description": "Generic SIMT front-end, spill, indirect-memory, and control-flow rates used by every SIMT StageCostModel. The indirect values are provisional seeds pending the next same-shape CaModel calibration.",
+      "indirect_memory": {
+        "load_transactions_per_system_cycle": 0.5,
+        "store_transactions_per_system_cycle": 0.5,
+        "dependency_latency_system_cycles": 100.0
       },
-      "scope_handoff": {
-        "fixed_pair_measurement": "simd_simt.scope_handoff.fixed_pair",
-        "simd_ub_load_bytes_per_system_cycle": 512.0,
-        "simd_ub_store_bytes_per_system_cycle": 256.0,
-        "simt_ub_load_bytes_per_thread_per_system_cycle": 4.0,
-        "simt_ub_store_bytes_per_thread_per_system_cycle": 4.0,
-        "description": "Only exact tensor values captured by or returned from scope.scope are charged. A value crosses the distinct SIMD/SIMT register files through UB: producer store plus consumer load. The fixed pair is the measured operational intercept of one complete local SIMD-to-SIMT-to-SIMD scope and includes VF entry/prologue and exit/epilogue, but excludes tensor handoff bytes and SIMT body work. One scope-local SuperBlock group pays this fixed pair once, so the per-logical-program route score amortizes only the fixed term by factor; UB bytes and Stage work remain unscaled."
+      "issue_instructions_per_system_cycle": 4.0,
+      "prefix_scan": {
+        "dependency_factor": 1.0,
+        "description": "SIMT shuffle throughput already represents the lane dependency chain measured by the A5 scan sweep."
       },
-      "source": "Ascend950 SIMT issue limits plus provisional conservative dependency/reconvergence, SuperBlock state-pressure, and scope hand-off rates; replace numeric seeds only through versioned CaModel/microbenchmark evidence.",
+      "register_budget_per_thread": 32.0,
       "scalar_memory": {
         "description": "SIMT warp-uniform scalar white-box: diff-line load T=prep+fill+(K-1)*issue (fill=480 joint refit); first scalar store T=base. Values are CAModel core cycles converted by 988.9/1800.",
         "uniform_load_prep_system_cycles": 3.2963333333333336,
         "uniform_load_fill_system_cycles": 263.7066666666667,
         "uniform_load_diff_line_issue_system_cycles": 0.5493888888888889,
         "uniform_store_base_system_cycles": 247.22500000000002
+      },
+      "scalar_operations_per_system_cycle": 4.0,
+      "scope_handoff": {
+        "description": "Only exact tensor values captured by or returned from scope.scope are charged. A value crosses the distinct SIMD/SIMT register files through UB: producer store plus consumer load. SIMD rates reflect the 256-byte vector width with two load and one store issue slots; SIMT rates are explicitly per active thread and are aggregated over one logical warp. The provisional 668-cycle directional fixed term is half of the 1335-cycle scope-pair residual obtained from the A5 local-scope sweep. One scope-local SuperBlock group pays this fixed pair once, so the per-logical-program route score amortizes only the fixed term by factor; UB bytes and Stage work remain unscaled. This is a route-independent calibration seed, not a solve_tril name check, and must later be replaced by directional transition microbenchmarks.",
+        "fixed_directional_system_cycles": 668.0,
+        "fixed_pair_measurement": "simd_simt.scope_handoff.fixed_pair",
+        "simd_ub_load_bytes_per_system_cycle": 512.0,
+        "simd_ub_store_bytes_per_system_cycle": 256.0,
+        "simt_ub_load_bytes_per_thread_per_system_cycle": 4.0,
+        "simt_ub_store_bytes_per_thread_per_system_cycle": 4.0
+      },
+      "source": "Ascend950 SIMT issue limits plus provisional conservative dependency/reconvergence, SuperBlock state-pressure, and scope hand-off rates; replace numeric seeds only through versioned CaModel/microbenchmark evidence.",
+      "spill_transaction_coverage": 1.0,
+      "spill_transactions_per_system_cycle": 1.0,
+      "superblock": {
+        "useful_factor_limit": 4,
+        "persistent_state_pressure_free_factor": 2,
+        "persistent_state_bytes_per_system_cycle": 8.0,
+        "description": "Independent logical programs may continue hiding latency through F4. The 8 B/system-cycle persistent-state rate is shared by the generic SIMD loop-carried-state term and by the extra pressure of replicating that state in SIMT SuperBlock; state replication is pressure-free only through F2. The rule consumes SSA live-out bytes and contains no workload-name check."
       }
     },
-    "mixed_setup_fallback": {
-      "1": {
-        "description": "Low-confidence mixed setup fallback for one warp, sourced from a standalone empty-VF net probe rather than a mixed transition.",
-        "measurement": "simt.setup.transition_harness_net.warps_1"
-      },
-      "2": {
-        "description": "Low-confidence mixed setup fallback for two warps, sourced from a standalone empty-VF net probe rather than a mixed transition.",
-        "measurement": "simt.setup.transition_harness_net.warps_2"
-      },
-      "4": {
-        "description": "Low-confidence mixed setup fallback for four warps, sourced from a standalone empty-VF net probe rather than a mixed transition.",
-        "measurement": "simt.setup.transition_harness_net.warps_4"
-      },
-      "8": {
-        "description": "Low-confidence mixed setup fallback for eight warps, sourced from a standalone empty-VF net probe rather than a mixed transition.",
-        "measurement": "simt.setup.transition_harness_net.warps_8"
-      },
-      "16": {
-        "description": "Low-confidence mixed setup fallback for sixteen warps, sourced from a standalone empty-VF net probe rather than a mixed transition.",
-        "measurement": "simt.setup.transition_harness_net.warps_16"
-      },
-      "32": {
-        "description": "Low-confidence mixed setup fallback for thirty-two warps, sourced from a standalone empty-VF net probe rather than a mixed transition.",
-        "measurement": "simt.setup.transition_harness_net.warps_32"
-      },
-      "confidence": "low",
-      "note": "These values are mode1(empty SIMT plus tail barrier) minus mode6(barrier only) in a branch-heavy harness. They contain no SIMD Stage and are used only as conservative setup fallbacks. Directional SIMD-to-SIMT, SIMT-to-SIMD, and dependent UB hand-off costs remain unmeasured."
-    }
-  }
+    "warp_size_measurement": "simt.warp_size"
+  },
+  "target": "Ascend950PR/dav-c310"
 }

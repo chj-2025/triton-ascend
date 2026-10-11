@@ -826,6 +826,9 @@ void init_ascend_ir(py::module &&m) {
         [](OpState &root, int64_t factor) -> int64_t {
           if (!ascend::isSupportedScopeSuperBlockFactor(factor))
             throw std::invalid_argument(
+                "SIMT scope SuperBlock factor must be 1, 2 or 4");
+          if (!ascend::isSupportedScopeSuperBlockFactor(factor))
+            throw std::invalid_argument(
                 "SIMT scope SuperBlock factor must be one of 1, 2 or 4");
           int64_t updated = 0;
           root->walk([&](Operation *op) {

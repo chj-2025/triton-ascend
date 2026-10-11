@@ -1,3 +1,4 @@
+import importlib
 import importlib.util
 import inspect
 import sys
@@ -9,6 +10,43 @@ from unittest.mock import patch
 
 
 class CompilerCostmodelContractTest(unittest.TestCase):
+
+    def test_runtime_compile_options_bridge_stays_out_of_packaged_patch(self):
+        from triton.backends.ascend import _apply_ascend_patch
+
+        runtime_jit = importlib.import_module("triton.runtime.jit")
+        _apply_ascend_patch()
+
+        class FakeBackend:
+
+            def __init__(self):
+                self.packed_options = None
+
+            def get_runtime_compile_options(self, _bound_args, _specialization, _options):
+                return {"runtime_probe": ((0, 23), )}
+
+            def parse_options(self, options):
+                self.packed_options = dict(options)
+                return types.SimpleNamespace(**options)
+
+        backend = FakeBackend()
+        binder = runtime_jit.create_function_from_signature(inspect.Signature(), [], backend)
+        bound_args, specialization, options = binder()
+        self.assertEqual(options["runtime_probe"], ((0, 23), ))
+
+        dummy_jit = types.SimpleNamespace(params=[])
+        runtime_jit.JITFunction._pack_args(dummy_jit, backend, {}, bound_args, specialization, options)
+        self.assertEqual(backend.packed_options["runtime_probe"], ((0, 23), ))
+
+        patched_factory = runtime_jit.create_function_from_signature
+        patched_pack_args = runtime_jit.JITFunction._pack_args
+        _apply_ascend_patch()
+        self.assertIs(runtime_jit.create_function_from_signature, patched_factory)
+        self.assertIs(runtime_jit.JITFunction._pack_args, patched_pack_args)
+
+        repo_root = Path(__file__).resolve().parents[4]
+        packaged_patch = repo_root / "third_party" / "ascend" / "patch" / "triton-ascend-3.6.0.patch"
+        self.assertNotIn("get_runtime_compile_options", packaged_patch.read_text(encoding="utf-8"))
 
     @staticmethod
     def _load_compiler_module():
@@ -247,6 +285,7 @@ class CompilerCostmodelContractTest(unittest.TestCase):
 
     def test_all_bishengir_entries_share_debug_info_option(self):
         cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
+
         for entry in (
                 cmplr.linalg_to_bin_enable_npu_compile_910_95,
                 cmplr.linalg_to_bin_enable_npu_compile_A2_A3,

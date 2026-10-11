@@ -101,7 +101,7 @@ def test_sin_costmodel_route(tmp_path):
     N, BLOCK = 4096, 1024
     x, y, report_path = _run_route(sin_kernel, N, BLOCK, tmp_path, "sin")
     torch.testing.assert_close(y, torch.sin(x), rtol=1e-3, atol=1e-3)
-    _assert_report(report_path, "f32.sin")
+    _assert_report(report_path, "fp32.saturated.math.sin")
 
 
 def test_cos_costmodel_route(tmp_path):
@@ -114,4 +114,4 @@ def test_cos_costmodel_route(tmp_path):
 def test_trans_costmodel_route(tmp_path):
     x, y, report_path = _run_trans_route(tmp_path)
     torch.testing.assert_close(y, x.transpose(0, 1))
-    _assert_report(report_path, "f32.trans")
+    _assert_report(report_path, "layout.transpose")

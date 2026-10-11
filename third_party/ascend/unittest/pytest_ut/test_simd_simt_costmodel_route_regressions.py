@@ -157,7 +157,7 @@ def dacs_segsum_kernel(
 
 
 @simd_simt_910_95_only
-def test_index_put_atomic_selects_all_simd(tmp_path):
+def test_index_put_atomic_selects_all_simt_only(tmp_path):
     z0_numel = 4096
     y1_numel = 38
     x2_numel = 128
@@ -194,7 +194,7 @@ def test_index_put_atomic_selects_all_simd(tmp_path):
 
     torch.testing.assert_close(output[:z0_numel], torch.ones_like(output[:z0_numel]))
     assert torch.count_nonzero(output[z0_numel:]).item() == 0
-    _assert_effective_route(report_path, "all_simd")
+    _assert_effective_route(report_path, "all_simt_only")
 
 
 @simd_simt_910_95_only

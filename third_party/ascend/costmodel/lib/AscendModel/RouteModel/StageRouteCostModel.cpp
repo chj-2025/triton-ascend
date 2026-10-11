@@ -33,9 +33,16 @@ static double mixedEquivalentStageCost(const LogicalStageCost &stage,
   // distinction prevents ordinary data movement from being reported as a
   // mode-switch cost while preserving the same total estimate.
   const double boundaryData = scopeHandoff.estimateScopeBoundaryData(
-      stage.scopeInputTensorBytes, stage.scopeOutputTensorBytes,
+      llvm::divideCeil(stage.scopeInputTensorBytes,
+                       selected.implementation.aivSubblocks),
+      llvm::divideCeil(stage.scopeOutputTensorBytes,
+                       selected.implementation.aivSubblocks),
       selected.implementation.superblockFactor);
-  return selected.totalCycles + boundaryData + scopeHandoff.fixedScopeCycles;
+  return selected.totalCycles + boundaryData +
+         (selected.localScopeCompletionInclusive
+              ? 0.0
+              : scopeHandoff.fixedCyclesForAivSubblocks(
+                    selected.implementation.aivSubblocks));
 }
 
 static double mixedExecutionMultiplicity(const LogicalStageCost &stage,
@@ -68,7 +75,11 @@ static double mixedBodyStageCost(const LogicalStageCost &stage,
   if (cost.implementation.mode == StageMode::SIMT &&
       cost.implementation.localScope && stage.localSimtMaterializable)
     body += scopeHandoff.estimateScopeBoundaryData(
-        stage.scopeInputTensorBytes, stage.scopeOutputTensorBytes, factor);
+        llvm::divideCeil(stage.scopeInputTensorBytes,
+                         cost.implementation.aivSubblocks),
+        llvm::divideCeil(stage.scopeOutputTensorBytes,
+                         cost.implementation.aivSubblocks),
+        factor);
   return body;
 }
 
@@ -114,6 +125,66 @@ static RuntimeSchedule makeRuntimeSchedule(int64_t logicalPrograms,
   return schedule;
 }
 
+/// Look up a bounded two-dimensional completion surface. Both dimensions are
+/// structural work counts. Extrapolating beyond the measured rectangle would
+/// turn local composition evidence into an unmeasured throughput model, so an
+/// unmatched geometry retains the independent resource formula.
+static std::optional<double> interpolateBoundedCompositionSurface(
+    const std::map<int64_t, std::map<int64_t, double>> &surface,
+    int64_t indirectWarpInstructions, int64_t dotFlops) {
+  if (surface.empty() || indirectWarpInstructions < surface.begin()->first ||
+      indirectWarpInstructions > surface.rbegin()->first)
+    return std::nullopt;
+
+  auto interpolateInner =
+      [dotFlops](
+          const std::map<int64_t, double> &curve) -> std::optional<double> {
+    if (curve.empty() || dotFlops < curve.begin()->first ||
+        dotFlops > curve.rbegin()->first)
+      return std::nullopt;
+    auto upper = curve.lower_bound(dotFlops);
+    if (upper == curve.end())
+      return std::nullopt;
+    if (upper->first == dotFlops)
+      return upper->second;
+    if (upper == curve.begin())
+      return std::nullopt;
+    auto lower = std::prev(upper);
+    const double ratio = static_cast<double>(dotFlops - lower->first) /
+                         static_cast<double>(upper->first - lower->first);
+    return lower->second + ratio * (upper->second - lower->second);
+  };
+
+  auto upper = surface.lower_bound(indirectWarpInstructions);
+  if (upper == surface.end())
+    return std::nullopt;
+  auto upperValue = interpolateInner(upper->second);
+  if (!upperValue)
+    return std::nullopt;
+  if (upper->first == indirectWarpInstructions)
+    return upperValue;
+  if (upper == surface.begin())
+    return std::nullopt;
+  auto lower = std::prev(upper);
+  auto lowerValue = interpolateInner(lower->second);
+  if (!lowerValue)
+    return std::nullopt;
+  const double ratio =
+      static_cast<double>(indirectWarpInstructions - lower->first) /
+      static_cast<double>(upper->first - lower->first);
+  return *lowerValue + ratio * (*upperValue - *lowerValue);
+}
+
+static std::optional<int64_t> exactNonNegativeWorkCount(double value) {
+  if (!std::isfinite(value) || value < 0.0 ||
+      value > static_cast<double>(std::numeric_limits<int64_t>::max()))
+    return std::nullopt;
+  const double rounded = std::round(value);
+  if (std::abs(value - rounded) > 1.0e-9)
+    return std::nullopt;
+  return static_cast<int64_t>(rounded);
+}
+
 static const StageImplementationCost *
 findImplementationCost(const LogicalStageCost &stage,
                        const StageImplementation &implementation) {
@@ -121,7 +192,8 @@ findImplementationCost(const LogicalStageCost &stage,
     if (cost.implementation.mode == implementation.mode &&
         cost.implementation.superblockFactor ==
             implementation.superblockFactor &&
-        cost.implementation.localScope == implementation.localScope)
+        cost.implementation.localScope == implementation.localScope &&
+        cost.implementation.aivSubblocks == implementation.aivSubblocks)
       return &cost;
   return nullptr;
 }
@@ -153,6 +225,33 @@ static void removeAutoBlockifyCostFromAllSIMD(StageRoutePlan &plan,
     plan.scopeHandoffCycles[index] = 0.0;
   }
   plan.totalCycles = std::max(0.0, plan.totalCycles);
+}
+
+/// A whole-kernel SIMT tail remains one factor-F VF, so its group-level
+/// setup, control and private-stack envelope stays F-wide. Generic dot
+/// arithmetic is guarded by the logical-program predicate, however, and only
+/// the active programs execute it. Exact dot-operand composites already own
+/// a measured physical-group envelope and must not receive this analytical
+/// inactive-program credit.
+static double
+genericPredicatedDotTailCredit(const LogicalStageCost &stage,
+                               const StageImplementationCost &selected,
+                               int64_t tailPrograms) {
+  if (selected.implementation.mode != StageMode::SIMT ||
+      selected.implementation.localScope ||
+      selected.implementation.superblockFactor <= 1 || tailPrograms <= 0 ||
+      !stage.features.hasDot || selected.resources.dot <= 0.0 ||
+      selected.resources.dotOperandGroup > 0.0)
+    return 0.0;
+  const int64_t factor = selected.implementation.superblockFactor;
+  const int64_t active = std::min<int64_t>(tailPrograms, factor);
+  const double inactiveFraction =
+      static_cast<double>(factor - active) / static_cast<double>(factor);
+  const double fullGroupDot =
+      static_cast<double>(factor) *
+      static_cast<double>(std::max<int64_t>(1, stage.iterationCount)) *
+      selected.resources.dot;
+  return inactiveFraction * fullGroupDot;
 }
 
 } // namespace
@@ -188,7 +287,10 @@ static llvm::StringRef stringifyStageSchedule(StageScheduleKind kind) {
 }
 
 bool StageImplementation::isValid() const {
-  if (!isSupportedSuperBlockFactor(superblockFactor))
+  if ((aivSubblocks != 1 && aivSubblocks != 2) ||
+      (aivSubblocks != 1 && (!localScope || mode != StageMode::SIMT)))
+    return false;
+  if (superblockFactor <= 0 || (superblockFactor & (superblockFactor - 1)) != 0)
     return false;
   if (mode == StageMode::SIMD)
     return superblockFactor == 1 && !localScope;
@@ -196,11 +298,14 @@ bool StageImplementation::isValid() const {
 }
 
 llvm::json::Object StageImplementation::toJSON() const {
-  return llvm::json::Object{
+  llvm::json::Object result{
       {"mode", stringifyStageMode(mode)},
       {"superblock_factor", superblockFactor},
       {"materialization",
        localScope ? "local_simt_scope_with_kernel_v1" : "whole_kernel"}};
+  if (mode == StageMode::SIMT)
+    result["simt_workload_aiv_partitions"] = aivSubblocks;
+  return result;
 }
 
 bool StageModelFeatures::isValid() const {
@@ -228,9 +333,17 @@ bool StageMemoryAccess::hasStaticLayout() const {
   if (shape.empty() || strides.size() != shape.size() || elementBits <= 0 ||
       elementBits % 8 != 0)
     return false;
-  return llvm::all_of(shape, [](int64_t extent) { return extent > 0; }) &&
-         llvm::all_of(strides,
-                      [](const auto &stride) { return stride && *stride > 0; });
+  if (!llvm::all_of(shape, [](int64_t extent) { return extent > 0; }))
+    return false;
+  for (size_t axis = 0; axis < shape.size(); ++axis) {
+    if (!strides[axis])
+      return false;
+    if (shape[axis] > 1 && *strides[axis] <= 0)
+      return false;
+    if (shape[axis] == 1 && *strides[axis] < 0)
+      return false;
+  }
+  return true;
 }
 
 int64_t StageMemoryAccess::contiguousAxisBytes() const {
@@ -286,6 +399,29 @@ int64_t StageMemoryAccess::rowCount() const {
   const int64_t contiguousElements = contiguousBytes / elementBytes;
   return contiguousElements > 0 ? llvm::divideCeil(elements, contiguousElements)
                                 : 0;
+}
+
+int64_t StageMemoryAccess::provenContiguousElements() const {
+  if (shape.empty() || shape.size() != strides.size())
+    return 1;
+  llvm::SmallVector<std::pair<int64_t, int64_t>, 5> dimensions;
+  for (size_t axis = 0; axis < shape.size(); ++axis) {
+    if (shape[axis] <= 1 || !strides[axis] || *strides[axis] <= 0)
+      continue;
+    dimensions.emplace_back(*strides[axis], shape[axis]);
+  }
+  llvm::sort(dimensions);
+  int64_t elements = 1;
+  int64_t expectedStride = 1;
+  for (const auto &[stride, extent] : dimensions) {
+    if (stride != expectedStride)
+      break;
+    if (elements > std::numeric_limits<int64_t>::max() / extent)
+      return 1;
+    elements *= extent;
+    expectedStride = elements;
+  }
+  return std::max<int64_t>(1, elements);
 }
 
 int64_t StageMemoryAccess::descriptorCount(unsigned maxRank) const {
@@ -358,7 +494,8 @@ bool StageMemoryAccess::isFlatContiguous() const {
 
 bool StageMemoryAccess::isValid() const {
   if (elementBits <= 0 || !std::isfinite(count) || count < 0.0 ||
-      shape.size() != strides.size())
+      !std::isfinite(activeElementRatio) || activeElementRatio < 0.0 ||
+      activeElementRatio > 1.0 || shape.size() != strides.size())
     return false;
   // Broadcast/reversed/unknown strides are legal workloads even when this
   // calibration only covers positive, non-broadcast descriptors.
@@ -404,6 +541,9 @@ std::string StageMemoryAccess::layoutKey() const {
 }
 
 llvm::json::Object StageMemoryAccess::toJSON() const {
+  llvm::json::Array consumers;
+  for (const auto &path : dotConsumerPaths)
+    consumers.push_back(path);
   llvm::json::Array shapeJSON;
   for (int64_t extent : shape)
     shapeJSON.push_back(extent);
@@ -418,11 +558,22 @@ llvm::json::Object StageMemoryAccess::toJSON() const {
       {"count_per_iteration", count},
       {"store", store},
       {"masked", masked},
+      {"address_depends_on_loaded_index", addressDependsOnLoadedIndex},
+      {"address_has_non_affine_tensor_computation",
+       addressHasNonAffineTensorComputation},
+      {"address_has_tensor_control_flow_selection",
+       addressHasTensorControlFlowSelection},
+      {"masked_store_has_matching_load_dependency",
+       maskedStoreHasMatchingLoadDependency},
+      {"active_element_ratio", activeElementRatio},
+      {"from_dot_accumulator", fromDotAccumulator},
+      {"dot_consumer_paths", std::move(consumers)},
       {"effective_rank", effectiveRank()},
       {"contiguous_axis_bytes", contiguousAxisBytes()},
       {"row_bytes", rowBytes()},
       {"row_stride_bytes", rowStrideBytes()},
       {"row_count", rowCount()},
+      {"proven_contiguous_elements", provenContiguousElements()},
       {"unfolded_pieces_if_5d", descriptorCount(5)},
       {"unfolded_pieces_if_2d", descriptorCount(2)},
       {"layout_key", layoutKey()},
@@ -430,14 +581,69 @@ llvm::json::Object StageMemoryAccess::toJSON() const {
   };
 }
 
+std::string AtomicWorkload::profileKey() const { return kind + "." + dataType; }
+
+bool AtomicWorkload::isFiniteAndNonNegative() const {
+  const std::array<double, 3> values = {
+      logicalElements, logicalOperationInstances, provenContiguousRunWidth};
+  return !kind.empty() && !dataType.empty() && !memorySemantic.empty() &&
+         !memoryScope.empty() &&
+         std::all_of(values.begin(), values.end(), [](double value) {
+           return std::isfinite(value) && value >= 0.0;
+         });
+}
+
+llvm::json::Object AtomicWorkload::toJSON() const {
+  llvm::json::Object result;
+  result["kind"] = kind;
+  result["data_type"] = dataType;
+  result["memory_semantic"] = memorySemantic;
+  result["memory_scope"] = memoryScope;
+  result["logical_elements_per_iteration"] = logicalElements;
+  result["logical_operation_instances_per_iteration"] =
+      logicalOperationInstances;
+  if (provenContiguousRunWidth > 0.0)
+    result["proven_contiguous_run_width"] = provenContiguousRunWidth;
+  else
+    result["proven_contiguous_run_width"] = nullptr;
+  result["result_used"] = resultUsed;
+  result["address_depends_on_loaded_index"] = addressDependsOnLoadedIndex;
+  result["contention"] = contentionUnknown ? "runtime_unknown" : "proven";
+  return result;
+}
+
+bool TensorOperationWorkload::isFiniteAndNonNegative() const {
+  const std::array<double, 2> values = {logicalElements, segmentCount};
+  return !operation.empty() && elementBitWidth > 0 &&
+         contiguousElementsPerSegment > 0 &&
+         std::all_of(values.begin(), values.end(), [](double value) {
+           return std::isfinite(value) && value >= 0.0;
+         });
+}
+
+llvm::json::Object TensorOperationWorkload::toJSON() const {
+  return llvm::json::Object{
+      {"operation", operation},
+      {"element_bit_width", elementBitWidth},
+      {"logical_elements_per_iteration", logicalElements},
+      {"segment_count_per_iteration", segmentCount},
+      {"contiguous_elements_per_segment", contiguousElementsPerSegment},
+      {"simd_lowering", "segmented_vector"}};
+}
+
 bool StageWorkload::isFiniteAndNonNegative() const {
-  const std::array<double, 15> values = {scalarOperations,
+  const std::array<double, 22> values = {scalarOperations,
                                          loadBytes,
                                          storeBytes,
                                          loadOperations,
                                          storeOperations,
                                          loadWarpInstructions,
                                          storeWarpInstructions,
+                                         sharedLocalLoadInstructions,
+                                         sharedLocalStoreInstructions,
+                                         privateStackLoadInstructions,
+                                         privateStackStoreInstructions,
+                                         reductionOperations,
                                          shuffleLaneSteps,
                                          dotOperations,
                                          dotFlops,
@@ -445,7 +651,9 @@ bool StageWorkload::isFiniteAndNonNegative() const {
                                          loopBackedges,
                                          conditionalBranches,
                                          divergentBranches,
-                                         synchronizations};
+                                         synchronizations,
+                                         scalarLoadCount,
+                                         scalarStoreCount};
   if (!std::all_of(values.begin(), values.end(), [](double value) {
         return std::isfinite(value) && value >= 0.0;
       }))
@@ -456,22 +664,93 @@ bool StageWorkload::isFiniteAndNonNegative() const {
              shapeCount.second >= 0.0;
     });
   };
+  auto validNamedCounts = [](const auto &counts) {
+    return llvm::all_of(counts, [](const auto &namedCount) {
+      return !namedCount.first.empty() && std::isfinite(namedCount.second) &&
+             namedCount.second >= 0.0;
+    });
+  };
   auto validMemoryCounts = [](const auto &counts) {
     return llvm::all_of(counts, [](const auto &shapeCount) {
       return shapeCount.first.first > 0 && shapeCount.first.second > 0 &&
              std::isfinite(shapeCount.second) && shapeCount.second >= 0.0;
     });
   };
+  auto validSegmentedIndirect = [](const auto &counts) {
+    return llvm::all_of(counts, [](const auto &shapeCount) {
+      return std::get<0>(shapeCount.first) > 0 &&
+             std::get<1>(shapeCount.first) > 0 &&
+             std::get<2>(shapeCount.first) > 1 &&
+             std::get<2>(shapeCount.first) <= std::get<1>(shapeCount.first) &&
+             std::isfinite(shapeCount.second) && shapeCount.second >= 0.0;
+    });
+  };
   const bool validPrefixScans =
       llvm::all_of(prefixScanCounts, [](const auto &shapeCount) {
-        return shapeCount.first.first > 1 && shapeCount.first.second > 0 &&
+        return std::get<0>(shapeCount.first) > 1 &&
+               std::get<1>(shapeCount.first) > 0 &&
+               std::get<2>(shapeCount.first) > 0 &&
+               std::get<3>(shapeCount.first) > 0 &&
+               !std::get<5>(shapeCount.first).empty() &&
                std::isfinite(shapeCount.second) && shapeCount.second >= 0.0;
       });
   const bool validAccesses = llvm::all_of(
       memoryAccesses, [](const auto &access) { return access.isValid(); });
-  return validAccesses && validCounts(predicateCounts) &&
+  const bool validDotPaths =
+      llvm::all_of(dotOperandPaths, [](const auto &entry) {
+        return !entry.first.empty() && entry.second.first > 0 &&
+               std::isfinite(entry.second.second) && entry.second.second >= 0.0;
+      });
+  const bool validTensorOperations = llvm::all_of(
+      tensorOperationWorkloads, [](const TensorOperationWorkload &tensor) {
+        return tensor.isFiniteAndNonNegative();
+      });
+  const bool validAtomicWorkloads =
+      llvm::all_of(atomicWorkloads, [](const AtomicWorkload &atomic) {
+        return atomic.isFiniteAndNonNegative();
+      });
+  return validAccesses && validDotPaths && validTensorOperations &&
+         validAtomicWorkloads && validCounts(predicateCounts) &&
          validCounts(dotFlopCounts) && validPrefixScans &&
          validMemoryCounts(indirectLoadCounts) &&
+         validSegmentedIndirect(segmentedIndirectLoadCounts) &&
+         validMemoryCounts(indirectStoreCounts) &&
+         validSegmentedIndirect(segmentedIndirectStoreCounts) &&
+         validNamedCounts(reductionCombineClassCounts) &&
+         llvm::all_of(reductionGeometryCounts,
+                      [](const auto &shapeCount) {
+                        return std::get<0>(shapeCount.first) > 0 &&
+                               std::get<1>(shapeCount.first) > 1 &&
+                               std::get<2>(shapeCount.first) > 0 &&
+                               std::isfinite(shapeCount.second) &&
+                               shapeCount.second >= 0.0;
+                      }) &&
+         llvm::all_of(scalarizedMultiResultReductionCounts,
+                      [](const auto &shapeCount) {
+                        return std::get<0>(shapeCount.first) > 0 &&
+                               std::get<1>(shapeCount.first) > 1 &&
+                               std::get<2>(shapeCount.first) > 1 &&
+                               std::get<3>(shapeCount.first) > 0 &&
+                               std::isfinite(shapeCount.second) &&
+                               shapeCount.second >= 0.0;
+                      }) &&
+         llvm::all_of(sortCounts,
+                      [](const auto &shapeCount) {
+                        return std::get<0>(shapeCount.first) > 0 &&
+                               std::get<1>(shapeCount.first) > 1 &&
+                               std::get<2>(shapeCount.first) > 0 &&
+                               std::isfinite(shapeCount.second) &&
+                               shapeCount.second >= 0.0;
+                      }) &&
+         llvm::all_of(oneTripMaskedAccumulatorReductionExtents,
+                      [](const auto &shapeCount) {
+                        return shapeCount.first.first > 1 &&
+                               shapeCount.first.second > 0 &&
+                               shapeCount.first.second <=
+                                   shapeCount.first.first &&
+                               std::isfinite(shapeCount.second) &&
+                               shapeCount.second >= 0.0;
+                      }) &&
          validMemoryCounts(continuousLoadCounts) &&
          validMemoryCounts(continuousStoreCounts) &&
          llvm::all_of(operationCounts, [&](const auto &entry) {
@@ -496,6 +775,10 @@ llvm::json::Object StageWorkload::toJSON() const {
   }
   result["operation_elements_per_iteration"] = std::move(operations);
   result["operation_instances_per_iteration"] = std::move(instances);
+  llvm::json::Array tensorOperations;
+  for (const TensorOperationWorkload &tensor : tensorOperationWorkloads)
+    tensorOperations.push_back(tensor.toJSON());
+  result["tensor_operation_workloads"] = std::move(tensorOperations);
   result["scalar_operations_per_iteration"] = scalarOperations;
   result["load_bytes_per_iteration"] = loadBytes;
   result["store_bytes_per_iteration"] = storeBytes;
@@ -503,10 +786,22 @@ llvm::json::Object StageWorkload::toJSON() const {
   result["store_operations_per_iteration"] = storeOperations;
   result["load_warp_instructions_per_iteration"] = loadWarpInstructions;
   result["store_warp_instructions_per_iteration"] = storeWarpInstructions;
+  result["shared_local_load_instructions_per_iteration"] =
+      sharedLocalLoadInstructions;
+  result["shared_local_store_instructions_per_iteration"] =
+      sharedLocalStoreInstructions;
+  result["private_stack_load_instructions_per_iteration"] =
+      privateStackLoadInstructions;
+  result["private_stack_store_instructions_per_iteration"] =
+      privateStackStoreInstructions;
   llvm::json::Array accesses;
   for (const StageMemoryAccess &access : memoryAccesses)
     accesses.push_back(access.toJSON());
   result["memory_accesses_per_iteration"] = std::move(accesses);
+  llvm::json::Array atomicOperations;
+  for (const AtomicWorkload &atomic : atomicWorkloads)
+    atomicOperations.push_back(atomic.toJSON());
+  result["atomic_workloads"] = std::move(atomicOperations);
   llvm::json::Array continuousLoads;
   for (const auto &[shape, count] : continuousLoadCounts)
     continuousLoads.push_back(
@@ -534,6 +829,35 @@ llvm::json::Object StageWorkload::toJSON() const {
                             llvm::divideCeil(shape.second, int64_t(32))},
                            {"operations_per_iteration", count}});
   result["indirect_load_shapes"] = std::move(indirectLoads);
+  llvm::json::Array segmentedIndirectLoads;
+  for (const auto &[shape, count] : segmentedIndirectLoadCounts)
+    segmentedIndirectLoads.push_back(llvm::json::Object{
+        {"bytes_per_operation", std::get<0>(shape)},
+        {"elements_per_operation", std::get<1>(shape)},
+        {"contiguous_elements_per_segment", std::get<2>(shape)},
+        {"segments_per_operation",
+         llvm::divideCeil(std::get<1>(shape), std::get<2>(shape))},
+        {"operations_per_iteration", count}});
+  result["segmented_indirect_load_shapes"] = std::move(segmentedIndirectLoads);
+  llvm::json::Array indirectStores;
+  for (const auto &[shape, count] : indirectStoreCounts)
+    indirectStores.push_back(
+        llvm::json::Object{{"bytes_per_operation", shape.first},
+                           {"elements_per_operation", shape.second},
+                           {"segments_per_operation", shape.second},
+                           {"operations_per_iteration", count}});
+  result["indirect_store_shapes"] = std::move(indirectStores);
+  llvm::json::Array segmentedIndirectStores;
+  for (const auto &[shape, count] : segmentedIndirectStoreCounts)
+    segmentedIndirectStores.push_back(llvm::json::Object{
+        {"bytes_per_operation", std::get<0>(shape)},
+        {"elements_per_operation", std::get<1>(shape)},
+        {"contiguous_elements_per_segment", std::get<2>(shape)},
+        {"segments_per_operation",
+         llvm::divideCeil(std::get<1>(shape), std::get<2>(shape))},
+        {"operations_per_iteration", count}});
+  result["segmented_indirect_store_shapes"] =
+      std::move(segmentedIndirectStores);
   double predicateElements = 0.0;
   llvm::json::Array predicates;
   for (const auto &[size, count] : predicateCounts) {
@@ -546,23 +870,77 @@ llvm::json::Object StageWorkload::toJSON() const {
   llvm::json::Array prefixScans;
   for (const auto &[shape, count] : prefixScanCounts)
     prefixScans.push_back(
-        llvm::json::Object{{"axis_extent", shape.first},
-                           {"independent_sequence_count", shape.second},
+        llvm::json::Object{{"axis_extent", std::get<0>(shape)},
+                           {"independent_sequence_count", std::get<1>(shape)},
+                           {"axis_stride_elements", std::get<2>(shape)},
+                           {"result_count", std::get<3>(shape)},
+                           {"reverse", std::get<4>(shape)},
+                           {"combine_class", std::get<5>(shape)},
                            {"count_per_iteration", count}});
   result["prefix_scan_instances_per_iteration"] = std::move(prefixScans);
+  result["reduction_operations_per_iteration"] = reductionOperations;
   result["shuffle_lane_steps_per_iteration"] = shuffleLaneSteps;
+  llvm::json::Array reductionGeometries;
+  for (const auto &[shape, count] : reductionGeometryCounts)
+    reductionGeometries.push_back(
+        llvm::json::Object{{"independent_rows", std::get<0>(shape)},
+                           {"axis_extent", std::get<1>(shape)},
+                           {"element_bit_width", std::get<2>(shape)},
+                           {"count_per_iteration", count}});
+  result["reduction_instances_per_iteration"] = std::move(reductionGeometries);
+  llvm::json::Array reductionCombines;
+  for (const auto &[combineClass, count] : reductionCombineClassCounts)
+    reductionCombines.push_back(llvm::json::Object{
+        {"combine_class", combineClass}, {"count_per_iteration", count}});
+  result["reduction_combine_classes_per_iteration"] =
+      std::move(reductionCombines);
+  llvm::json::Array scalarizedReductions;
+  for (const auto &[shape, count] : scalarizedMultiResultReductionCounts)
+    scalarizedReductions.push_back(
+        llvm::json::Object{{"independent_rows", std::get<0>(shape)},
+                           {"axis_extent", std::get<1>(shape)},
+                           {"result_count", std::get<2>(shape)},
+                           {"element_bit_width", std::get<3>(shape)},
+                           {"count_per_iteration", count}});
+  result["scalarized_multi_result_reductions_per_iteration"] =
+      std::move(scalarizedReductions);
+  llvm::json::Array sorts;
+  for (const auto &[shape, count] : sortCounts)
+    sorts.push_back(
+        llvm::json::Object{{"independent_rows", std::get<0>(shape)},
+                           {"axis_extent", std::get<1>(shape)},
+                           {"element_bit_width", std::get<2>(shape)},
+                           {"count_per_iteration", count}});
+  result["sort_instances_per_iteration"] = std::move(sorts);
+  llvm::json::Array maskedAccumulatorReductions;
+  for (const auto &[shape, count] : oneTripMaskedAccumulatorReductionExtents)
+    maskedAccumulatorReductions.push_back(
+        llvm::json::Object{{"physical_axis_extent", shape.first},
+                           {"active_axis_extent", shape.second},
+                           {"count_per_iteration", count}});
+  result["one_trip_masked_accumulator_reductions_per_iteration"] =
+      std::move(maskedAccumulatorReductions);
   result["dot_operations_per_iteration"] = dotOperations;
   llvm::json::Array dotInstances;
   for (const auto &[flops, count] : dotFlopCounts)
     dotInstances.push_back(llvm::json::Object{{"flops_per_matrix", flops},
                                               {"matrix_instances", count}});
   result["dot_instances_per_iteration"] = std::move(dotInstances);
+  llvm::json::Array dotPaths;
+  for (const auto &[key, entry] : dotOperandPaths)
+    dotPaths.push_back(
+        llvm::json::Object{{"path", key},
+                           {"flops_per_matrix", entry.first},
+                           {"count_per_iteration", entry.second}});
+  result["dot_operand_paths"] = std::move(dotPaths);
   result["dot_flops_per_iteration"] = dotFlops;
   result["issue_elements_per_iteration"] = issueElements;
   result["loop_backedges_per_iteration"] = loopBackedges;
   result["conditional_branches_per_iteration"] = conditionalBranches;
   result["divergent_branches_per_iteration"] = divergentBranches;
   result["synchronizations_per_iteration"] = synchronizations;
+  result["scalar_load_count_per_iteration"] = scalarLoadCount;
+  result["scalar_store_count_per_iteration"] = scalarStoreCount;
   result["pays_kernel_setup"] = paysKernelSetup;
   return result;
 }
@@ -580,6 +958,8 @@ llvm::json::Object StageModelFeatures::toJSON() const {
   result["has_dot"] = hasDot;
   result["has_conversion_pack"] = hasConversionPack;
   result["inside_auto_blockify_v1_loop"] = insideAutoBlockifyV1Loop;
+  result["is_grid_stride_loop_shell"] = isGridStrideLoopShell;
+  result["inside_grid_stride_loop_body"] = insideGridStrideLoopBody;
   result["conditional_branch_count"] = conditionalBranchCount;
   result["divergent_branch_count"] = divergentBranchCount;
   result["loop_backedge_count"] = loopBackedgeCount;
@@ -593,22 +973,58 @@ llvm::json::Object StageModelFeatures::toJSON() const {
 }
 
 bool StageResourceCycles::isFiniteAndNonNegative() const {
-  const std::array<double, 16> values = {setup,
-                                         scalar,
-                                         load,
-                                         store,
-                                         compute,
-                                         predicate,
-                                         shuffle,
-                                         dot,
-                                         issue,
-                                         prefixScanIssue,
-                                         prefixScanCriticalPath,
-                                         recurrenceGroupCriticalPath,
-                                         continuousLoadGroup,
-                                         continuousStoreGroup,
-                                         storeLayoutService,
-                                         criticalPath};
+  const std::array<double, 51> values = {
+      setup,
+      scalar,
+      load,
+      store,
+      sharedLocalLoad,
+      sharedLocalStore,
+      privateStackLoad,
+      privateStackStore,
+      privateStackCombinedFloor,
+      computedAddressScalarizedLoad,
+      controlFlowAddressScalarizedLoad,
+      maskedLoadStoreReadModifyWrite,
+      sharedLayout,
+      atomic,
+      singlePhysicalProgramAtomic,
+      compute,
+      operationCompletion,
+      predicate,
+      reduction,
+      scalarizedMultiResultReduction,
+      sort,
+      maskedAccumulatorReductionCompletionSetup,
+      rowwiseReductionGroupBody,
+      multiResultReductionGroupBody,
+      shuffle,
+      scanShuffle,
+      dot,
+      dotOperandGroup,
+      dotInputLoadsCovered,
+      loopControl,
+      branchControl,
+      divergence,
+      synchronization,
+      spill,
+      issue,
+      irregularMaskedTileFloor,
+      irregularPhysicalMaterialization,
+      irregularFullPhysicalMaterialization,
+      irregularTailMaterialization,
+      prefixScanIssue,
+      prefixScanCriticalPath,
+      gridStridePrefixScanBody,
+      recurrenceGroupCriticalPath,
+      recurrenceGroupStartup,
+      continuousLoadGroup,
+      continuousStoreGroup,
+      indirectLoadGroup,
+      indirectLoadGroupStartup,
+      gridStrideStartup,
+      storeLayoutService,
+      criticalPath};
   return std::all_of(values.begin(), values.end(), [](double value) {
     return std::isfinite(value) && value >= 0.0;
   });
@@ -620,37 +1036,334 @@ llvm::json::Object StageResourceCycles::toJSON() const {
   result["scalar_per_iteration"] = scalar;
   result["load_per_iteration"] = load;
   result["store_per_iteration"] = store;
+  result["rowwise_additional_load_setups_owned_once"] =
+      rowwiseAdditionalLoadSetupsOwnedOnce;
+  result["shared_local_load_per_iteration"] = sharedLocalLoad;
+  result["shared_local_store_per_iteration"] = sharedLocalStore;
+  result["private_stack_load_per_iteration"] = privateStackLoad;
+  result["private_stack_store_per_iteration"] = privateStackStore;
+  result["private_stack_combined_floor_per_iteration"] =
+      privateStackCombinedFloor;
+  result["computed_address_scalarized_load_per_iteration"] =
+      computedAddressScalarizedLoad;
+  result["control_flow_address_scalarized_load_per_iteration"] =
+      controlFlowAddressScalarizedLoad;
+  result["masked_load_store_read_modify_write_per_iteration"] =
+      maskedLoadStoreReadModifyWrite;
+  result["dot_component_private_stack_floor_applied"] =
+      dotComponentPrivateStackFloorApplied;
+  result["shared_layout_per_iteration"] = sharedLayout;
   result["atomic_per_iteration"] = atomic;
+  result["single_physical_program_atomic_per_iteration"] =
+      singlePhysicalProgramAtomic;
+  result["has_single_physical_program_atomic_rate"] =
+      hasSinglePhysicalProgramAtomicRate;
   result["compute_per_iteration"] = compute;
+  result["operation_completion_per_iteration"] = operationCompletion;
   result["predicate_per_iteration"] = predicate;
+  result["reduction_per_iteration"] = reduction;
+  result["scalarized_multi_result_reduction_per_iteration"] =
+      scalarizedMultiResultReduction;
+  result["sort_per_iteration"] = sort;
+  result["masked_accumulator_reduction_completion_setup_system_cycles"] =
+      maskedAccumulatorReductionCompletionSetup;
+  result["rowwise_reduction_group_body_per_iteration"] =
+      rowwiseReductionGroupBody;
+  result["multi_result_reduction_group_body_per_iteration"] =
+      multiResultReductionGroupBody;
   result["shuffle_per_iteration"] = shuffle;
   result["scan_shuffle_per_iteration"] = scanShuffle;
   result["dot_per_iteration"] = dot;
+  result["dot_operand_group_included_in_dot"] = dotOperandGroup;
+  result["dot_input_loads_owned_by_composite"] = dotInputLoadsCovered;
+  result["loop_control_per_iteration"] = loopControl;
+  result["branch_control_per_iteration"] = branchControl;
+  result["divergence_per_iteration"] = divergence;
+  result["synchronization_per_iteration"] = synchronization;
+  result["spill_per_iteration"] = spill;
   result["issue_per_iteration"] = issue;
+  result["irregular_masked_tile_floor_per_iteration"] =
+      irregularMaskedTileFloor;
+  result["irregular_physical_materialization_per_iteration"] =
+      irregularPhysicalMaterialization;
+  result["irregular_full_physical_materialization_per_iteration"] =
+      irregularFullPhysicalMaterialization;
+  result["irregular_tail_materialization_per_iteration"] =
+      irregularTailMaterialization;
   result["prefix_scan_issue_per_iteration"] = prefixScanIssue;
   result["prefix_scan_critical_path_per_iteration"] = prefixScanCriticalPath;
+  result["grid_stride_prefix_scan_body_per_iteration"] =
+      gridStridePrefixScanBody;
+  result["grid_stride_factor_specific_resource_body"] =
+      gridStrideFactorSpecificResourceBody;
   result["recurrence_group_critical_path_per_iteration"] =
       recurrenceGroupCriticalPath;
+  result["recurrence_group_startup_system_cycles"] = recurrenceGroupStartup;
   result["continuous_load_group_per_iteration"] = continuousLoadGroup;
   result["continuous_store_group_per_iteration"] = continuousStoreGroup;
+  result["indirect_load_group_per_iteration"] = indirectLoadGroup;
+  result["indirect_load_group_startup_system_cycles"] =
+      indirectLoadGroupStartup;
+  result["grid_stride_startup_system_cycles"] = gridStrideStartup;
   result["store_layout_service_per_iteration"] = storeLayoutService;
   result["critical_path_per_iteration"] = criticalPath;
+  result["indirect_memory_analytical_fallback"] =
+      indirectMemoryAnalyticalFallback;
+  return result;
+}
+
+llvm::json::Object StageResourceCycles::toCompactJSON() const {
+  llvm::json::Object result;
+  auto add = [&](llvm::StringRef key, double value) {
+    if (value > 0.0)
+      result[key] = value;
+  };
+  add("setup", setup);
+  add("scalar_per_iteration", scalar);
+  add("load_per_iteration", load);
+  add("store_per_iteration", store);
+  if (rowwiseAdditionalLoadSetupsOwnedOnce)
+    result["rowwise_additional_load_setups_owned_once"] = true;
+  add("shared_local_load_per_iteration", sharedLocalLoad);
+  add("shared_local_store_per_iteration", sharedLocalStore);
+  add("private_stack_load_per_iteration", privateStackLoad);
+  add("private_stack_store_per_iteration", privateStackStore);
+  add("private_stack_combined_floor_per_iteration", privateStackCombinedFloor);
+  add("computed_address_scalarized_load_per_iteration",
+      computedAddressScalarizedLoad);
+  add("control_flow_address_scalarized_load_per_iteration",
+      controlFlowAddressScalarizedLoad);
+  add("masked_load_store_read_modify_write_per_iteration",
+      maskedLoadStoreReadModifyWrite);
+  if (dotComponentPrivateStackFloorApplied)
+    result["dot_component_private_stack_floor_applied"] = true;
+  add("shared_layout_per_iteration", sharedLayout);
+  add("atomic_per_iteration", atomic);
+  add("single_physical_program_atomic_per_iteration",
+      singlePhysicalProgramAtomic);
+  if (hasSinglePhysicalProgramAtomicRate)
+    result["has_single_physical_program_atomic_rate"] = true;
+  add("compute_per_iteration", compute);
+  add("operation_completion_per_iteration", operationCompletion);
+  add("predicate_per_iteration", predicate);
+  add("reduction_per_iteration", reduction);
+  add("scalarized_multi_result_reduction_per_iteration",
+      scalarizedMultiResultReduction);
+  add("sort_per_iteration", sort);
+  add("masked_accumulator_reduction_completion_setup_system_cycles",
+      maskedAccumulatorReductionCompletionSetup);
+  add("rowwise_reduction_group_body_per_iteration", rowwiseReductionGroupBody);
+  add("multi_result_reduction_group_body_per_iteration",
+      multiResultReductionGroupBody);
+  add("shuffle_per_iteration", shuffle);
+  add("scan_shuffle_per_iteration", scanShuffle);
+  add("dot_per_iteration", dot);
+  add("dot_operand_group_included_in_dot", dotOperandGroup);
+  add("dot_input_loads_owned_by_composite", dotInputLoadsCovered);
+  add("loop_control_per_iteration", loopControl);
+  add("branch_control_per_iteration", branchControl);
+  add("divergence_per_iteration", divergence);
+  add("synchronization_per_iteration", synchronization);
+  add("spill_per_iteration", spill);
+  add("issue_per_iteration", issue);
+  add("irregular_masked_tile_floor_per_iteration", irregularMaskedTileFloor);
+  add("irregular_physical_materialization_per_iteration",
+      irregularPhysicalMaterialization);
+  add("irregular_full_physical_materialization_per_iteration",
+      irregularFullPhysicalMaterialization);
+  add("irregular_tail_materialization_per_iteration",
+      irregularTailMaterialization);
+  add("prefix_scan_issue_per_iteration", prefixScanIssue);
+  add("prefix_scan_critical_path_per_iteration", prefixScanCriticalPath);
+  add("grid_stride_prefix_scan_body_per_iteration", gridStridePrefixScanBody);
+  if (gridStrideFactorSpecificResourceBody)
+    result["grid_stride_factor_specific_resource_body"] = true;
+  add("recurrence_group_critical_path_per_iteration",
+      recurrenceGroupCriticalPath);
+  add("recurrence_group_startup_system_cycles", recurrenceGroupStartup);
+  add("continuous_load_group_per_iteration", continuousLoadGroup);
+  add("continuous_store_group_per_iteration", continuousStoreGroup);
+  add("indirect_load_group_per_iteration", indirectLoadGroup);
+  add("indirect_load_group_startup_system_cycles", indirectLoadGroupStartup);
+  add("grid_stride_startup_system_cycles", gridStrideStartup);
+  add("store_layout_service_per_iteration", storeLayoutService);
+  add("critical_path_per_iteration", criticalPath);
+  if (indirectMemoryAnalyticalFallback)
+    result["indirect_memory_analytical_fallback"] = true;
   return result;
 }
 
 bool StageImplementationCost::isValid() const {
   return implementation.isValid() && std::isfinite(totalCycles) &&
-         totalCycles >= 0.0 && resources.isFiniteAndNonNegative();
+         totalCycles >= 0.0 && std::isfinite(cvPartitionIdealTotalCycles) &&
+         cvPartitionIdealTotalCycles >= 0.0 &&
+         std::isfinite(cvPartitionPayloadEfficiency) &&
+         cvPartitionPayloadEfficiency >= 0.0 &&
+         cvPartitionPayloadEfficiency <= 1.0 &&
+         std::isfinite(cvPartitionInefficiencyCorrectionCycles) &&
+         cvPartitionInefficiencyCorrectionCycles >= 0.0 &&
+         resources.isFiniteAndNonNegative() &&
+         (!perAivWorkload || perAivWorkload->isFiniteAndNonNegative());
 }
 
 llvm::json::Object StageImplementationCost::toJSON() const {
-  return llvm::json::Object{{"implementation", implementation.toJSON()},
-                            {"total_system_cycles", totalCycles},
-                            {"formula_evidence", formulaEvidence},
-                            {"resource_system_cycles", resources.toJSON()}};
+  llvm::json::Object result{
+      {"implementation", implementation.toJSON()},
+      {"total_system_cycles", totalCycles},
+      {"local_scope_completion_inclusive", localScopeCompletionInclusive},
+      {"formula_evidence", formulaEvidence},
+      {"resource_system_cycles", resources.toJSON()}};
+  if (perAivWorkload)
+    result["per_aiv_workload_before_superblock"] = perAivWorkload->toJSON();
+  if (implementation.aivSubblocks > 1) {
+    result["cv_partition_ideal_total_system_cycles"] =
+        cvPartitionIdealTotalCycles;
+    result["cv_partition_payload_efficiency"] = cvPartitionPayloadEfficiency;
+    result["cv_partition_inefficiency_correction_system_cycles"] =
+        cvPartitionInefficiencyCorrectionCycles;
+  }
+  return result;
 }
 
-llvm::json::Object LogicalStageCost::toJSON() const {
+llvm::json::Object StageImplementationCost::toCompactJSON() const {
+  llvm::json::Object result{
+      {"implementation", implementation.toJSON()},
+      {"total_system_cycles", totalCycles},
+      {"formula_evidence", formulaEvidence},
+      {"resource_system_cycles", resources.toCompactJSON()}};
+  if (localScopeCompletionInclusive)
+    result["local_scope_completion_inclusive"] = true;
+  if (implementation.aivSubblocks > 1) {
+    result["cv_partition_ideal_total_system_cycles"] =
+        cvPartitionIdealTotalCycles;
+    result["cv_partition_payload_efficiency"] = cvPartitionPayloadEfficiency;
+    result["cv_partition_inefficiency_correction_system_cycles"] =
+        cvPartitionInefficiencyCorrectionCycles;
+  }
+  return result;
+}
+
+llvm::json::Object SimtDotPressureSite::toJSON() const {
+  return llvm::json::Object{
+      {"m", m},
+      {"n", n},
+      {"k", k},
+      {"element_bits", elementBits},
+      {"operand_32bit_units_per_thread", operandUnitsPerThread},
+      {"retained_tensor_32bit_units_per_thread", retainedTensorUnitsPerThread},
+      {"retained_scalar_32bit_units_per_thread", retainedScalarUnitsPerThread}};
+}
+
+llvm::json::Object SimtDotDependencySite::toJSON() const {
+  llvm::json::Array predecessors;
+  for (int64_t predecessor : predecessorOrdinals)
+    predecessors.push_back(predecessor);
+  return llvm::json::Object{
+      {"ordinal", ordinal},
+      {"operation_ordinal", operationOrdinal},
+      {"predecessor_ordinals", std::move(predecessors)},
+      {"depth", depth},
+      {"successor_count", successorCount},
+      {"non_dot_pure_consumer_count", nonDotPureConsumerCount},
+      {"side_effect_frontier_count", sideEffectFrontierCount},
+      {"max_non_dot_pure_use_span", maxNonDotPureUseSpan},
+      {"max_side_effect_use_span", maxSideEffectUseSpan}};
+}
+
+llvm::json::Object SimtRegisterPressure::toJSON() const {
+  llvm::StringRef chargeRegion = "none";
+  switch (dotComponentPrivateStackChargeRegion) {
+  case SimtPrivateStackChargeRegion::None:
+    break;
+  case SimtPrivateStackChargeRegion::WholeFunction:
+    chargeRegion = "whole_function";
+    break;
+  case SimtPrivateStackChargeRegion::BeforeRecurrence:
+    chargeRegion = "before_recurrence";
+    break;
+  case SimtPrivateStackChargeRegion::DotRegion:
+    chargeRegion = "dot_region";
+    break;
+  case SimtPrivateStackChargeRegion::AfterDot:
+    chargeRegion = "after_dot";
+    break;
+  }
+  llvm::json::Array dots;
+  for (const auto &site : dotSites)
+    dots.push_back(site.toJSON());
+  llvm::json::Array dotDependencies;
+  for (const auto &site : dotDependencySites)
+    dotDependencies.push_back(site.toJSON());
+  return llvm::json::Object{
+      {"scope", "whole_simt_vf"},
+      {"status", "uncalibrated_ttir_pressure_proxy"},
+      {"base_warp_count", baseWarpCount},
+      {"peak_live_32bit_units_per_thread", peakLiveUnitsPerThread},
+      {"peak_tensor_32bit_units_per_thread", peakTensorUnitsPerThread},
+      {"peak_scalar_32bit_units_per_thread", peakScalarUnitsPerThread},
+      {"peak_cross_stage_32bit_units_per_thread", peakCrossStageUnitsPerThread},
+      {"peak_loop_carried_32bit_units_per_thread",
+       peakLoopCarriedUnitsPerThread},
+      {"peak_rematerializable_32bit_units_per_thread",
+       peakRematerializableUnitsPerThread},
+      {"peak_live_predicate_units_per_thread", peakLivePredicateUnitsPerThread},
+      {"predicate_definition_units_per_thread",
+       predicateDefinitionUnitsPerThread},
+      {"predicate_use_units_per_thread", predicateUseUnitsPerThread},
+      {"max_predicate_fanout", maxPredicateFanout},
+      {"ttir_integer_equality_predicate_definition_units_per_thread",
+       ttirIntegerEqualityPredicateDefinitionUnitsPerThread},
+      {"ttir_integer_ordered_predicate_definition_units_per_thread",
+       ttirIntegerOrderedPredicateDefinitionUnitsPerThread},
+      {"ttir_predicate_shape_definition_units_per_thread",
+       ttirPredicateShapeDefinitionUnitsPerThread},
+      {"ttir_other_predicate_definition_units_per_thread",
+       ttirOtherPredicateDefinitionUnitsPerThread},
+      {"ttir_predicate_dag_edge_units_per_thread",
+       ttirPredicateDagEdgeUnitsPerThread},
+      {"ttir_max_predicate_dag_depth", ttirMaxPredicateDagDepth},
+      {"ttir_select_predicate_use_units_per_thread",
+       ttirSelectPredicateUseUnitsPerThread},
+      {"ttir_boolean_predicate_use_units_per_thread",
+       ttirBooleanPredicateUseUnitsPerThread},
+      {"loop_invariant_predicate_units_per_thread",
+       loopInvariantPredicateUnitsPerThread},
+      {"loop_invariant_predicate_use_units_per_thread",
+       loopInvariantPredicateUseUnitsPerThread},
+      {"peak_pointer_32bit_units_per_thread", peakPointerUnitsPerThread},
+      {"peak_block_pointer_count", peakBlockPointerCount},
+      {"peak_block_pointer_rank_sum", peakBlockPointerRankSum},
+      {"unknown_value_count", unknownValueCount},
+      {"lowered_peak_live_32bit_units_per_thread",
+       loweredPeakLiveUnitsPerThread},
+      {"backend_unroll_factor", backendUnrollFactor},
+      {"ttir_dot_definition_count", ttirDotDefinitionCount},
+      {"ttir_dot_dependency_edge_count", ttirDotDependencyEdgeCount},
+      {"ttir_dot_dependency_source_count", ttirDotDependencySourceCount},
+      {"ttir_dot_dependency_sink_count", ttirDotDependencySinkCount},
+      {"ttir_max_dot_dependency_depth", ttirMaxDotDependencyDepth},
+      {"ttir_maximum_weak_dot_component_nodes",
+       ttirMaximumWeakDotComponentNodes},
+      {"ttir_maximum_weak_dot_component_geometry_known",
+       ttirMaximumWeakDotComponentGeometryKnown},
+      {"ttir_maximum_weak_dot_component_m", ttirMaximumWeakDotComponentM},
+      {"ttir_maximum_weak_dot_component_n", ttirMaximumWeakDotComponentN},
+      {"ttir_maximum_weak_dot_component_k", ttirMaximumWeakDotComponentK},
+      {"ttir_maximum_weak_dot_component_element_bits",
+       ttirMaximumWeakDotComponentElementBits},
+      {"ttir_function_dot_use_signature", ttirFunctionDotUseSignature},
+      {"dot_component_private_stack_charge_owner",
+       dotComponentPrivateStackChargeRegion !=
+           SimtPrivateStackChargeRegion::None},
+      {"dot_component_private_stack_charge_region", chargeRegion},
+      {"ttir_dot_dependency_sites", std::move(dotDependencies)},
+      {"dot_live_contexts", std::move(dots)},
+      {"layout_mapping", "balanced_elements_unpacked_not_lowering_proof"},
+      {"spill_cost_included", false}};
+}
+
+llvm::json::Object
+LogicalStageCost::toJSON(bool includeDiagnosticImplementations) const {
   llvm::json::Object result;
   result["id"] = id;
   result["model"] = model;
@@ -667,6 +1380,16 @@ llvm::json::Object LogicalStageCost::toJSON() const {
   result["live_out_count"] = liveOutCount;
   result["live_in_bytes"] = liveInBytes;
   result["live_out_bytes"] = liveOutBytes;
+  if (wholeSimtRegisterPressure)
+    result["whole_simt_register_pressure"] =
+        wholeSimtRegisterPressure->toJSON();
+  result["simt_ub_working_set_bytes_per_program"] =
+      simtUbWorkingSetBytesPerProgram;
+  result["simt_usable_ub_bytes"] = simtUsableUbBytes;
+  llvm::json::Array rejectedUbFactors;
+  for (int64_t factor : simtFactorsRejectedByUb)
+    rejectedUbFactors.push_back(factor);
+  result["simt_factors_rejected_by_ub"] = std::move(rejectedUbFactors);
   result["scope_input_tensor_bytes"] = scopeInputTensorBytes;
   result["scope_output_tensor_bytes"] = scopeOutputTensorBytes;
   llvm::json::Array anchorIndices;
@@ -683,19 +1406,46 @@ llvm::json::Object LogicalStageCost::toJSON() const {
   for (int64_t factor : localSimtFactors)
     localFactors.push_back(factor);
   result["local_simt_factors"] = std::move(localFactors);
+  if (includeDiagnosticImplementations) {
+    llvm::json::Array estimates;
+    for (const StageImplementationCost &cost : simtCalibrationEstimates) {
+      llvm::json::Object estimate = cost.toJSON();
+      estimate["estimate_only"] = true;
+      estimate["includes_scope_boundary_costs"] = false;
+      // This is Stage-local availability, not proof that several such Stages
+      // can be combined into one executable Mixed/SuperBlock route.
+      estimate["local_implementation_available"] =
+          findImplementationCost(*this, cost.implementation) != nullptr;
+      estimates.push_back(std::move(estimate));
+    }
+    result["simt_calibration_estimates"] = std::move(estimates);
+  }
   llvm::json::Array costs;
   for (const StageImplementationCost &implementation : implementations)
-    costs.push_back(implementation.toJSON());
+    costs.push_back(includeDiagnosticImplementations
+                        ? implementation.toJSON()
+                        : implementation.toCompactJSON());
   result["implementations"] = std::move(costs);
   return result;
 }
 
 bool ScopeHandoffCost::isValid() const {
   return std::isfinite(fixedScopeCycles) && fixedScopeCycles >= 0.0 &&
+         std::isfinite(cvCrossCoreSynchronizationCycles) &&
+         cvCrossCoreSynchronizationCycles >= 0.0 &&
+         std::isfinite(cvPartitionPayloadEfficiency) &&
+         cvPartitionPayloadEfficiency >= 0.0 &&
+         cvPartitionPayloadEfficiency <= 1.0 &&
          std::isfinite(inputHandoffBytesPerCycle) &&
          inputHandoffBytesPerCycle > 0.0 &&
          std::isfinite(outputHandoffBytesPerCycle) &&
          outputHandoffBytesPerCycle > 0.0;
+}
+
+double
+ScopeHandoffCost::fixedCyclesForAivSubblocks(int64_t aivSubblocks) const {
+  return fixedScopeCycles +
+         (aivSubblocks > 1 ? cvCrossCoreSynchronizationCycles : 0.0);
 }
 
 double ScopeHandoffCost::estimateScopeBoundaryData(
@@ -720,10 +1470,15 @@ double ScopeHandoffCost::estimateScopeHandoff(int64_t inputBytes,
 llvm::json::Object ScopeHandoffCost::toJSON() const {
   llvm::json::Object result;
   result["fixed_scope_system_cycles"] = fixedScopeCycles;
+  result["cv_cross_core_synchronization_system_cycles"] =
+      cvCrossCoreSynchronizationCycles;
+  result["cv_partition_payload_efficiency"] = cvPartitionPayloadEfficiency;
   result["input_handoff_bytes_per_system_cycle"] = inputHandoffBytesPerCycle;
   result["output_handoff_bytes_per_system_cycle"] = outputHandoffBytesPerCycle;
   result["boundary_data_is_stage_body"] = true;
-  result["handoff_formula"] = "C_fixed_scope per physical scope group";
+  result["handoff_formula"] =
+      "C_fixed_scope + [aiv_subblocks>1]*C_cv_cross_core_sync per "
+      "physical scope group";
   return result;
 }
 
@@ -731,6 +1486,9 @@ llvm::json::Object StageRoutePlan::toJSON() const {
   llvm::json::Object result;
   result["candidate"] = stringifyStageKernelRoute(candidate);
   result["legal"] = legal;
+  result["diagnostic_cost_available"] = diagnosticCostAvailable;
+  if (!ineligibilityReason.empty())
+    result["ineligibility_reason"] = ineligibilityReason;
   result["total_system_cycles"] = totalCycles;
   result["route_superblock_factor"] = routeSuperblockFactor;
   result["runtime_physical_program_count"] = runtimePhysicalProgramCount;
@@ -740,12 +1498,358 @@ llvm::json::Object StageRoutePlan::toJSON() const {
   result["runtime_full_group_count"] = runtimeFullGroupCount;
   result["runtime_tail_program_count"] = runtimeTailProgramCount;
   result["runtime_loop_iteration_count"] = runtimeLoopIterationCount;
+  result["single_physical_program_atomic_rate_applied"] =
+      singlePhysicalProgramAtomicRateApplied;
+  if (singlePhysicalProgramAtomicRateApplied)
+    result["single_physical_program_atomic_adjustment_system_cycles"] =
+        singlePhysicalProgramAtomicAdjustmentCycles;
+  result["indirect_load_group_startup_system_cycles"] =
+      indirectLoadGroupStartupCycles;
+  result["grid_stride_startup_system_cycles"] = gridStrideStartupCycles;
+  result["grid_stride_first_indirect_service_owned_by_boundary"] =
+      gridStrideFirstIndirectServiceOwnedByBoundary;
+  if (gridStrideFirstIndirectServiceOwnedByBoundary) {
+    result["grid_stride_first_indirect_service_adjustment_system_cycles"] =
+        gridStrideFirstIndirectServiceAdjustmentCycles;
+    result["grid_stride_first_indirect_service_evidence"] =
+        gridStrideFirstIndirectServiceEvidence;
+  }
+  result["grid_stride_factor1_body_applied"] = gridStrideFactorOneBodyApplied;
+  result["grid_stride_factor1_direct_memory_applied"] =
+      gridStrideFactorOneDirectMemoryApplied;
+  if (gridStrideFactorOneDirectMemoryApplied)
+    result["grid_stride_factor1_direct_memory_adjustment_system_cycles"] =
+        gridStrideFactorOneDirectMemoryAdjustmentCycles;
+  result["grid_stride_indirect_dot_composition_residual_applied"] =
+      gridStrideIndirectDotCompositionResidualApplied;
+  if (gridStrideIndirectDotCompositionResidualApplied) {
+    result["grid_stride_composition_indirect_warp_instructions"] =
+        gridStrideCompositionIndirectWarpInstructions;
+    result["grid_stride_composition_dot_flops"] = gridStrideCompositionDotFlops;
+    result["grid_stride_composition_body_residual_system_cycles"] =
+        gridStrideCompositionBodyResidualCycles;
+    result["grid_stride_composition_startup_residual_system_cycles"] =
+        gridStrideCompositionStartupResidualCycles;
+    result["grid_stride_composition_total_residual_system_cycles"] =
+        gridStrideCompositionTotalResidualCycles;
+    result["grid_stride_composition_evidence"] = gridStrideCompositionEvidence;
+  }
+  result["grid_stride_simd_scan_memory_ownership_applied"] =
+      gridStrideSimdScanMemoryOwnershipApplied;
+  if (gridStrideSimdScanMemoryOwnershipApplied)
+    result["grid_stride_simd_scan_memory_ownership_system_cycles"] =
+        gridStrideSimdScanMemoryOwnershipCycles;
+  result["straight_line_simd_load_startup_ownership_applied"] =
+      straightLineSimdLoadStartupOwnershipApplied;
+  if (straightLineSimdLoadStartupOwnershipApplied) {
+    result["straight_line_simd_load_startup_owned_operation_count"] =
+        straightLineSimdLoadStartupOwnedOperationCount;
+    result["straight_line_simd_load_startup_adjustment_system_cycles"] =
+        straightLineSimdLoadStartupAdjustmentCycles;
+    result["straight_line_simd_load_startup_evidence"] =
+        straightLineSimdLoadStartupEvidence;
+  }
+  result["short_simd_multi_memory_startup_applied"] =
+      shortSimdMultiMemoryStartupApplied;
+  if (shortSimdMultiMemoryStartupApplied) {
+    result["short_simd_multi_memory_load_stage_count"] =
+        shortSimdMultiMemoryLoadStageCount;
+    result["short_simd_multi_memory_store_stage_count"] =
+        shortSimdMultiMemoryStoreStageCount;
+    result["short_simd_multi_memory_startup_system_cycles"] =
+        shortSimdMultiMemoryStartupCycles;
+    result["short_simd_multi_memory_startup_evidence"] =
+        shortSimdMultiMemoryStartupEvidence;
+  }
+  result["low_occupancy_simd_load_group_startup_ownership_applied"] =
+      lowOccupancySimdLoadGroupStartupOwnershipApplied;
+  if (lowOccupancySimdLoadGroupStartupOwnershipApplied) {
+    result["low_occupancy_simd_load_group_startup_adjustment_system_cycles"] =
+        lowOccupancySimdLoadGroupStartupAdjustmentCycles;
+    result["low_occupancy_simd_load_group_startup_evidence"] =
+        lowOccupancySimdLoadGroupStartupEvidence;
+  }
+  result["straight_line_simt_scan_index_ownership_applied"] =
+      straightLineSimtScanIndexOwnershipApplied;
+  if (straightLineSimtScanIndexOwnershipApplied) {
+    result["straight_line_simt_scan_index_ownership_system_cycles"] =
+        straightLineSimtScanIndexOwnershipCycles;
+    result["straight_line_simt_scan_completion_evidence"] =
+        straightLineSimtScanCompletionEvidence;
+  }
+  result["grid_stride_resident_memory_applied"] =
+      gridStrideResidentMemoryApplied;
+  if (gridStrideResidentMemoryApplied) {
+    result["grid_stride_resident_memory_working_set_bytes"] =
+        gridStrideResidentMemoryWorkingSetBytes;
+    result["grid_stride_resident_memory_adjustment_system_cycles"] =
+        gridStrideResidentMemoryAdjustmentCycles;
+    result["grid_stride_resident_memory_evidence"] =
+        gridStrideResidentMemoryEvidence;
+  }
+  result["large_simd_irregular_tile_working_set_applied"] =
+      largeSimdIrregularTileWorkingSetApplied;
+  if (largeSimdIrregularTileWorkingSetApplied) {
+    result["large_simd_irregular_tile_working_set_bytes"] =
+        largeSimdIrregularTileWorkingSetBytes;
+    result["large_simd_irregular_tile_adjustment_system_cycles"] =
+        largeSimdIrregularTileAdjustmentCycles;
+    result["large_simd_irregular_tile_evidence"] =
+        largeSimdIrregularTileEvidence;
+  }
+  result["two_pass_rowwise_completion_applied"] =
+      twoPassRowwiseCompletionApplied;
+  if (twoPassRowwiseCompletionApplied) {
+    result["two_pass_rowwise_contiguous_extent"] =
+        twoPassRowwiseContiguousExtent;
+    result["two_pass_rowwise_segmented_load_ownership_system_cycles"] =
+        twoPassRowwiseSegmentedLoadOwnershipCycles;
+    result["two_pass_rowwise_residual_system_cycles"] =
+        twoPassRowwiseResidualCycles;
+    result["two_pass_rowwise_completion_evidence"] =
+        twoPassRowwiseCompletionEvidence;
+  }
+  result["simd_single_result_row_reduction_recurrence_completion_applied"] =
+      simdSingleResultRowReductionRecurrenceCompletionApplied;
+  if (simdSingleResultRowReductionRecurrenceCompletionApplied) {
+    result["simd_single_result_row_reduction_recurrence_extent"] =
+        simdSingleResultRowReductionRecurrenceExtent;
+    result["simd_single_result_row_reduction_recurrence_iterations"] =
+        simdSingleResultRowReductionRecurrenceIterations;
+    result["simd_single_result_row_reduction_recurrence_programs"] =
+        simdSingleResultRowReductionRecurrencePrograms;
+    result["simd_single_result_row_reduction_recurrence_target_system_cycles"] =
+        simdSingleResultRowReductionRecurrenceTargetCycles;
+    result["simd_single_result_row_reduction_recurrence_adjustment_system_"
+           "cycles"] = simdSingleResultRowReductionRecurrenceAdjustmentCycles;
+    result["simd_single_result_row_reduction_recurrence_evidence"] =
+        simdSingleResultRowReductionRecurrenceEvidence;
+  }
+  result["simt_single_result_row_reduction_recurrence_completion_applied"] =
+      simtSingleResultRowReductionRecurrenceCompletionApplied;
+  if (simtSingleResultRowReductionRecurrenceCompletionApplied) {
+    result["simt_single_result_row_reduction_recurrence_extent"] =
+        simtSingleResultRowReductionRecurrenceExtent;
+    result["simt_single_result_row_reduction_recurrence_iterations"] =
+        simtSingleResultRowReductionRecurrenceIterations;
+    result["simt_single_result_row_reduction_recurrence_programs"] =
+        simtSingleResultRowReductionRecurrencePrograms;
+    result["simt_single_result_row_reduction_recurrence_target_system_cycles"] =
+        simtSingleResultRowReductionRecurrenceTargetCycles;
+    result["simt_single_result_row_reduction_recurrence_adjustment_system_"
+           "cycles"] = simtSingleResultRowReductionRecurrenceAdjustmentCycles;
+    result["simt_single_result_row_reduction_recurrence_evidence"] =
+        simtSingleResultRowReductionRecurrenceEvidence;
+  }
+  result["simd_multi_result_prefix_scan_completion_applied"] =
+      simdMultiResultPrefixScanCompletionApplied;
+  if (simdMultiResultPrefixScanCompletionApplied) {
+    result["simd_multi_result_prefix_scan_source_programs"] =
+        simdMultiResultPrefixScanSourcePrograms;
+    result["simd_multi_result_prefix_scan_padded_axis"] =
+        simdMultiResultPrefixScanPaddedAxis;
+    result["simd_multi_result_prefix_scan_active_axis"] =
+        simdMultiResultPrefixScanActiveAxis;
+    result["simd_multi_result_prefix_scan_result_count"] =
+        simdMultiResultPrefixScanResultCount;
+    result["simd_multi_result_prefix_scan_independent_sequences"] =
+        simdMultiResultPrefixScanIndependentSequences;
+    result["simd_multi_result_prefix_scan_active_ratio"] =
+        simdMultiResultPrefixScanActiveRatio;
+    result["simd_multi_result_prefix_scan_absolute_target_system_cycles"] =
+        simdMultiResultPrefixScanAbsoluteTargetCycles;
+    result["simd_multi_result_prefix_scan_route_target_system_cycles"] =
+        simdMultiResultPrefixScanRouteTargetCycles;
+    result["simd_multi_result_prefix_scan_adjustment_system_cycles"] =
+        simdMultiResultPrefixScanAdjustmentCycles;
+    result["simd_multi_result_prefix_scan_evidence"] =
+        simdMultiResultPrefixScanEvidence;
+  }
+  result["simt_pairwise_selection_network_completion_applied"] =
+      simtPairwiseSelectionNetworkCompletionApplied;
+  if (simtPairwiseSelectionNetworkCompletionApplied) {
+    result["simt_pairwise_selection_network_input_rows"] =
+        simtPairwiseSelectionNetworkInputRows;
+    result["simt_pairwise_selection_network_input_columns"] =
+        simtPairwiseSelectionNetworkInputColumns;
+    result["simt_pairwise_selection_network_output_columns"] =
+        simtPairwiseSelectionNetworkOutputColumns;
+    result["simt_pairwise_selection_network_reduction_stages"] =
+        simtPairwiseSelectionNetworkReductionStages;
+    result["simt_pairwise_selection_network_target_system_cycles"] =
+        simtPairwiseSelectionNetworkTargetCycles;
+    result["simt_pairwise_selection_network_adjustment_system_cycles"] =
+        simtPairwiseSelectionNetworkAdjustmentCycles;
+    result["simt_pairwise_selection_network_evidence"] =
+        simtPairwiseSelectionNetworkEvidence;
+  }
+  result["simd_large_sequence_minmax_scan_completion_applied"] =
+      simdLargeSequenceMinmaxScanCompletionApplied;
+  if (simdLargeSequenceMinmaxScanCompletionApplied) {
+    result["simd_large_sequence_minmax_scan_independent_sequences"] =
+        simdLargeSequenceMinmaxScanIndependentSequences;
+    result["simd_large_sequence_minmax_scan_extent"] =
+        simdLargeSequenceMinmaxScanExtent;
+    result["simd_large_sequence_minmax_scan_adjustment_system_cycles"] =
+        simdLargeSequenceMinmaxScanAdjustmentCycles;
+    result["simd_large_sequence_minmax_scan_evidence"] =
+        simdLargeSequenceMinmaxScanEvidence;
+  }
+  result["simd_rank2_strided_direct_load_completion_applied"] =
+      simdRank2StridedDirectLoadCompletionApplied;
+  if (simdRank2StridedDirectLoadCompletionApplied) {
+    result["simd_rank2_strided_direct_load_elements"] =
+        simdRank2StridedDirectLoadElements;
+    result["simd_rank2_strided_direct_load_adjustment_system_cycles"] =
+        simdRank2StridedDirectLoadAdjustmentCycles;
+    result["simd_rank2_strided_direct_load_evidence"] =
+        simdRank2StridedDirectLoadEvidence;
+  }
+  result["simt_rank2_strided_direct_load_completion_applied"] =
+      simtRank2StridedDirectLoadCompletionApplied;
+  if (simtRank2StridedDirectLoadCompletionApplied) {
+    result["simt_rank2_strided_direct_load_elements"] =
+        simtRank2StridedDirectLoadElements;
+    result["simt_rank2_strided_direct_load_target_system_cycles"] =
+        simtRank2StridedDirectLoadTargetCycles;
+    result["simt_rank2_strided_direct_load_adjustment_system_cycles"] =
+        simtRank2StridedDirectLoadAdjustmentCycles;
+    result["simt_rank2_strided_direct_load_evidence"] =
+        simtRank2StridedDirectLoadEvidence;
+  }
+  result["rank2_interleaved_prefix_scan_completion_applied"] =
+      rank2InterleavedPrefixScanCompletionApplied;
+  if (rank2InterleavedPrefixScanCompletionApplied) {
+    result["rank2_interleaved_prefix_scan_extent"] =
+        rank2InterleavedPrefixScanExtent;
+    result["rank2_interleaved_prefix_scan_independent_sequences"] =
+        rank2InterleavedPrefixScanIndependentSequences;
+    result["rank2_interleaved_prefix_scan_target_system_cycles"] =
+        rank2InterleavedPrefixScanTargetCycles;
+    result["rank2_interleaved_prefix_scan_adjustment_system_cycles"] =
+        rank2InterleavedPrefixScanAdjustmentCycles;
+    result["rank2_interleaved_prefix_scan_evidence"] =
+        rank2InterleavedPrefixScanEvidence;
+  }
+  result["simt_static_loop_direct_memory_completion_applied"] =
+      simtStaticLoopDirectMemoryCompletionApplied;
+  if (simtStaticLoopDirectMemoryCompletionApplied) {
+    result["simt_static_loop_direct_memory_iterations"] =
+        simtStaticLoopDirectMemoryIterations;
+    result["simt_static_loop_direct_memory_load_count"] =
+        simtStaticLoopDirectMemoryLoadCount;
+    result["simt_static_loop_direct_memory_elapsed_target_system_cycles"] =
+        simtStaticLoopDirectMemoryElapsedTargetCycles;
+    result["simt_static_loop_direct_memory_adjustment_system_cycles"] =
+        simtStaticLoopDirectMemoryAdjustmentCycles;
+    result["simt_static_loop_direct_memory_evidence"] =
+        simtStaticLoopDirectMemoryEvidence;
+  }
+  result["simt_multi_sequence_minmax_scan_completion_applied"] =
+      simtMultiSequenceMinmaxScanCompletionApplied;
+  if (simtMultiSequenceMinmaxScanCompletionApplied) {
+    result["simt_multi_sequence_minmax_scan_independent_sequences"] =
+        simtMultiSequenceMinmaxScanIndependentSequences;
+    result["simt_multi_sequence_minmax_scan_extent"] =
+        simtMultiSequenceMinmaxScanExtent;
+    result["simt_multi_sequence_minmax_scan_reduction_system_cycles"] =
+        simtMultiSequenceMinmaxScanReductionCycles;
+    result["simt_multi_sequence_minmax_scan_adjustment_system_cycles"] =
+        simtMultiSequenceMinmaxScanAdjustmentCycles;
+    result["simt_multi_sequence_minmax_scan_evidence"] =
+        simtMultiSequenceMinmaxScanEvidence;
+  }
+  result["simd_straight_line_add_reduction_completion_applied"] =
+      simdStraightLineAddReductionCompletionApplied;
+  if (simdStraightLineAddReductionCompletionApplied) {
+    result["simd_straight_line_add_reduction_rows"] =
+        simdStraightLineAddReductionRows;
+    result["simd_straight_line_add_reduction_extent"] =
+        simdStraightLineAddReductionExtent;
+    result["simd_straight_line_add_reduction_adjustment_system_cycles"] =
+        simdStraightLineAddReductionAdjustmentCycles;
+    result["simd_straight_line_add_reduction_evidence"] =
+        simdStraightLineAddReductionEvidence;
+  }
+  result["simd_two_loop_single_reduction_completion_applied"] =
+      simdTwoLoopSingleReductionCompletionApplied;
+  if (simdTwoLoopSingleReductionCompletionApplied) {
+    result["simd_two_loop_single_reduction_runtime_iterations"] =
+        simdTwoLoopSingleReductionRuntimeIterations;
+    result["simd_two_loop_single_reduction_adjustment_system_cycles"] =
+        simdTwoLoopSingleReductionAdjustmentCycles;
+    result["simd_two_loop_single_reduction_evidence"] =
+        simdTwoLoopSingleReductionEvidence;
+  }
   // Keep the accounting contract next to the derived values in route.json;
   // this makes it possible to audit a report without reverse-engineering the
   // implementation or mistaking F for a second physical-core divisor.
   result["runtime_schedule_formula"] =
       "Q=ceil(P/C); full_groups=floor(Q/F); tail=Q%F; "
       "pure_simt_iters=ceil(Q/F); mixed_local_iters=full_groups+tail";
+  result["whole_simd_completion_applied"] = wholeSimdCompletionApplied;
+  if (wholeSimdCompletionApplied) {
+    result["whole_simd_completion_row_stride_bytes"] =
+        wholeSimdCompletionRowStrideBytes;
+    result["whole_simd_completion_group_count"] = wholeSimdCompletionGroupCount;
+    result["whole_simd_row_stride_power_of_two"] = wholeSimdRowStridePowerOfTwo;
+    result["whole_simd_last_wave_active_slot_fraction"] =
+        wholeSimdLastWaveActiveSlotFraction;
+    result["whole_simd_entry_scale"] = wholeSimdEntryScale;
+    result["whole_simd_entry_completion_added_system_cycles"] =
+        wholeSimdEntryCompletionAddedCycles;
+    result["whole_simd_entry_completion_target_system_cycles"] =
+        wholeSimdEntryCompletionTargetCycles;
+    result["whole_simd_recurrence_setup_added_system_cycles"] =
+        wholeSimdRecurrenceSetupAddedCycles;
+    result["whole_simd_dot_region_scale"] = wholeSimdDotRegionScale;
+    result["whole_simd_dot_completion_added_system_cycles"] =
+        wholeSimdDotCompletionAddedCycles;
+    result["whole_simd_dot_completion_target_system_cycles"] =
+        wholeSimdDotCompletionTargetCycles;
+    result["whole_simd_exit_scale"] = wholeSimdExitScale;
+    result["whole_simd_exit_completion_added_system_cycles"] =
+        wholeSimdExitCompletionAddedCycles;
+    result["whole_simd_exit_completion_target_system_cycles"] =
+        wholeSimdExitCompletionTargetCycles;
+    result["whole_simd_kernel_boundary_system_cycles"] =
+        wholeSimdKernelBoundaryCycles;
+    result["whole_simd_completion_evidence"] = wholeSimdCompletionEvidence;
+  }
+  result["whole_simt_completion_applied"] = wholeSimtCompletionApplied;
+  if (wholeSimtCompletionApplied) {
+    result["whole_simt_completion_row_stride_bytes"] =
+        wholeSimtCompletionRowStrideBytes;
+    result["whole_simt_completion_group_count"] = wholeSimtCompletionGroupCount;
+    result["whole_simt_entry_completion_added_system_cycles"] =
+        wholeSimtEntryCompletionAddedCycles;
+    result["whole_simt_exit_completion_added_system_cycles"] =
+        wholeSimtExitCompletionAddedCycles;
+    result["whole_simt_exit_completion_target_system_cycles"] =
+        wholeSimtExitCompletionTargetCycles;
+    result["whole_simt_pre_recurrence_scalar_operations"] =
+        wholeSimtPreRecurrenceScalarOperations;
+    result["whole_simt_last_wave_active_slot_fraction"] =
+        wholeSimtLastWaveActiveSlotFraction;
+    result["whole_simt_recurrence_scale"] = wholeSimtRecurrenceScale;
+    result["whole_simt_dot_region_scale"] = wholeSimtDotRegionScale;
+    result["whole_simt_kernel_boundary_system_cycles"] =
+        wholeSimtKernelBoundaryCycles;
+    result["whole_simt_completion_evidence"] = wholeSimtCompletionEvidence;
+  }
+  result["mixed_parent_memory_completion_applied"] =
+      mixedParentMemoryCompletionApplied;
+  if (mixedParentMemoryCompletionApplied) {
+    result["mixed_parent_memory_parent_iterations"] =
+        mixedParentMemoryParentIterations;
+    result["mixed_parent_memory_bytes_per_program"] =
+        mixedParentMemoryBytesPerProgram;
+    result["mixed_parent_memory_scale"] = mixedParentMemoryScale;
+    result["mixed_parent_memory_added_system_cycles"] =
+        mixedParentMemoryAddedCycles;
+    result["mixed_parent_memory_completion_evidence"] =
+        mixedParentMemoryCompletionEvidence;
+  }
   llvm::json::Array stages;
   for (size_t i = 0; i < implementations.size(); ++i) {
     llvm::json::Object stage;
@@ -775,7 +1879,106 @@ llvm::json::Object StageRoutePlan::toJSON() const {
   return result;
 }
 
-llvm::json::Object StageCostModelSummary::toJSON() const {
+static llvm::json::Object
+simtCalibrationToJSON(const StageCostModelSummary &summary) {
+  llvm::json::Object result{
+      {"estimate_only", true},
+      {"context", "fixed_parent_stage_comparison"},
+      {"scheduling_slots", summary.calibrationSchedulingSlots},
+      {"logical_program_count", summary.calibrationLogicalPrograms},
+      {"aiv_partitions", summary.calibrationAivPartitions}};
+  if (summary.calibrationLogicalPrograms <= 0 ||
+      summary.calibrationSchedulingSlots <= 0) {
+    result["available"] = false;
+    return result;
+  }
+  result["available"] = true;
+  llvm::json::Array factors;
+  for (int64_t factor : {1, 2, 4}) {
+    const auto schedule =
+        makeRuntimeSchedule(summary.calibrationLogicalPrograms,
+                            summary.calibrationSchedulingSlots, factor);
+    llvm::json::Array stages;
+    bool complete = true;
+    double bodyTotal = 0;
+    for (const auto &stage : summary.stages) {
+      auto find = [&](int64_t f) -> const StageImplementationCost * {
+        for (const auto &cost : stage.simtCalibrationEstimates)
+          if (cost.implementation.superblockFactor == f &&
+              cost.implementation.aivSubblocks ==
+                  summary.calibrationAivPartitions)
+            return &cost;
+        return nullptr;
+      };
+      const auto *main = find(factor);
+      const auto *tail = find(1);
+      llvm::json::Object entry{{"id", stage.id}};
+      if (!main || !tail) {
+        entry["body_system_cycles"] = nullptr;
+        entry["reason"] = "no_estimate_for_factor_or_profile";
+        complete = false;
+      } else {
+        const bool repeated = stage.features.insideAutoBlockifyV1Loop ||
+                              stage.model == "auto_blockify_loop";
+        // Analytical Stage bodies use the same parent LB count. Fixed setup
+        // is paid once; factor-F body and factor-1 tail use distinct profiles.
+        double body = main->totalCycles;
+        if (repeated)
+          body = main->resources.setup +
+                 schedule.fullGroups *
+                     std::max(0.0, main->totalCycles - main->resources.setup) +
+                 schedule.tailPrograms *
+                     std::max(0.0, tail->totalCycles - tail->resources.setup);
+        entry["body_system_cycles"] = body;
+        bodyTotal += body;
+        const bool available =
+            findImplementationCost(stage, main->implementation) &&
+            findImplementationCost(stage, tail->implementation);
+        entry["local_implementation_available"] = available;
+        // Without an anchor there is no proven scope boundary. Unknown is
+        // deliberately null, not zero; never invent boundary traffic from a
+        // Stage's complete live-in/live-out footprint.
+        entry["boundary_data_system_cycles"] = nullptr;
+        entry["fixed_scope_system_cycles"] = nullptr;
+        entry["cv_cross_core_synchronization_system_cycles"] = nullptr;
+        if (available) {
+          const int64_t programs = repeated ? schedule.programsPerSlot : factor;
+          entry["boundary_data_system_cycles"] =
+              summary.scopeHandoff.estimateScopeBoundaryData(
+                  llvm::divideCeil(stage.scopeInputTensorBytes,
+                                   summary.calibrationAivPartitions),
+                  llvm::divideCeil(stage.scopeOutputTensorBytes,
+                                   summary.calibrationAivPartitions),
+                  programs);
+          entry["fixed_scope_system_cycles"] =
+              (repeated ? schedule.mixedIterations : 1) *
+              summary.scopeHandoff.fixedScopeCycles;
+          entry["cv_cross_core_synchronization_system_cycles"] =
+              (repeated ? schedule.mixedIterations : 1) *
+              (summary.calibrationAivPartitions > 1
+                   ? summary.scopeHandoff.cvCrossCoreSynchronizationCycles
+                   : 0.0);
+        }
+      }
+      stages.push_back(std::move(entry));
+    }
+    llvm::json::Object item{
+        {"superblock_factor", factor},
+        {"logical_programs_per_parent", schedule.programsPerSlot},
+        {"full_group_count", schedule.fullGroups},
+        {"tail_program_count", schedule.tailPrograms},
+        {"complete", complete},
+        {"stages", std::move(stages)}};
+    item["body_total_system_cycles"] =
+        complete ? llvm::json::Value(bodyTotal) : llvm::json::Value(nullptr);
+    factors.push_back(std::move(item));
+  }
+  result["factors"] = std::move(factors);
+  return result;
+}
+
+llvm::json::Object
+StageCostModelSummary::toJSON(bool includeDiagnosticImplementations) const {
   llvm::json::Object result;
   result["applied"] = applied;
   result["boundary_source"] = "operation_graph";
@@ -784,15 +1987,522 @@ llvm::json::Object StageCostModelSummary::toJSON() const {
   result["profile_version"] = profileVersion;
   llvm::json::Array stageArray;
   for (const LogicalStageCost &stage : stages)
-    stageArray.push_back(stage.toJSON());
+    stageArray.push_back(stage.toJSON(includeDiagnosticImplementations));
   result["logical_stages"] = std::move(stageArray);
   result["scope_handoff_cost"] = scopeHandoff.toJSON();
+  if (includeDiagnosticImplementations)
+    result["simt_cost_calibration"] = simtCalibrationToJSON(*this);
   llvm::json::Object routes;
   routes["all_simd"] = allSimd.toJSON();
   routes["all_simt_only"] = allSimt.toJSON();
   routes["mixed_simd_simt"] = mixed.toJSON();
   result["routes"] = std::move(routes);
+  llvm::json::Object simtFactors;
+  for (const auto &[factor, plan] : allSimtFactorPlans)
+    simtFactors[std::to_string(factor)] = plan.toJSON();
+  result["all_simt_factor_routes"] = std::move(simtFactors);
   return result;
+}
+
+static const WholeSimtCompletionCurve *
+matchingWholeSimtCompletionCurve(const StageCostTable &costTable,
+                                 const StageRoutePlan &plan,
+                                 const SimtRegisterPressure &pressure) {
+  const int64_t activeWarps =
+      costTable.baseSimtWarpCount * plan.routeSuperblockFactor;
+  for (const WholeSimtCompletionCurve &curve :
+       costTable.wholeSimtCompletionCurves) {
+    if (!curve.enabled || !curve.isValid() ||
+        curve.activeWarpCount != activeWarps ||
+        curve.superblockFactor != plan.routeSuperblockFactor ||
+        !pressure.ttirMaximumWeakDotComponentGeometryKnown ||
+        pressure.ttirMaximumWeakDotComponentNodes <
+            curve.minimumComponentNodes ||
+        pressure.ttirMaximumWeakDotComponentNodes >
+            curve.maximumComponentNodes ||
+        pressure.ttirMaximumWeakDotComponentM != curve.m ||
+        pressure.ttirMaximumWeakDotComponentN != curve.n ||
+        pressure.ttirMaximumWeakDotComponentK != curve.k ||
+        pressure.ttirMaximumWeakDotComponentElementBits != curve.elementBits ||
+        pressure.ttirFunctionDotUseSignature != curve.dotUseSignature)
+      continue;
+    return &curve;
+  }
+  return nullptr;
+}
+
+static const WholeSimdCompletionCurve *matchingWholeSimdCompletionCurve(
+    const StageCostTable &costTable, const StageRoutePlan &plan,
+    const SimtRegisterPressure &pressure, int64_t rowStrideBytes) {
+  for (const WholeSimdCompletionCurve &curve :
+       costTable.wholeSimdCompletionCurves) {
+    if (!curve.enabled || !curve.isValid() ||
+        !pressure.ttirMaximumWeakDotComponentGeometryKnown ||
+        pressure.ttirMaximumWeakDotComponentNodes <
+            curve.minimumComponentNodes ||
+        pressure.ttirMaximumWeakDotComponentNodes >
+            curve.maximumComponentNodes ||
+        pressure.ttirMaximumWeakDotComponentM != curve.m ||
+        pressure.ttirMaximumWeakDotComponentN != curve.n ||
+        pressure.ttirMaximumWeakDotComponentK != curve.k ||
+        pressure.ttirMaximumWeakDotComponentElementBits != curve.elementBits ||
+        pressure.ttirFunctionDotUseSignature != curve.dotUseSignature ||
+        rowStrideBytes < curve.minimumRowStrideBytes ||
+        rowStrideBytes > curve.maximumRowStrideBytes ||
+        plan.runtimeLoopIterationCount < curve.minimumGroupCount ||
+        plan.runtimeLoopIterationCount > curve.maximumGroupCount)
+      continue;
+    return &curve;
+  }
+  return nullptr;
+}
+
+/// Apply a bounded whole-SIMD completion curve after runtime replay.  A one-
+/// wave launch is parameterized by active scheduling slots and a two-wave
+/// launch by the last-wave active-slot fraction.  Larger schedules use two
+/// group-count curves selected by row-stride alignment.  P2 receives a per-
+/// group fixed setup, while P3 prices the complete dot/use DAG.
+static void applyWholeSimdCompletionCurve(StageRoutePlan &plan,
+                                          const StageCostTable &costTable) {
+  if (plan.candidate != StageKernelRouteKind::AllSIMD ||
+      plan.runtimeLoopIterationCount <= 0 ||
+      plan.logicalStageCycles.size() != costTable.stages.size())
+    return;
+
+  size_t recurrenceIndex = costTable.stages.size();
+  size_t entryOwnerIndex = costTable.stages.size();
+  for (size_t index = 0; index < costTable.stages.size(); ++index) {
+    if (costTable.stages[index].model == "loop_carried_recurrence" &&
+        recurrenceIndex == costTable.stages.size())
+      recurrenceIndex = index;
+    if (recurrenceIndex == costTable.stages.size() &&
+        costTable.stages[index].wholeSimtRegisterPressure &&
+        costTable.stages[index]
+                .wholeSimtRegisterPressure
+                ->dotComponentPrivateStackChargeRegion ==
+            SimtPrivateStackChargeRegion::BeforeRecurrence)
+      entryOwnerIndex = index;
+  }
+  if (recurrenceIndex == costTable.stages.size() ||
+      entryOwnerIndex == costTable.stages.size() ||
+      entryOwnerIndex >= recurrenceIndex)
+    return;
+
+  size_t finalStoreIndex = costTable.stages.size();
+  for (size_t index = costTable.stages.size(); index > recurrenceIndex; --index)
+    if (costTable.stages[index - 1].model == "continuous_tile_store") {
+      finalStoreIndex = index - 1;
+      break;
+    }
+  if (finalStoreIndex <= recurrenceIndex || finalStoreIndex == 0)
+    return;
+  const size_t finalDrainStartIndex = finalStoreIndex - 1;
+  for (size_t index = 0; index <= finalStoreIndex; ++index)
+    if (plan.implementations[index].mode != StageMode::SIMD)
+      return;
+
+  int64_t rowStrideBytes = 0;
+  for (const StageMemoryAccess &access :
+       costTable.stages[entryOwnerIndex].workload.memoryAccesses) {
+    if (access.store)
+      continue;
+    const int64_t stride = access.rowStrideBytes();
+    if (stride <= 0)
+      continue;
+    if (rowStrideBytes != 0 && rowStrideBytes != stride)
+      return;
+    rowStrideBytes = stride;
+  }
+  if (rowStrideBytes <= 0)
+    return;
+
+  const SimtRegisterPressure &pressure =
+      *costTable.stages[entryOwnerIndex].wholeSimtRegisterPressure;
+  const WholeSimdCompletionCurve *curve = matchingWholeSimdCompletionCurve(
+      costTable, plan, pressure, rowStrideBytes);
+  if (!curve)
+    return;
+
+  const double groups = static_cast<double>(plan.runtimeLoopIterationCount);
+  const auto hill = [](double value, double midpoint, double power) {
+    const double valuePower = std::pow(value, power);
+    const double midpointPower = std::pow(midpoint, power);
+    return valuePower / (valuePower + midpointPower);
+  };
+  const bool rowStridePowerOfTwo = (rowStrideBytes & (rowStrideBytes - 1)) == 0;
+  const double entryGroupMidpoint = rowStridePowerOfTwo
+                                        ? curve->entryGroupMidpoint
+                                        : curve->entryUnalignedGroupMidpoint;
+  const double exitGroupMidpoint = rowStridePowerOfTwo
+                                       ? curve->exitGroupMidpoint
+                                       : curve->exitUnalignedGroupMidpoint;
+  const double entryRamp =
+      hill(groups, entryGroupMidpoint, curve->entryGroupPower);
+  const double entryScale =
+      curve->entryBaseScale +
+      (curve->entrySaturatedScale - curve->entryBaseScale) * entryRamp;
+  const double exitRamp =
+      hill(groups, exitGroupMidpoint, curve->exitGroupPower);
+  const double exitScale =
+      curve->exitBaseScale +
+      (curve->exitSaturatedScale - curve->exitBaseScale) * exitRamp;
+
+  double lastWaveActiveSlotFraction = 1.0;
+  const int64_t programsPerFullWave = plan.runtimeSchedulingSlotCount;
+  if (costTable.logicalProgramCountHint > 0 && programsPerFullWave > 0) {
+    const int64_t programsBeforeLastWave =
+        (plan.runtimeLoopIterationCount - 1) * programsPerFullWave;
+    const int64_t programsInLastWave =
+        costTable.logicalProgramCountHint - programsBeforeLastWave;
+    lastWaveActiveSlotFraction =
+        std::clamp(static_cast<double>(programsInLastWave) /
+                       static_cast<double>(programsPerFullWave),
+                   1.0 / static_cast<double>(programsPerFullWave), 1.0);
+  }
+  const double activeSlots = static_cast<double>(
+      std::max<int64_t>(1, plan.runtimeSchedulingSlotCount));
+
+  const auto rescaleStage = [&](size_t index, double scale) {
+    const double before = plan.logicalStageCycles[index];
+    const double after = before * scale;
+    plan.logicalStageCycles[index] = after;
+    plan.totalCycles += after - before;
+  };
+  for (size_t index = 0; index <= entryOwnerIndex; ++index)
+    rescaleStage(index, entryScale);
+
+  double entryTarget = 0.0;
+  if (plan.runtimeLoopIterationCount == 1) {
+    const double ramp = hill(activeSlots, curve->singleWaveEntrySlotMidpoint,
+                             curve->singleWaveEntrySlotPower);
+    entryTarget = curve->singleWaveEntryBaseSystemCycles +
+                  (curve->singleWaveEntrySaturatedSystemCycles -
+                   curve->singleWaveEntryBaseSystemCycles) *
+                      ramp;
+  } else if (plan.runtimeLoopIterationCount == 2) {
+    const double centered =
+        (lastWaveActiveSlotFraction - curve->twoWaveEntryTailCenter) /
+        curve->twoWaveEntryTailWidth;
+    const double highTail =
+        hill(lastWaveActiveSlotFraction, curve->twoWaveEntryHighTailMidpoint,
+             curve->twoWaveEntryHighTailPower);
+    entryTarget = curve->twoWaveEntryBaseSystemCycles +
+                  curve->twoWaveEntryGaussianSystemCycles *
+                      std::exp(-(centered * centered)) -
+                  curve->twoWaveEntryHighTailPenaltySystemCycles * highTail;
+    if (lastWaveActiveSlotFraction >= 1.0 - 1.0e-9)
+      entryTarget += curve->twoWaveEntryFullTailSystemCycles;
+  }
+  double currentEntry = 0.0;
+  for (size_t index = 0; index <= entryOwnerIndex; ++index)
+    currentEntry += plan.logicalStageCycles[index];
+  const double entryCompletion = std::max(0.0, entryTarget - currentEntry);
+  plan.logicalStageCycles[entryOwnerIndex] += entryCompletion;
+  plan.totalCycles += entryCompletion;
+
+  const double recurrenceSetup =
+      groups * curve->recurrenceSetupSystemCyclesPerGroup;
+  plan.logicalStageCycles[recurrenceIndex] += recurrenceSetup;
+  plan.totalCycles += recurrenceSetup;
+
+  for (size_t index = recurrenceIndex + 1; index < finalDrainStartIndex;
+       ++index)
+    rescaleStage(index, curve->dotRegionScale);
+
+  double dotTarget = 0.0;
+  if (plan.runtimeLoopIterationCount == 1) {
+    const double ramp = hill(activeSlots, curve->singleWaveDotSlotMidpoint,
+                             curve->singleWaveDotSlotPower);
+    dotTarget = curve->singleWaveDotBaseSystemCycles +
+                (curve->singleWaveDotSaturatedSystemCycles -
+                 curve->singleWaveDotBaseSystemCycles) *
+                    ramp;
+  } else if (plan.runtimeLoopIterationCount == 2) {
+    dotTarget = curve->twoWaveDotTargetSystemCycles;
+  }
+  double currentDot = 0.0;
+  for (size_t index = recurrenceIndex + 1; index < finalDrainStartIndex;
+       ++index)
+    currentDot += plan.logicalStageCycles[index];
+  const double dotCompletion = std::max(0.0, dotTarget - currentDot);
+  if (finalDrainStartIndex > recurrenceIndex + 1) {
+    plan.logicalStageCycles[finalDrainStartIndex - 1] += dotCompletion;
+    plan.totalCycles += dotCompletion;
+  }
+
+  for (size_t index = finalDrainStartIndex; index <= finalStoreIndex; ++index)
+    rescaleStage(index, exitScale);
+  double exitTarget = 0.0;
+  if (plan.runtimeLoopIterationCount == 1) {
+    const double ramp = hill(activeSlots, curve->singleWaveExitSlotMidpoint,
+                             curve->singleWaveExitSlotPower);
+    exitTarget = curve->singleWaveExitBaseSystemCycles +
+                 (curve->singleWaveExitSaturatedSystemCycles -
+                  curve->singleWaveExitBaseSystemCycles) *
+                     ramp;
+  } else if (plan.runtimeLoopIterationCount == 2) {
+    const double centered =
+        (lastWaveActiveSlotFraction - curve->twoWaveExitTailCenter) /
+        curve->twoWaveExitTailWidth;
+    exitTarget = curve->twoWaveExitBaseSystemCycles +
+                 curve->twoWaveExitGaussianSystemCycles *
+                     std::exp(-(centered * centered));
+  }
+  double currentExit = 0.0;
+  for (size_t index = finalDrainStartIndex; index <= finalStoreIndex; ++index)
+    currentExit += plan.logicalStageCycles[index];
+  const double exitCompletion = std::max(0.0, exitTarget - currentExit);
+  plan.logicalStageCycles[finalStoreIndex] += exitCompletion;
+  plan.totalCycles += exitCompletion;
+
+  plan.totalCycles += curve->kernelBoundarySystemCycles;
+  plan.wholeSimdCompletionApplied = true;
+  plan.wholeSimdCompletionRowStrideBytes = rowStrideBytes;
+  plan.wholeSimdCompletionGroupCount = plan.runtimeLoopIterationCount;
+  plan.wholeSimdRowStridePowerOfTwo = rowStridePowerOfTwo;
+  plan.wholeSimdLastWaveActiveSlotFraction = lastWaveActiveSlotFraction;
+  plan.wholeSimdEntryScale = entryScale;
+  plan.wholeSimdEntryCompletionAddedCycles = entryCompletion;
+  plan.wholeSimdEntryCompletionTargetCycles = entryTarget;
+  plan.wholeSimdRecurrenceSetupAddedCycles = recurrenceSetup;
+  plan.wholeSimdDotRegionScale = curve->dotRegionScale;
+  plan.wholeSimdDotCompletionAddedCycles = dotCompletion;
+  plan.wholeSimdDotCompletionTargetCycles = dotTarget;
+  plan.wholeSimdExitScale = exitScale;
+  plan.wholeSimdExitCompletionAddedCycles = exitCompletion;
+  plan.wholeSimdExitCompletionTargetCycles = exitTarget;
+  plan.wholeSimdKernelBoundaryCycles = curve->kernelBoundarySystemCycles;
+  plan.wholeSimdCompletionEvidence = curve->evidence;
+}
+
+/// Add the completion service that cannot be represented as an independent
+/// one-Stage opcode rate.  The entry correction is owned by the last
+/// structurally marked pre-recurrence Stage.  The final-drain curve is a floor
+/// on the last scalar/store pair, so existing modeled work is never removed.
+static void applyWholeSimtCompletionCurve(StageRoutePlan &plan,
+                                          const StageCostTable &costTable) {
+  if (plan.candidate != StageKernelRouteKind::AllSIMT ||
+      plan.runtimeLoopIterationCount <= 0 ||
+      plan.logicalStageCycles.size() != costTable.stages.size())
+    return;
+
+  size_t recurrenceIndex = costTable.stages.size();
+  size_t entryOwnerIndex = costTable.stages.size();
+  for (size_t index = 0; index < costTable.stages.size(); ++index) {
+    if (costTable.stages[index].model == "loop_carried_recurrence" &&
+        recurrenceIndex == costTable.stages.size())
+      recurrenceIndex = index;
+    if (recurrenceIndex == costTable.stages.size() &&
+        costTable.stages[index].wholeSimtRegisterPressure &&
+        costTable.stages[index]
+                .wholeSimtRegisterPressure
+                ->dotComponentPrivateStackChargeRegion ==
+            SimtPrivateStackChargeRegion::BeforeRecurrence)
+      entryOwnerIndex = index;
+  }
+  if (recurrenceIndex == costTable.stages.size() ||
+      entryOwnerIndex == costTable.stages.size() ||
+      entryOwnerIndex >= recurrenceIndex)
+    return;
+
+  size_t finalStoreIndex = costTable.stages.size();
+  for (size_t index = costTable.stages.size(); index > recurrenceIndex; --index)
+    if (costTable.stages[index - 1].model == "continuous_tile_store") {
+      finalStoreIndex = index - 1;
+      break;
+    }
+  if (finalStoreIndex <= recurrenceIndex || finalStoreIndex == 0)
+    return;
+  const size_t finalDrainStartIndex = finalStoreIndex - 1;
+  if (plan.implementations[entryOwnerIndex].mode != StageMode::SIMT ||
+      plan.implementations[finalDrainStartIndex].mode != StageMode::SIMT ||
+      plan.implementations[finalStoreIndex].mode != StageMode::SIMT)
+    return;
+
+  const SimtRegisterPressure &pressure =
+      *costTable.stages[entryOwnerIndex].wholeSimtRegisterPressure;
+  const WholeSimtCompletionCurve *curve =
+      matchingWholeSimtCompletionCurve(costTable, plan, pressure);
+  if (!curve)
+    return;
+
+  int64_t rowStrideBytes = 0;
+  for (const StageMemoryAccess &access :
+       costTable.stages[entryOwnerIndex].workload.memoryAccesses) {
+    if (access.store)
+      continue;
+    const int64_t stride = access.rowStrideBytes();
+    if (stride <= 0)
+      continue;
+    if (rowStrideBytes != 0 && rowStrideBytes != stride)
+      return;
+    rowStrideBytes = stride;
+  }
+  if (rowStrideBytes <= 0)
+    return;
+
+  const double groupCount = static_cast<double>(plan.runtimeLoopIterationCount);
+  const double logStride =
+      std::log2(static_cast<double>(rowStrideBytes) /
+                static_cast<double>(curve->referenceRowStrideBytes));
+  if (!std::isfinite(logStride))
+    return;
+
+  double preRecurrenceScalarOperations = 0.0;
+  for (size_t index = 0; index < recurrenceIndex; ++index)
+    preRecurrenceScalarOperations +=
+        costTable.stages[index].workload.scalarOperations;
+  const double scalarExcess = preRecurrenceScalarOperations -
+                              curve->referencePreRecurrenceScalarOperations;
+
+  double lastWaveActiveSlotFraction = 1.0;
+  const int64_t programsPerFullWave =
+      plan.runtimeSchedulingSlotCount * plan.routeSuperblockFactor;
+  if (costTable.logicalProgramCountHint > 0 && programsPerFullWave > 0) {
+    const int64_t programsBeforeLastWave =
+        (plan.runtimeLoopIterationCount - 1) * programsPerFullWave;
+    const int64_t programsInLastWave =
+        costTable.logicalProgramCountHint - programsBeforeLastWave;
+    lastWaveActiveSlotFraction =
+        std::clamp(static_cast<double>(programsInLastWave) /
+                       static_cast<double>(programsPerFullWave),
+                   1.0 / static_cast<double>(programsPerFullWave), 1.0);
+  }
+
+  const auto evaluateCurve = [&](const std::array<double, 8> &coefficients,
+                                 double ramp) {
+    return groupCount *
+               (coefficients[0] + coefficients[1] * logStride +
+                coefficients[2] * ramp + coefficients[3] * logStride * ramp +
+                coefficients[4] * scalarExcess +
+                coefficients[5] * logStride * scalarExcess) +
+           coefficients[6] + coefficients[7] * logStride;
+  };
+
+  const auto rescaleStage = [&](size_t index, double scale) {
+    const double before = plan.logicalStageCycles[index];
+    const double after = before * scale;
+    plan.logicalStageCycles[index] = after;
+    plan.totalCycles += after - before;
+  };
+  rescaleStage(recurrenceIndex, curve->recurrenceScale);
+  for (size_t index = recurrenceIndex + 1; index < finalDrainStartIndex;
+       ++index)
+    rescaleStage(index, curve->dotRegionScale);
+
+  const double groupPower = std::pow(groupCount, curve->entryGroupPower);
+  const double midpointPower =
+      std::pow(curve->entryGroupMidpoint, curve->entryGroupPower);
+  const double entryRamp = groupPower / (groupPower + midpointPower);
+  const double entryAdded =
+      std::max(0.0, evaluateCurve(curve->entryAdditiveCoefficients, entryRamp));
+
+  double exitRamp = 0.0;
+  if (curve->exitRampExponential) {
+    exitRamp = 1.0 - std::exp(-std::max(0.0, groupCount - 1.0) /
+                              curve->exitGroupTimeConstant);
+  } else {
+    const double exitGroupPower = std::pow(groupCount, curve->exitGroupPower);
+    const double exitMidpointPower =
+        std::pow(curve->exitGroupMidpoint, curve->exitGroupPower);
+    exitRamp = exitGroupPower / (exitGroupPower + exitMidpointPower);
+  }
+  const double tailLog2Penalty = -std::log2(lastWaveActiveSlotFraction);
+  const double exitTarget = std::max(
+      0.0, evaluateCurve(curve->exitAbsoluteCoefficients, exitRamp) +
+               curve->exitTailLog2ActiveFractionCoefficient * tailLog2Penalty);
+  const double currentExit = plan.logicalStageCycles[finalDrainStartIndex] +
+                             plan.logicalStageCycles[finalStoreIndex];
+  const double exitAdded = std::max(0.0, exitTarget - currentExit);
+
+  plan.logicalStageCycles[entryOwnerIndex] += entryAdded;
+  plan.logicalStageCycles[finalStoreIndex] += exitAdded;
+  plan.totalCycles +=
+      entryAdded + exitAdded + curve->kernelBoundarySystemCycles;
+  plan.wholeSimtCompletionApplied = true;
+  plan.wholeSimtCompletionRowStrideBytes = rowStrideBytes;
+  plan.wholeSimtCompletionGroupCount = plan.runtimeLoopIterationCount;
+  plan.wholeSimtEntryCompletionAddedCycles = entryAdded;
+  plan.wholeSimtExitCompletionAddedCycles = exitAdded;
+  plan.wholeSimtExitCompletionTargetCycles = exitTarget;
+  plan.wholeSimtPreRecurrenceScalarOperations = preRecurrenceScalarOperations;
+  plan.wholeSimtLastWaveActiveSlotFraction = lastWaveActiveSlotFraction;
+  plan.wholeSimtRecurrenceScale = curve->recurrenceScale;
+  plan.wholeSimtDotRegionScale = curve->dotRegionScale;
+  plan.wholeSimtKernelBoundaryCycles = curve->kernelBoundarySystemCycles;
+  plan.wholeSimtCompletionEvidence = curve->evidence;
+}
+
+/// Price the high-wave completion service of a memory-heavy SIMD parent in a
+/// Mixed CV route.  The local SIMT scope keeps its own factor-specific cost;
+/// this term observes only SIMD-owned tile bytes replayed by the parent AIC
+/// loop.  Byte scaling is bounded at the independently measured reference, so
+/// a small copy cannot inherit the full completion envelope.
+static void
+applyMixedParentMemoryCompletionCurve(StageRoutePlan &plan,
+                                      const StageCostTable &costTable) {
+  if (plan.candidate != StageKernelRouteKind::Mixed ||
+      !costTable.mixedParentMemoryCompletionEnabled ||
+      costTable.mixedParentMemoryReferenceBytesPerProgram <= 0 ||
+      costTable.mixedParentMemoryCyclesPerExcessIteration <= 0.0 ||
+      plan.logicalStageCycles.size() != costTable.stages.size() ||
+      plan.runtimeStageLoopIterationCounts.size() != costTable.stages.size() ||
+      plan.runtimeStageExecutionDomains.size() != costTable.stages.size())
+    return;
+
+  bool hasLocalSimtScope = false;
+  bool hasParentDot = false;
+  int64_t parentIterations = 0;
+  double parentBytesPerProgram = 0.0;
+  size_t ownerIndex = costTable.stages.size();
+  for (size_t index = 0; index < costTable.stages.size(); ++index) {
+    const StageImplementation &implementation = plan.implementations[index];
+    if (implementation.mode == StageMode::SIMT && implementation.localScope)
+      hasLocalSimtScope = true;
+    if (implementation.mode != StageMode::SIMD ||
+        plan.runtimeStageExecutionDomains[index] != "aic_parent")
+      continue;
+    parentIterations =
+        std::max(parentIterations, plan.runtimeStageLoopIterationCounts[index]);
+    hasParentDot |= costTable.stages[index].features.hasDot;
+    const bool tileMemory =
+        costTable.stages[index].model == "continuous_tile_memory" ||
+        costTable.stages[index].model == "continuous_tile_store";
+    if (!tileMemory)
+      continue;
+    const double iterations = static_cast<double>(
+        std::max<int64_t>(1, costTable.stages[index].iterationCount));
+    parentBytesPerProgram +=
+        iterations * (costTable.stages[index].workload.loadBytes +
+                      costTable.stages[index].workload.storeBytes);
+    ownerIndex = index;
+  }
+  if (!hasLocalSimtScope || !hasParentDot ||
+      parentIterations <= costTable.mixedParentMemoryMinimumIterations ||
+      parentBytesPerProgram <= 0.0 || ownerIndex == costTable.stages.size())
+    return;
+
+  const double byteScale =
+      std::clamp(parentBytesPerProgram /
+                     static_cast<double>(
+                         costTable.mixedParentMemoryReferenceBytesPerProgram),
+                 0.0, 1.0);
+  const double addedCycles =
+      static_cast<double>(parentIterations -
+                          costTable.mixedParentMemoryMinimumIterations) *
+      costTable.mixedParentMemoryCyclesPerExcessIteration * byteScale;
+  if (!std::isfinite(addedCycles) || addedCycles <= 0.0)
+    return;
+
+  plan.logicalStageCycles[ownerIndex] += addedCycles;
+  plan.totalCycles += addedCycles;
+  plan.mixedParentMemoryCompletionApplied = true;
+  plan.mixedParentMemoryParentIterations = parentIterations;
+  plan.mixedParentMemoryBytesPerProgram = parentBytesPerProgram;
+  plan.mixedParentMemoryScale = byteScale;
+  plan.mixedParentMemoryAddedCycles = addedCycles;
+  plan.mixedParentMemoryCompletionEvidence =
+      costTable.mixedParentMemoryCompletionEvidence;
 }
 
 /// Compose one-group Stage costs according to the schedule that the backend
@@ -801,7 +2511,9 @@ llvm::json::Object StageCostModelSummary::toJSON() const {
 /// AutoBlockify first assigns Q=ceil(P/C) logical programs to that slot. A
 /// whole-kernel pure-SIMT route executes ceil(Q/F) factor-F loop iterations;
 /// its final partial group is still an F-wide VF guarded by an in-bounds
-/// predicate. A local Mixed SuperBlock is different: NPUIR materializes
+/// predicate. Group-level costs remain F-wide while generic dot arithmetic is
+/// reduced by the inactive logical-program fraction. A local Mixed SuperBlock
+/// is different: NPUIR materializes
 /// floor(Q/F) factor-F main iterations plus Q%F separate factor-1 tail
 /// iterations. One-time dispatch/setup must not be multiplied by either
 /// count.
@@ -856,7 +2568,17 @@ static bool applyRuntimeSchedule(StageRoutePlan &plan,
   const int64_t wholeKernelGroupIterations = parentSchedule.wholeIterations;
   const int64_t mixedLoopIterations = parentSchedule.mixedIterations;
 
-  plan.runtimePhysicalProgramCount = std::min(logicalPrograms, launchCores);
+  // A whole-kernel SIMT SuperBlock materializes F logical programs in one
+  // physical block.  Its launch grid therefore contains ceil(P/F) blocks;
+  // reporting P here made the kernel-boundary curve charge idle physical
+  // launches that do not exist.  Mixed retains its parent grid because a
+  // local scope does not change the parent kernel launch.
+  const int64_t launchedPhysicalPrograms =
+      plan.candidate == StageKernelRouteKind::AllSIMT
+          ? ceilDivNonNegative(logicalPrograms, factor)
+          : logicalPrograms;
+  plan.runtimePhysicalProgramCount =
+      std::min(launchedPhysicalPrograms, launchCores);
   plan.runtimeSchedulingSlotCount = std::min(logicalPrograms, schedulingSlots);
   plan.runtimeLogicalProgramsPerSchedulingSlot = programsPerSchedulingSlot;
   plan.runtimeFullGroupCount = fullGroups;
@@ -878,6 +2600,10 @@ static bool applyRuntimeSchedule(StageRoutePlan &plan,
         return stage.model == "auto_blockify_dispatch" ||
                stage.model == "auto_blockify_loop";
       });
+  const bool hasGridStrideLoop =
+      llvm::any_of(costTable.stages, [](const LogicalStageCost &stage) {
+        return stage.features.isGridStrideLoopShell;
+      });
   std::vector<double> unscaledStageCycles = plan.logicalStageCycles;
   std::vector<double> unscaledHandoffCycles = plan.scopeHandoffCycles;
   plan.totalCycles = 0.0;
@@ -889,18 +2615,72 @@ static bool applyRuntimeSchedule(StageRoutePlan &plan,
   const RuntimeSchedule perStageSchedule = makeRuntimeSchedule(
       logicalPrograms, usesCubeExecution ? aiCores : vectorCores, factor);
 
+  // Completion curves for a SIMD prefix scan are measured from the complete
+  // source-loop body and therefore already include its direct input/output
+  // service.  Stage partitioning deliberately keeps those transfers as
+  // adjacent logical stages.  Detect ownership within one contiguous source
+  // grid-stride body so route composition does not charge them a second time.
+  // This is a structural transfer: it does not overlap pipelines and does not
+  // inspect an operator or kernel name.
+  auto simdScanOwnsDirectMemoryStage = [&](size_t stageIndex) {
+    const LogicalStageCost &memoryStage = costTable.stages[stageIndex];
+    if (!memoryStage.features.insideGridStrideLoopBody ||
+        plan.implementations[stageIndex].mode != StageMode::SIMD ||
+        (memoryStage.model != "continuous_tile_memory" &&
+         memoryStage.model != "continuous_tile_store") ||
+        !memoryStage.features.hasContiguousMemory ||
+        memoryStage.features.hasIndirectMemory || memoryStage.features.hasDot ||
+        memoryStage.features.hasReduction || memoryStage.features.hasPrefixScan)
+      return false;
+
+    size_t begin = stageIndex;
+    while (begin > 0 &&
+           costTable.stages[begin - 1].features.insideGridStrideLoopBody)
+      --begin;
+    size_t end = stageIndex + 1;
+    while (end < costTable.stages.size() &&
+           costTable.stages[end].features.insideGridStrideLoopBody)
+      ++end;
+    for (size_t scanIndex = begin; scanIndex < end; ++scanIndex) {
+      if (plan.implementations[scanIndex].mode != StageMode::SIMD)
+        continue;
+      const StageImplementationCost *scan = findImplementationCost(
+          costTable.stages[scanIndex], plan.implementations[scanIndex]);
+      if (scan && scan->resources.gridStridePrefixScanBody > 0.0)
+        return true;
+    }
+    return false;
+  };
+
   for (size_t index = 0; index < costTable.stages.size(); ++index) {
     const LogicalStageCost &stage = costTable.stages[index];
     const StageImplementationCost *selected =
         findImplementationCost(stage, plan.implementations[index]);
     if (!selected)
       return false;
+    plan.indirectLoadGroupStartupCycles =
+        std::max(plan.indirectLoadGroupStartupCycles,
+                 selected->resources.indirectLoadGroupStartup);
+    plan.gridStrideStartupCycles = std::max(
+        plan.gridStrideStartupCycles, selected->resources.gridStrideStartup);
     const double setup = selected->resources.setup;
     // `logicalStageCycles` includes the fixed local-scope envelope so that
     // report totals remain backward compatible.  Remove that envelope before
     // scaling the Stage body; tensor boundary traffic stays in the body.
-    const double fullBody = std::max(0.0, unscaledStageCycles[index] - setup -
-                                              unscaledHandoffCycles[index]);
+    double fullBody = std::max(0.0, unscaledStageCycles[index] - setup -
+                                        unscaledHandoffCycles[index]);
+    if (plan.candidate == StageKernelRouteKind::AllSIMD &&
+        plan.runtimePhysicalProgramCount == 1 &&
+        stage.model == "atomic_memory" &&
+        selected->resources.hasSinglePhysicalProgramAtomicRate) {
+      const double adjustment =
+          static_cast<double>(std::max<int64_t>(1, stage.iterationCount)) *
+          (selected->resources.singlePhysicalProgramAtomic -
+           selected->resources.atomic);
+      fullBody = std::max(0.0, fullBody + adjustment);
+      plan.singlePhysicalProgramAtomicRateApplied = true;
+      plan.singlePhysicalProgramAtomicAdjustmentCycles += adjustment;
+    }
     double scaledStageCycles = unscaledStageCycles[index];
     double scaledHandoffCycles = unscaledHandoffCycles[index];
 
@@ -908,6 +2688,56 @@ static bool applyRuntimeSchedule(StageRoutePlan &plan,
                                  stage.model == "auto_blockify_loop";
     const RuntimeSchedule &schedule =
         isScheduleShell ? parentSchedule : perStageSchedule;
+    // A resident masked rowwise tile can share part of its physical
+    // materialization with the Stage completion envelope.  Once the complete
+    // kernel read/write footprint reaches the independently measured hardware
+    // boundary, that ownership disappears: restore the full serialized
+    // physical materialization inside the same iteration.  This uses only
+    // TTIR bytes, the static Stage trip count, and the logical launch grid;
+    // it neither overlaps loop iterations nor keys on an operator or shape.
+    if (plan.candidate == StageKernelRouteKind::AllSIMD && hasV1Schedule &&
+        stage.features.insideAutoBlockifyV1Loop &&
+        stage.model == "rowwise_reduction" &&
+        selected->resources.irregularFullPhysicalMaterialization >
+            selected->resources.irregularPhysicalMaterialization + 1.0e-9 &&
+        costTable.simdIrregularTileLargeWorkingSetFullPhysicalMinimumBytes >
+            0 &&
+        costTable.logicalProgramCountHint > 0) {
+      const double bytesPerIteration =
+          stage.workload.loadBytes + stage.workload.storeBytes;
+      const double workingSetBytes =
+          bytesPerIteration *
+          static_cast<double>(std::max<int64_t>(1, stage.iterationCount)) *
+          static_cast<double>(costTable.logicalProgramCountHint);
+      if (workingSetBytes >=
+          static_cast<double>(
+              costTable
+                  .simdIrregularTileLargeWorkingSetFullPhysicalMinimumBytes)) {
+        const double count =
+            static_cast<double>(std::max<int64_t>(1, stage.iterationCount));
+        const double currentBodyPerIteration = fullBody / count;
+        const auto &r = selected->resources;
+        const double fullPhysicalVectorCandidate =
+            r.load + r.continuousLoadGroup + r.predicate +
+            std::max(r.compute + r.dot, r.reduction + r.shuffle) +
+            r.irregularFullPhysicalMaterialization +
+            r.irregularTailMaterialization;
+        const double fullPhysicalBodyPerIteration =
+            std::max(currentBodyPerIteration, fullPhysicalVectorCandidate);
+        const double bodyAdjustment =
+            count * (fullPhysicalBodyPerIteration - currentBodyPerIteration);
+        if (bodyAdjustment > 1.0e-9) {
+          fullBody += bodyAdjustment;
+          plan.largeSimdIrregularTileWorkingSetApplied = true;
+          plan.largeSimdIrregularTileWorkingSetBytes = std::max(
+              plan.largeSimdIrregularTileWorkingSetBytes, workingSetBytes);
+          plan.largeSimdIrregularTileAdjustmentCycles +=
+              static_cast<double>(schedule.programsPerSlot) * bodyAdjustment;
+          plan.largeSimdIrregularTileEvidence =
+              costTable.simdIrregularTileCompletionEvidence;
+        }
+      }
+    }
     // A factor-F main iteration and an F1 tail use different implementation
     // records.  In particular, an SIMD peer is replayed F times in the main
     // group but only once in the tail; reusing the F-wide cost for the tail
@@ -957,6 +2787,8 @@ static bool applyRuntimeSchedule(StageRoutePlan &plan,
           factor == 1 ? "factor1" : "factorF_only";
     else if (localSimtScope)
       plan.runtimeStageTailModes[index] = "factorF_plus_factor1_tail";
+    else if (plan.candidate == StageKernelRouteKind::AllSIMT)
+      plan.runtimeStageTailModes[index] = "factorF_predicated_tail";
     else
       plan.runtimeStageTailModes[index] = "factorF_body_plus_factor1_tail";
     if (plan.candidate == StageKernelRouteKind::AllSIMD)
@@ -970,7 +2802,149 @@ static bool applyRuntimeSchedule(StageRoutePlan &plan,
               ? schedule.mixedIterations
               : schedule.programsPerSlot;
 
-    if (!hasV1Schedule) {
+    if (hasGridStrideLoop) {
+      // A source grid-stride loop already maps P logical items onto the C
+      // resident program ids: for (pid; pid < P; pid += num_programs).  V1
+      // SuperBlock groups those resident ids, but it does not consume F
+      // source-loop iterations at once.  Charge prologue/epilogue stages once
+      // and replay only the loop shell/body Q=ceil(P/C) times.  Dividing Q by
+      // F here was the main gather-dot underestimate and also repeated the
+      // loop-invariant gathered operand on every wave.
+      const bool repeatedByGridStrideLoop =
+          stage.features.isGridStrideLoopShell ||
+          stage.features.insideGridStrideLoopBody;
+      const int64_t repetitions =
+          repeatedByGridStrideLoop ? perStageSchedule.programsPerSlot : 1;
+      plan.runtimeStageLoopIterationCounts[index] = repetitions;
+      double repeatedBody = fullBody;
+      if (repeatedByGridStrideLoop && simdScanOwnsDirectMemoryStage(index)) {
+        plan.gridStrideSimdScanMemoryOwnershipApplied = true;
+        plan.gridStrideSimdScanMemoryOwnershipCycles +=
+            static_cast<double>(repetitions) * repeatedBody;
+        repeatedBody = 0.0;
+      }
+      if (repeatedByGridStrideLoop &&
+          plan.candidate == StageKernelRouteKind::AllSIMT) {
+        // A source grid-stride loop already serializes its body over the
+        // resident program ids.  SuperBlock F changes a V1-generated group,
+        // but it does not clone or consume F iterations of this source loop.
+        // Use the F1 body as the semantic body for every explicit factor;
+        // factor-specific occupancy remains available to non-grid-stride
+        // stages and to generated V1 loops.
+        const StageImplementationCost *factorOne = findImplementationCost(
+            stage, StageImplementation{StageMode::SIMT, 1, false, 1});
+        if (!factorOne)
+          return false;
+        if (selected->resources.gridStrideFactorSpecificResourceBody) {
+          // Source-loop iterations are not grouped by F, but their resource
+          // service still depends on the selected active-warp configuration.
+          // Stage scoring forms an F-wide physical-group total, so divide that
+          // total once to recover the measured factor-specific cost of one
+          // serialized source iteration.
+          repeatedBody = std::max(
+              0.0, (selected->totalCycles - selected->resources.setup) /
+                       static_cast<double>(factor));
+          // The SIMT scan Q sweep prices the scan engine after removing its
+          // GM transfers. When Stage fusion places those direct transfers in
+          // the PrefixScan Stage, the source grid-stride loop still executes
+          // one logical transfer stream per source iteration; SuperBlock F
+          // changes the scan resource rate, not that semantic byte stream.
+          // Recompose the same dependency bound with F1 transfer service so
+          // the route cost is invariant to whether load/scan/store are split
+          // into three Stages or fused into one.
+          if (stage.features.hasPrefixScan &&
+              stage.features.hasContiguousMemory &&
+              !stage.features.hasIndirectMemory &&
+              selected->resources.gridStridePrefixScanBody > 0.0 &&
+              factorOne->resources.gridStridePrefixScanBody > 0.0) {
+            auto directMemory = [](const StageResourceCycles &resources) {
+              return resources.load + resources.store +
+                     resources.continuousLoadGroup +
+                     resources.continuousStoreGroup;
+            };
+            const double selectedMemory = directMemory(selected->resources);
+            const double factorOneMemory = directMemory(factorOne->resources);
+            const double selectedBound = std::max(
+                selected->resources.gridStridePrefixScanBody + selectedMemory,
+                selected->resources.issue);
+            const double factorOneMemoryBound = std::max(
+                selected->resources.gridStridePrefixScanBody + factorOneMemory,
+                selected->resources.issue);
+            const double adjustmentPerStage =
+                static_cast<double>(
+                    std::max<int64_t>(1, stage.iterationCount)) *
+                (factorOneMemoryBound - selectedBound);
+            if (std::abs(adjustmentPerStage) > 1.0e-9) {
+              repeatedBody += adjustmentPerStage;
+              plan.gridStrideFactorOneDirectMemoryApplied = true;
+              plan.gridStrideFactorOneDirectMemoryAdjustmentCycles +=
+                  static_cast<double>(repetitions) * adjustmentPerStage;
+            }
+          }
+          if (factor > 1)
+            plan.runtimeStageTailModes[index] =
+                "source_grid_stride_factor_specific_resource_body";
+        } else {
+          repeatedBody = std::max(0.0, factorOne->totalCycles -
+                                           factorOne->resources.setup);
+        }
+        if (factor > 1 &&
+            !selected->resources.gridStrideFactorSpecificResourceBody) {
+          plan.gridStrideFactorOneBodyApplied = true;
+          plan.runtimeStageTailModes[index] = "source_grid_stride_factor1_body";
+        }
+
+        // The generic GM rates come from a rotating cold-memory sweep.  A
+        // warmed source grid-stride loop can repeatedly traverse a bounded
+        // direct, contiguous footprint.  When the complete route footprint
+        // stays inside the independently measured resident domain, replace
+        // only the F1 direct load/store resources with the resident rates.
+        // No execution pipelines are overlapped and no operator/shape key is
+        // consulted.
+        const double bytesPerLogicalProgram =
+            stage.workload.loadBytes + stage.workload.storeBytes;
+        const double workingSetBytes =
+            bytesPerLogicalProgram *
+            static_cast<double>(costTable.logicalProgramCountHint);
+        const bool directContiguousMemory =
+            stage.model == "independent_pipelined_loop" &&
+            stage.features.hasContiguousMemory &&
+            !stage.features.hasIndirectMemory && !stage.features.hasDot &&
+            !stage.features.hasReduction && !stage.features.hasPrefixScan &&
+            factorOne->resources.continuousLoadGroup == 0.0 &&
+            factorOne->resources.continuousStoreGroup == 0.0 &&
+            factorOne->resources.indirectLoadGroup == 0.0 &&
+            factorOne->resources.sharedLayout == 0.0;
+        if (directContiguousMemory && workingSetBytes > 0.0 &&
+            workingSetBytes <=
+                static_cast<double>(
+                    costTable.simtGridStrideResidentMemoryMaximumBytes) &&
+            costTable.simtGridStrideResidentLoadWarpInstructionsPerCycle >
+                0.0 &&
+            costTable.simtGridStrideResidentStoreWarpInstructionsPerCycle >
+                0.0) {
+          const double coldMemory =
+              factorOne->resources.load + factorOne->resources.store;
+          const double residentMemory =
+              stage.workload.loadWarpInstructions /
+                  costTable.simtGridStrideResidentLoadWarpInstructionsPerCycle +
+              stage.workload.storeWarpInstructions /
+                  costTable.simtGridStrideResidentStoreWarpInstructionsPerCycle;
+          const double before = repeatedBody;
+          repeatedBody =
+              std::max(0.0, repeatedBody - coldMemory + residentMemory);
+          plan.gridStrideResidentMemoryApplied = true;
+          plan.gridStrideResidentMemoryWorkingSetBytes = std::max(
+              plan.gridStrideResidentMemoryWorkingSetBytes, workingSetBytes);
+          plan.gridStrideResidentMemoryAdjustmentCycles +=
+              static_cast<double>(repetitions) * (repeatedBody - before);
+          plan.gridStrideResidentMemoryEvidence =
+              costTable.simtGridStrideResidentMemoryEvidence;
+        }
+      }
+      scaledStageCycles = setup + repetitions * repeatedBody;
+      scaledHandoffCycles *= repetitions;
+    } else if (!hasV1Schedule) {
       if (plan.candidate == StageKernelRouteKind::Mixed &&
           plan.implementations[index].mode == StageMode::SIMT &&
           plan.implementations[index].localScope) {
@@ -1008,6 +2982,11 @@ static bool applyRuntimeSchedule(StageRoutePlan &plan,
                 ? schedule.wholeIterations
                 : schedule.programsPerSlot;
         scaledStageCycles = setup + repetitions * fullBody;
+        if (plan.candidate == StageKernelRouteKind::AllSIMT)
+          scaledStageCycles =
+              std::max(setup, scaledStageCycles -
+                                  genericPredicatedDotTailCredit(
+                                      stage, *selected, schedule.tailPrograms));
         scaledHandoffCycles *= repetitions;
       }
     } else if (stage.model == "auto_blockify_loop") {
@@ -1025,6 +3004,10 @@ static bool applyRuntimeSchedule(StageRoutePlan &plan,
         scaledHandoffCycles *= schedule.programsPerSlot;
       } else if (plan.candidate == StageKernelRouteKind::AllSIMT) {
         scaledStageCycles = setup + schedule.wholeIterations * fullBody;
+        scaledStageCycles =
+            std::max(setup, scaledStageCycles -
+                                genericPredicatedDotTailCredit(
+                                    stage, *selected, schedule.tailPrograms));
         scaledHandoffCycles *= schedule.wholeIterations;
       } else {
         double tailUnitCycles = selected->totalCycles;
@@ -1056,6 +3039,1137 @@ static bool applyRuntimeSchedule(StageRoutePlan &plan,
     plan.scopeHandoffCycles[index] = scaledHandoffCycles;
     plan.totalCycles += scaledStageCycles;
   }
+  // The P=1 straight-line SIMT scan lowers to one external helper.  Pure
+  // generic index/address Stages feeding that helper are a TTIR partitioning
+  // artifact; their setup and issue service are already inside the measured
+  // completion-inclusive helper rate.  Keep all explicit memory Stages and
+  // every semantic scan element.  This ownership transfer is structural and
+  // uses neither an operator name nor an exact tensor shape.
+  if (plan.candidate == StageKernelRouteKind::AllSIMT &&
+      plan.runtimePhysicalProgramCount == 1 &&
+      costTable.simtStraightLinePrefixScanElementsPerCycle > 0.0) {
+    bool hasStraightLineScan = false;
+    for (size_t index = 0; index < costTable.stages.size(); ++index) {
+      const LogicalStageCost &stage = costTable.stages[index];
+      hasStraightLineScan |=
+          plan.implementations[index].mode == StageMode::SIMT &&
+          stage.model == "prefix_scan" && !stage.features.hasLoop &&
+          !stage.features.isGridStrideLoopShell &&
+          !stage.features.insideGridStrideLoopBody;
+    }
+    if (hasStraightLineScan) {
+      for (size_t index = 0; index < costTable.stages.size(); ++index) {
+        const LogicalStageCost &stage = costTable.stages[index];
+        const bool genericIssueOnly =
+            !stage.workload.operationCounts.empty() &&
+            llvm::all_of(stage.workload.operationCounts, [](const auto &entry) {
+              return entry.getKey() == "generic.issue";
+            });
+        const bool pureIndexPrologue =
+            plan.implementations[index].mode == StageMode::SIMT &&
+            (stage.model == "index_generation" ||
+             stage.model == "vector_issue") &&
+            genericIssueOnly && !stage.features.hasLoop &&
+            !stage.features.hasContiguousMemory &&
+            !stage.features.hasIndirectMemory &&
+            !stage.features.hasAtomicMemory && !stage.features.hasReduction &&
+            !stage.features.hasPrefixScan && !stage.features.hasDot &&
+            stage.workload.loadOperations == 0.0 &&
+            stage.workload.storeOperations == 0.0 &&
+            stage.workload.dotOperations == 0.0 &&
+            stage.workload.reductionOperations == 0.0;
+        if (!pureIndexPrologue)
+          continue;
+        const double adjustment = plan.logicalStageCycles[index];
+        if (adjustment <= 0.0)
+          continue;
+        plan.logicalStageCycles[index] = 0.0;
+        plan.totalCycles = std::max(0.0, plan.totalCycles - adjustment);
+        plan.straightLineSimtScanIndexOwnershipApplied = true;
+        plan.straightLineSimtScanIndexOwnershipCycles -= adjustment;
+        plan.straightLineSimtScanCompletionEvidence =
+            costTable.simtStraightLinePrefixScanCompletionEvidence;
+      }
+    }
+  }
+  // Stage partitioning may split an uninterrupted straight-line load run at
+  // semantic operations such as extract/insert-slice even though SIMD
+  // lowering emits one MTE2 program for the complete run.  The per-operation
+  // analytical fallback correctly owns every byte, but charging its program
+  // establishment latency in every adjacent load Stage duplicates a route
+  // envelope.  Transfer startup ownership only when at least three exact,
+  // pure direct-load operations remain adjacent in the same execution domain
+  // and no later loaded-index access consumes their values. Loaded-index
+  // address formation establishes a completion boundary, so those MTE2
+  // programs cannot share the straight-line startup envelope. Two-load
+  // kernels remain an independent holdout domain. This is serialized
+  // accounting: no byte service or pipeline overlap is removed.
+  if (plan.candidate == StageKernelRouteKind::AllSIMD &&
+      costTable.simdLoadOperationStartupCycles > 0.0) {
+    const bool hasIndirectAddressDependency =
+        llvm::any_of(costTable.stages, [](const LogicalStageCost &stage) {
+          return stage.features.hasIndirectMemory;
+        });
+    int64_t runOperations = 0;
+    int64_t runRepetitions = 0;
+    std::string runDomain;
+    auto flushLoadRun = [&]() {
+      if (!hasIndirectAddressDependency && runOperations >= 3 &&
+          runRepetitions > 0) {
+        const double adjustment = static_cast<double>(runOperations - 1) *
+                                  costTable.simdLoadOperationStartupCycles *
+                                  static_cast<double>(runRepetitions);
+        plan.totalCycles = std::max(0.0, plan.totalCycles - adjustment);
+        plan.straightLineSimdLoadStartupOwnershipApplied = true;
+        plan.straightLineSimdLoadStartupOwnedOperationCount += runOperations;
+        plan.straightLineSimdLoadStartupAdjustmentCycles -= adjustment;
+        plan.straightLineSimdLoadStartupEvidence =
+            "adjacent pure direct-load Stages share one SIMD MTE2 program "
+            "startup per runtime wave; all bytes remain serialized";
+      }
+      runOperations = 0;
+      runRepetitions = 0;
+      runDomain.clear();
+    };
+    for (size_t index = 0; index <= costTable.stages.size(); ++index) {
+      bool eligible = index < costTable.stages.size();
+      bool transparentSeparator = false;
+      int64_t operations = 0;
+      int64_t repetitions = 0;
+      std::string domain;
+      if (eligible) {
+        const LogicalStageCost &stage = costTable.stages[index];
+        const StageImplementationCost *selected =
+            findImplementationCost(stage, plan.implementations[index]);
+        const auto exactLoads =
+            exactNonNegativeWorkCount(stage.workload.loadOperations);
+        eligible =
+            selected && plan.implementations[index].mode == StageMode::SIMD &&
+            stage.model == "continuous_tile_memory" && exactLoads &&
+            *exactLoads > 0 && stage.workload.storeOperations == 0.0 &&
+            stage.features.hasContiguousMemory && !stage.features.hasLoop &&
+            !stage.features.hasIndirectMemory &&
+            !stage.features.hasAtomicMemory && !stage.features.hasReduction &&
+            !stage.features.hasPrefixScan && !stage.features.hasDot &&
+            selected->resources.load > 0.0 &&
+            selected->resources.continuousLoadGroup == 0.0 &&
+            selected->resources.indirectLoadGroup == 0.0;
+        if (eligible) {
+          operations = *exactLoads;
+          repetitions = plan.runtimeStageLoopIterationCounts[index];
+          domain = plan.runtimeStageExecutionDomains[index];
+          eligible = repetitions > 0;
+        }
+        transparentSeparator =
+            !eligible && selected &&
+            std::abs(selected->totalCycles) <= 1.0e-12 &&
+            stage.workload.loadOperations == 0.0 &&
+            stage.workload.storeOperations == 0.0 &&
+            stage.workload.dotOperations == 0.0 &&
+            stage.workload.reductionOperations == 0.0 &&
+            !stage.features.hasLoop && !stage.features.hasIndirectMemory &&
+            !stage.features.hasAtomicMemory && !stage.features.hasReduction &&
+            !stage.features.hasPrefixScan && !stage.features.hasDot;
+      }
+      if (transparentSeparator && runOperations > 0)
+        continue;
+      if (!eligible || (runOperations > 0 && (repetitions != runRepetitions ||
+                                              domain != runDomain))) {
+        flushLoadRun();
+      }
+      if (eligible) {
+        if (runOperations == 0) {
+          runRepetitions = repetitions;
+          runDomain = domain;
+        }
+        runOperations += operations;
+      }
+    }
+  }
+  // The independent-loop load-group startup was fitted with all vector cores
+  // resident.  For a sub-grid AutoBlockify launch, the separately measured
+  // kernel-boundary envelope already spans that establishment interval.  Move
+  // ownership once while preserving every iteration startup and transferred
+  // byte. A grouped prefix followed by residual loads is a distinct MTE
+  // program and retains its startup. Full-grid memory-stream calibration keeps
+  // the original startup as well.
+  if (plan.candidate == StageKernelRouteKind::AllSIMD &&
+      plan.runtimePhysicalProgramCount > 0 &&
+      plan.runtimePhysicalProgramCount < costTable.physicalCoreCountHint &&
+      costTable.simdIndependentLoadGroupKernelStartupCycles > 0.0) {
+    for (size_t index = 0; index < costTable.stages.size(); ++index) {
+      const LogicalStageCost &stage = costTable.stages[index];
+      const StageImplementationCost *selected =
+          findImplementationCost(stage, plan.implementations[index]);
+      if (!selected || stage.model != "independent_pipelined_loop" ||
+          !stage.features.insideAutoBlockifyV1Loop ||
+          selected->resources.continuousLoadGroup <= 0.0 ||
+          selected->resources.load > 0.0)
+        continue;
+      const double adjustment =
+          std::min(selected->resources.setup,
+                   costTable.simdIndependentLoadGroupKernelStartupCycles);
+      if (adjustment <= 0.0)
+        continue;
+      plan.logicalStageCycles[index] =
+          std::max(0.0, plan.logicalStageCycles[index] - adjustment);
+      plan.totalCycles = std::max(0.0, plan.totalCycles - adjustment);
+      plan.lowOccupancySimdLoadGroupStartupOwnershipApplied = true;
+      plan.lowOccupancySimdLoadGroupStartupAdjustmentCycles -= adjustment;
+      plan.lowOccupancySimdLoadGroupStartupEvidence =
+          "sub-grid AutoBlockify launch transfers one full-grid load-group "
+          "startup to the generic kernel-boundary envelope; iteration bytes "
+          "and service remain serialized";
+    }
+  }
+  // Short multi-wave elementwise kernels often keep two or more independent
+  // direct loads and a direct store in separate Stages.  The Stage bodies own
+  // every serialized byte and per-operation startup, while the measured
+  // independent-load-group curve exposes one additional kernel establishment
+  // envelope.  Charge that envelope once for the route; it is neither a
+  // per-wave term nor pipeline overlap.
+  if (plan.candidate == StageKernelRouteKind::AllSIMD &&
+      plan.runtimeLoopIterationCount > 1 &&
+      costTable.simdIndependentLoadGroupKernelStartupCycles > 0.0) {
+    int64_t directLoadStages = 0;
+    int64_t directStoreStages = 0;
+    bool hasIndependentLoop = false;
+    bool allMemoryStagesDirect = true;
+    for (size_t index = 0; index < costTable.stages.size(); ++index) {
+      const LogicalStageCost &stage = costTable.stages[index];
+      const StageImplementationCost *selected =
+          findImplementationCost(stage, plan.implementations[index]);
+      if (!selected)
+        continue;
+      if (stage.model == "independent_pipelined_loop")
+        hasIndependentLoop = true;
+      const bool hasLoads = stage.workload.loadOperations > 0.0;
+      const bool hasStores = stage.workload.storeOperations > 0.0;
+      if (!hasLoads && !hasStores)
+        continue;
+      const bool direct = stage.features.hasContiguousMemory &&
+                          !stage.features.hasIndirectMemory &&
+                          !stage.features.hasAtomicMemory &&
+                          selected->resources.continuousLoadGroup == 0.0 &&
+                          selected->resources.continuousStoreGroup == 0.0 &&
+                          selected->resources.indirectLoadGroup == 0.0;
+      allMemoryStagesDirect &= direct;
+      if (direct && hasLoads && !hasStores)
+        ++directLoadStages;
+      if (direct && hasStores && !hasLoads)
+        ++directStoreStages;
+    }
+    if (!hasIndependentLoop && allMemoryStagesDirect && directLoadStages >= 3 &&
+        directStoreStages >= 1) {
+      plan.shortSimdMultiMemoryStartupApplied = true;
+      plan.shortSimdMultiMemoryLoadStageCount = directLoadStages;
+      plan.shortSimdMultiMemoryStoreStageCount = directStoreStages;
+      plan.shortSimdMultiMemoryStartupCycles =
+          costTable.simdIndependentLoadGroupKernelStartupCycles;
+      plan.shortSimdMultiMemoryStartupEvidence =
+          "independent SIMD direct-load group kernel startup charged once; "
+          "all memory bytes and Stage bodies remain serialized";
+      plan.totalCycles += plan.shortSimdMultiMemoryStartupCycles;
+    }
+  }
+  // In a factor-one source grid-stride gather, the kernel boundary already
+  // contains the first indirect-memory service interval.  The dynamic group
+  // curve therefore contributes only Q-1 incremental services.  Remove one
+  // indirect body once, retaining the separately measured grid-stride startup
+  // and every later serialized iteration.
+  const bool gridStrideBodyHasDot =
+      llvm::any_of(costTable.stages, [](const LogicalStageCost &stage) {
+        return stage.features.insideGridStrideLoopBody && stage.features.hasDot;
+      });
+  if (plan.candidate == StageKernelRouteKind::AllSIMT &&
+      plan.routeSuperblockFactor == 1 && hasGridStrideLoop &&
+      !gridStrideBodyHasDot) {
+    for (size_t index = 0; index < costTable.stages.size(); ++index) {
+      const LogicalStageCost &stage = costTable.stages[index];
+      const StageImplementationCost *selected =
+          findImplementationCost(stage, plan.implementations[index]);
+      if (!selected || !stage.features.insideGridStrideLoopBody ||
+          stage.features.hasDot ||
+          plan.runtimeStageLoopIterationCounts[index] <= 1 ||
+          selected->resources.gridStrideStartup <= 0.0 ||
+          selected->resources.indirectLoadGroup <= 0.0)
+        continue;
+      const double adjustment = selected->resources.indirectLoadGroup;
+      plan.totalCycles = std::max(0.0, plan.totalCycles - adjustment);
+      plan.gridStrideFirstIndirectServiceOwnedByBoundary = true;
+      plan.gridStrideFirstIndirectServiceAdjustmentCycles -= adjustment;
+      plan.gridStrideFirstIndirectServiceEvidence =
+          "factor-one pure dynamic grid-stride gather boundary owns the "
+          "first indirect service; Q-1 later services remain serialized";
+      break;
+    }
+  }
+  // The intercept of a loaded-index count sweep is a kernel execution
+  // envelope.  Paying it in every Stage and runtime wave multiplied the same
+  // launch/fill cost several times (most visibly for grid-stride gather-dot).
+  // The incremental group curve remains in each Stage; the route owns the
+  // shared startup exactly once.
+  // Dynamic grid-stride evidence includes the serialized body initialization
+  // and supersedes static-range intercepts when present.  Both are route
+  // envelopes, so they must never be summed.
+  if ((plan.candidate == StageKernelRouteKind::AllSIMT ||
+       plan.candidate == StageKernelRouteKind::AllSIMD) &&
+      hasGridStrideLoop) {
+    double indirectWarpInstructions = 0.0;
+    double dotFlops = 0.0;
+    for (const LogicalStageCost &stage : costTable.stages) {
+      if (!stage.features.insideGridStrideLoopBody)
+        continue;
+      for (const auto &[shape, count] : stage.workload.indirectLoadCounts) {
+        if (!std::isfinite(count) || count < 0.0 || shape.second <= 0)
+          continue;
+        indirectWarpInstructions +=
+            count * static_cast<double>(ceilDivNonNegative(shape.second, 32));
+      }
+      dotFlops += stage.workload.dotFlops;
+    }
+    const auto indirectCount =
+        exactNonNegativeWorkCount(indirectWarpInstructions);
+    const auto dotFlopCount = exactNonNegativeWorkCount(dotFlops);
+    // When Q<F the selected factor-F route executes no factor-F body at all:
+    // it consists solely of factor-1 tail programs.  A factor-F composition
+    // residual is evidence for the physical F-wide group and cannot be
+    // charged to that tail-only route.
+    const int64_t compositionFactor =
+        plan.runtimeFullGroupCount == 0 && plan.runtimeTailProgramCount > 0
+            ? 1
+            : factor;
+    const auto &bodySurfaces =
+        plan.candidate == StageKernelRouteKind::AllSIMD
+            ? costTable
+                  .simdGridStrideIndirectDotCompositionBodyResidualByFactorAndGeometry
+            : costTable
+                  .simtGridStrideIndirectDotCompositionBodyResidualByFactorAndGeometry;
+    const auto &startupSurfaces =
+        plan.candidate == StageKernelRouteKind::AllSIMD
+            ? costTable
+                  .simdGridStrideIndirectDotCompositionStartupResidualByFactorAndGeometry
+            : costTable
+                  .simtGridStrideIndirectDotCompositionStartupResidualByFactorAndGeometry;
+    const std::string &compositionEvidence =
+        plan.candidate == StageKernelRouteKind::AllSIMD
+            ? costTable.simdGridStrideIndirectDotCompositionEvidence
+            : costTable.simtGridStrideIndirectDotCompositionEvidence;
+    const auto bodyFactor = bodySurfaces.find(compositionFactor);
+    const auto startupFactor = startupSurfaces.find(compositionFactor);
+    std::optional<double> bodyResidual;
+    std::optional<double> startupResidual;
+    if (indirectCount && dotFlopCount && *indirectCount > 0 &&
+        *dotFlopCount > 0) {
+      if (bodyFactor != bodySurfaces.end())
+        bodyResidual = interpolateBoundedCompositionSurface(
+            bodyFactor->second, *indirectCount, *dotFlopCount);
+      if (startupFactor != startupSurfaces.end())
+        startupResidual = interpolateBoundedCompositionSurface(
+            startupFactor->second, *indirectCount, *dotFlopCount);
+    }
+    const double body = bodyResidual.value_or(0.0);
+    const double startup = startupResidual.value_or(0.0);
+    if (std::abs(body) > 1.0e-12 || std::abs(startup) > 1.0e-12) {
+      plan.gridStrideIndirectDotCompositionResidualApplied = true;
+      plan.gridStrideCompositionIndirectWarpInstructions = *indirectCount;
+      plan.gridStrideCompositionDotFlops = *dotFlopCount;
+      plan.gridStrideCompositionBodyResidualCycles = body;
+      plan.gridStrideCompositionStartupResidualCycles = startup;
+      plan.gridStrideCompositionTotalResidualCycles =
+          startup + static_cast<double>(programsPerSchedulingSlot) * body;
+      plan.gridStrideCompositionEvidence = compositionEvidence;
+      plan.totalCycles += plan.gridStrideCompositionTotalResidualCycles;
+    }
+  }
+  // A two-pass rowwise body has a distinct compiler structure: exactly two
+  // FP16 loaded-index row reads feed one row reduction and a final transform,
+  // with no dot work.  Isolated Stage resources do not determine the complete
+  // serialized composition envelope.  Apply only a bounded (extent,Q)
+  // surface for the selected physical factor; this is a completion residual,
+  // not cross-Stage pipeline overlap.
+  if (plan.candidate == StageKernelRouteKind::AllSIMT ||
+      plan.candidate == StageKernelRouteKind::AllSIMD) {
+    int64_t rowwiseStageCount = 0;
+    int64_t segmentedStageCount = 0;
+    int64_t commonContiguousExtent = 0;
+    bool exactStructure = true;
+    for (const LogicalStageCost &stage : costTable.stages) {
+      const StageWorkload &work = stage.workload;
+      if (work.dotFlops > 0.0)
+        exactStructure = false;
+      if (work.reductionOperations > 0.0) {
+        ++rowwiseStageCount;
+      }
+      if (work.segmentedIndirectLoadCounts.empty())
+        continue;
+      if (work.segmentedIndirectLoadCounts.size() != 1) {
+        exactStructure = false;
+        continue;
+      }
+      const auto &[shape, count] = *work.segmentedIndirectLoadCounts.begin();
+      const auto exactCount = exactNonNegativeWorkCount(count);
+      const auto [bytes, elements, contiguous] = shape;
+      if (!exactCount || *exactCount != 1 || bytes <= 0 || elements <= 0 ||
+          contiguous <= 0 || elements % contiguous != 0 ||
+          elements / contiguous != 2 || bytes * 8 / elements != 16 ||
+          bytes * 8 % elements != 0) {
+        exactStructure = false;
+        continue;
+      }
+      if (commonContiguousExtent != 0 && commonContiguousExtent != contiguous)
+        exactStructure = false;
+      commonContiguousExtent = contiguous;
+      ++segmentedStageCount;
+    }
+    exactStructure &= rowwiseStageCount == 1 && segmentedStageCount == 2 &&
+                      commonContiguousExtent > 0;
+    const auto &surfaces =
+        plan.candidate == StageKernelRouteKind::AllSIMD
+            ? costTable
+                  .simdTwoPassRowwiseCompletionResidualByFactorExtentAndProgramsPerSlot
+            : costTable
+                  .simtTwoPassRowwiseCompletionResidualByFactorExtentAndProgramsPerSlot;
+    const std::string &evidence =
+        plan.candidate == StageKernelRouteKind::AllSIMD
+            ? costTable.simdTwoPassRowwiseCompletionEvidence
+            : costTable.simtTwoPassRowwiseCompletionEvidence;
+    const auto factorSurface = surfaces.find(factor);
+    std::optional<double> residual;
+    if (exactStructure && factorSurface != surfaces.end())
+      residual = interpolateBoundedCompositionSurface(
+          factorSurface->second, commonContiguousExtent,
+          programsPerSchedulingSlot);
+    if (residual && std::abs(*residual) > 1.0e-12) {
+      plan.twoPassRowwiseCompletionApplied = true;
+      plan.twoPassRowwiseContiguousExtent = commonContiguousExtent;
+      plan.twoPassRowwiseResidualCycles = *residual;
+      plan.twoPassRowwiseCompletionEvidence = evidence;
+      plan.totalCycles = std::max(0.0, plan.totalCycles + *residual);
+    }
+  }
+  // A scalar-result row reduction carried across a source loop lowers to a
+  // different SIMD helper from the matrix-valued recurrence calibration.
+  // Match the TTIR topology exactly, then replace that Stage with its bounded
+  // completion-inclusive cost.  The source-program term represents measured
+  // single-wave contention; it is not an operator/shape identity and it does
+  // not overlap iterations or neighboring Stages.
+  if ((plan.candidate == StageKernelRouteKind::AllSIMD ||
+       plan.candidate == StageKernelRouteKind::Mixed) &&
+      costTable.simdSingleResultRowReductionRecurrenceCompletionEnabled) {
+    const int64_t sourcePrograms = costTable.sourceLogicalProgramCountHint > 0
+                                       ? costTable.sourceLogicalProgramCountHint
+                                       : costTable.logicalProgramCountHint;
+    if (sourcePrograms >=
+            costTable.simdSingleResultRowReductionRecurrenceMinimumPrograms &&
+        sourcePrograms <=
+            costTable.simdSingleResultRowReductionRecurrenceMaximumPrograms) {
+      std::optional<size_t> matchingStage;
+      int64_t reductionExtent = 0;
+      for (size_t index = 0; index < costTable.stages.size(); ++index) {
+        const LogicalStageCost &stage = costTable.stages[index];
+        if (!stage.features.hasLoopCarriedDataDependency ||
+            !stage.features.hasReduction)
+          continue;
+        const StageWorkload &work = stage.workload;
+        if (stage.iterationCount <
+                costTable
+                    .simdSingleResultRowReductionRecurrenceMinimumIterations ||
+            stage.iterationCount >
+                costTable
+                    .simdSingleResultRowReductionRecurrenceMaximumIterations ||
+            stage.features.parallelRecurrenceGroupCount != 1 ||
+            stage.features.hasDot || stage.features.hasPrefixScan ||
+            work.reductionGeometryCounts.size() != 1 ||
+            !work.scalarizedMultiResultReductionCounts.empty() ||
+            !work.prefixScanCounts.empty()) {
+          matchingStage.reset();
+          reductionExtent = 0;
+          break;
+        }
+        const auto &[geometry, count] = *work.reductionGeometryCounts.begin();
+        const auto exactCount = exactNonNegativeWorkCount(count);
+        const auto [rows, extent, elementBits] = geometry;
+        if (!exactCount || *exactCount != 1 || rows != 1 || elementBits != 32 ||
+            extent <
+                costTable.simdSingleResultRowReductionRecurrenceMinimumExtent ||
+            extent >
+                costTable.simdSingleResultRowReductionRecurrenceMaximumExtent ||
+            matchingStage) {
+          matchingStage.reset();
+          reductionExtent = 0;
+          break;
+        }
+        matchingStage = index;
+        reductionExtent = extent;
+      }
+      if (matchingStage &&
+          plan.implementations[*matchingStage].mode == StageMode::SIMD) {
+        const size_t index = *matchingStage;
+        const int64_t iterations = costTable.stages[index].iterationCount;
+        const double startup =
+            costTable
+                .simdSingleResultRowReductionRecurrenceStartupInterceptCycles +
+            costTable
+                    .simdSingleResultRowReductionRecurrenceStartupSqrtProgramCycles *
+                std::sqrt(static_cast<double>(sourcePrograms));
+        const double target =
+            std::max(0.0, startup) +
+            static_cast<double>(iterations) *
+                costTable.simdSingleResultRowReductionRecurrenceIterationCycles;
+        const double adjustment = target - plan.logicalStageCycles[index];
+        plan.logicalStageCycles[index] = target;
+        plan.totalCycles = std::max(0.0, plan.totalCycles + adjustment);
+        plan.simdSingleResultRowReductionRecurrenceCompletionApplied = true;
+        plan.simdSingleResultRowReductionRecurrenceExtent = reductionExtent;
+        plan.simdSingleResultRowReductionRecurrenceIterations = iterations;
+        plan.simdSingleResultRowReductionRecurrencePrograms = sourcePrograms;
+        plan.simdSingleResultRowReductionRecurrenceTargetCycles = target;
+        plan.simdSingleResultRowReductionRecurrenceAdjustmentCycles =
+            adjustment;
+        plan.simdSingleResultRowReductionRecurrenceEvidence =
+            costTable.simdSingleResultRowReductionRecurrenceEvidence;
+      }
+    }
+  }
+  // Whole-SIMT F1 uses a different scalar-result recurrence helper.  Its
+  // bounded completion surface is measured independently from the SIMD and
+  // matrix-valued recurrence paths and is selected only by TTIR topology,
+  // reduction extent, dynamic trip count, and source launch count.
+  if (plan.candidate == StageKernelRouteKind::AllSIMT && factor == 1 &&
+      costTable.simtSingleResultRowReductionRecurrenceCompletionEnabled) {
+    const int64_t sourcePrograms = costTable.sourceLogicalProgramCountHint > 0
+                                       ? costTable.sourceLogicalProgramCountHint
+                                       : costTable.logicalProgramCountHint;
+    if (sourcePrograms >=
+            costTable.simtSingleResultRowReductionRecurrenceMinimumPrograms &&
+        sourcePrograms <=
+            costTable.simtSingleResultRowReductionRecurrenceMaximumPrograms) {
+      std::optional<size_t> matchingStage;
+      int64_t reductionExtent = 0;
+      for (size_t index = 0; index < costTable.stages.size(); ++index) {
+        const LogicalStageCost &stage = costTable.stages[index];
+        if (!stage.features.hasLoopCarriedDataDependency ||
+            !stage.features.hasReduction)
+          continue;
+        const StageWorkload &work = stage.workload;
+        if (stage.iterationCount <
+                costTable
+                    .simtSingleResultRowReductionRecurrenceMinimumIterations ||
+            stage.iterationCount >
+                costTable
+                    .simtSingleResultRowReductionRecurrenceMaximumIterations ||
+            stage.features.parallelRecurrenceGroupCount != 1 ||
+            stage.features.hasDot || stage.features.hasPrefixScan ||
+            work.reductionGeometryCounts.size() != 1 ||
+            !work.scalarizedMultiResultReductionCounts.empty() ||
+            !work.prefixScanCounts.empty()) {
+          matchingStage.reset();
+          reductionExtent = 0;
+          break;
+        }
+        const auto &[geometry, count] = *work.reductionGeometryCounts.begin();
+        const auto exactCount = exactNonNegativeWorkCount(count);
+        const auto [rows, extent, elementBits] = geometry;
+        if (!exactCount || *exactCount != 1 || rows != 1 || elementBits != 32 ||
+            extent <
+                costTable.simtSingleResultRowReductionRecurrenceMinimumExtent ||
+            extent >
+                costTable.simtSingleResultRowReductionRecurrenceMaximumExtent ||
+            matchingStage) {
+          matchingStage.reset();
+          reductionExtent = 0;
+          break;
+        }
+        matchingStage = index;
+        reductionExtent = extent;
+      }
+      if (matchingStage &&
+          plan.implementations[*matchingStage].mode == StageMode::SIMT) {
+        const size_t index = *matchingStage;
+        const int64_t iterations = costTable.stages[index].iterationCount;
+        const double startup =
+            costTable
+                .simtSingleResultRowReductionRecurrenceStartupInterceptCycles +
+            costTable
+                    .simtSingleResultRowReductionRecurrenceStartupSqrtProgramCycles *
+                std::sqrt(static_cast<double>(sourcePrograms));
+        const double target =
+            std::max(0.0, startup) +
+            static_cast<double>(iterations) *
+                costTable.simtSingleResultRowReductionRecurrenceIterationCycles;
+        const double adjustment = target - plan.logicalStageCycles[index];
+        plan.logicalStageCycles[index] = target;
+        plan.totalCycles = std::max(0.0, plan.totalCycles + adjustment);
+        plan.simtSingleResultRowReductionRecurrenceCompletionApplied = true;
+        plan.simtSingleResultRowReductionRecurrenceExtent = reductionExtent;
+        plan.simtSingleResultRowReductionRecurrenceIterations = iterations;
+        plan.simtSingleResultRowReductionRecurrencePrograms = sourcePrograms;
+        plan.simtSingleResultRowReductionRecurrenceTargetCycles = target;
+        plan.simtSingleResultRowReductionRecurrenceAdjustmentCycles =
+            adjustment;
+        plan.simtSingleResultRowReductionRecurrenceEvidence =
+            costTable.simtSingleResultRowReductionRecurrenceEvidence;
+      }
+    }
+  }
+  // A coalesced multi-result scan is completed by one backend helper whose
+  // elapsed envelope depends on the number of source programs and on the
+  // useful prefix inside the padded scan axis.  The scan Stage itself does not
+  // retain the runtime mask bound after zero filling, but the adjacent masked
+  // row-major loads/stores retain that bound as their row stride. Match the
+  // complete TTIR topology and recover the active axis from those accesses;
+  // no operator name, source location, or exact tensor shape is consulted.
+  if (plan.candidate == StageKernelRouteKind::AllSIMD && factor == 1 &&
+      costTable.simdMultiResultPrefixScanCompletionEnabled) {
+    const int64_t sourcePrograms = costTable.sourceLogicalProgramCountHint > 0
+                                       ? costTable.sourceLogicalProgramCountHint
+                                       : costTable.logicalProgramCountHint;
+    bool exactStructure =
+        sourcePrograms >= costTable.simdMultiResultPrefixScanMinimumPrograms &&
+        sourcePrograms <= costTable.simdMultiResultPrefixScanMaximumPrograms;
+    std::optional<size_t> scanStageIndex;
+    int64_t paddedAxis = 0;
+    int64_t independentSequences = 0;
+    int64_t resultCount = 0;
+    for (size_t index = 0; index < costTable.stages.size(); ++index) {
+      const LogicalStageCost &stage = costTable.stages[index];
+      if (stage.features.hasDot || stage.features.hasAtomicMemory ||
+          stage.features.hasLoopCarriedDataDependency)
+        exactStructure = false;
+      if (stage.workload.prefixScanCounts.empty())
+        continue;
+      if (scanStageIndex || stage.workload.prefixScanCounts.size() != 1 ||
+          stage.iterationCount != 1) {
+        exactStructure = false;
+        continue;
+      }
+      const auto &[shape, count] = *stage.workload.prefixScanCounts.begin();
+      const auto exactCount = exactNonNegativeWorkCount(count);
+      const auto &[axis, sequences, stride, results, reverse, combine] = shape;
+      if (!exactCount || *exactCount != 1 || reverse || stride != 1 ||
+          combine != "add" ||
+          axis < costTable.simdMultiResultPrefixScanMinimumPaddedAxis ||
+          axis > costTable.simdMultiResultPrefixScanMaximumPaddedAxis ||
+          results != costTable.simdMultiResultPrefixScanRequiredResultCount ||
+          sequences !=
+              costTable.simdMultiResultPrefixScanRequiredIndependentSequences) {
+        exactStructure = false;
+        continue;
+      }
+      scanStageIndex = index;
+      paddedAxis = axis;
+      independentSequences = sequences;
+      resultCount = results;
+    }
+
+    int64_t activeAxis = 0;
+    int64_t matchingLoads = 0;
+    int64_t matchingStores = 0;
+    int64_t totalTensorMemoryAccesses = 0;
+    for (const LogicalStageCost &stage : costTable.stages) {
+      for (const StageMemoryAccess &access : stage.workload.memoryAccesses) {
+        ++totalTensorMemoryAccesses;
+        if (!scanStageIndex || !access.masked ||
+            access.addressDependsOnLoadedIndex || access.effectiveRank() != 2 ||
+            access.elementBits != 32 ||
+            access.rowCount() != independentSequences ||
+            access.rowBytes() != paddedAxis * 4 ||
+            access.rowStrideBytes() <= 0 || access.rowStrideBytes() % 4 != 0) {
+          exactStructure = false;
+          continue;
+        }
+        const int64_t candidateActiveAxis = access.rowStrideBytes() / 4;
+        if (candidateActiveAxis <= 0 || candidateActiveAxis > paddedAxis ||
+            (activeAxis != 0 && activeAxis != candidateActiveAxis)) {
+          exactStructure = false;
+          continue;
+        }
+        activeAxis = candidateActiveAxis;
+        if (access.store)
+          ++matchingStores;
+        else
+          ++matchingLoads;
+      }
+    }
+    exactStructure &= scanStageIndex.has_value() && activeAxis > 0 &&
+                      matchingLoads == resultCount &&
+                      matchingStores == resultCount &&
+                      totalTensorMemoryAccesses == 2 * resultCount;
+    const double activeRatio =
+        paddedAxis > 0
+            ? static_cast<double>(activeAxis) / static_cast<double>(paddedAxis)
+            : 0.0;
+    exactStructure &=
+        activeRatio >=
+            costTable.simdMultiResultPrefixScanMinimumActiveRatio - 1.0e-12 &&
+        activeRatio <=
+            costTable.simdMultiResultPrefixScanMaximumActiveRatio + 1.0e-12;
+    if (exactStructure) {
+      const double absoluteTarget =
+          costTable.simdMultiResultPrefixScanElapsedInterceptCycles +
+          costTable.simdMultiResultPrefixScanElapsedSqrtProgramCycles *
+              std::sqrt(static_cast<double>(sourcePrograms)) +
+          costTable.simdMultiResultPrefixScanElapsedInactiveRatioCycles *
+              (1.0 - activeRatio) +
+          costTable.simdMultiResultPrefixScanElapsedPaddedAxisCycles *
+              static_cast<double>(paddedAxis);
+      const double routeTarget = std::max(
+          0.0, absoluteTarget -
+                   costTable.simdMultiResultPrefixScanFixedBoundaryCycles);
+      const double adjustment = routeTarget - plan.totalCycles;
+      plan.totalCycles = routeTarget;
+      plan.logicalStageCycles[*scanStageIndex] =
+          std::max(0.0, plan.logicalStageCycles[*scanStageIndex] + adjustment);
+      plan.simdMultiResultPrefixScanCompletionApplied = true;
+      plan.simdMultiResultPrefixScanSourcePrograms = sourcePrograms;
+      plan.simdMultiResultPrefixScanPaddedAxis = paddedAxis;
+      plan.simdMultiResultPrefixScanActiveAxis = activeAxis;
+      plan.simdMultiResultPrefixScanResultCount = resultCount;
+      plan.simdMultiResultPrefixScanIndependentSequences = independentSequences;
+      plan.simdMultiResultPrefixScanActiveRatio = activeRatio;
+      plan.simdMultiResultPrefixScanAbsoluteTargetCycles = absoluteTarget;
+      plan.simdMultiResultPrefixScanRouteTargetCycles = routeTarget;
+      plan.simdMultiResultPrefixScanAdjustmentCycles = adjustment;
+      plan.simdMultiResultPrefixScanEvidence =
+          costTable.simdMultiResultPrefixScanEvidence;
+    }
+  }
+  plan.totalCycles += plan.gridStrideStartupCycles > 0.0
+                          ? plan.gridStrideStartupCycles
+                          : plan.indirectLoadGroupStartupCycles;
+  applyMixedParentMemoryCompletionCurve(plan, costTable);
+  applyWholeSimdCompletionCurve(plan, costTable);
+  applyWholeSimtCompletionCurve(plan, costTable);
+  // A straight-line pairwise selection network lowers as one compound SIMT
+  // helper. Pricing every extent-2 reduction and predicate independently
+  // double counts that helper's internal issue and shuffle envelope. Match the
+  // complete compiler structure and replace the route resource with the
+  // bounded completion formula. No operator/function name participates.
+  if (plan.candidate == StageKernelRouteKind::AllSIMT && factor == 1 &&
+      plan.runtimePhysicalProgramCount == 1 &&
+      costTable.logicalProgramCountHint == 1 &&
+      costTable.simtPairwiseSelectionNetworkCompletionEnabled) {
+    bool exactStructure = true;
+    int64_t totalTensorMemoryAccesses = 0;
+    int64_t matchingLoads = 0;
+    int64_t matchingStores = 0;
+    int64_t inputRows = 0;
+    int64_t inputColumns = 0;
+    int64_t outputRows = 0;
+    int64_t outputColumns = 0;
+    int64_t reductionStages = 0;
+    for (const LogicalStageCost &stage : costTable.stages) {
+      const bool scheduleShell = stage.model == "auto_blockify_dispatch" ||
+                                 stage.model == "auto_blockify_loop";
+      if (stage.features.hasDot || stage.features.hasAtomicMemory ||
+          stage.features.hasPrefixScan || stage.features.hasIndirectMemory ||
+          stage.features.hasLoopCarriedDataDependency ||
+          (stage.features.hasLoop && !scheduleShell))
+        exactStructure = false;
+
+      if (stage.features.hasReduction) {
+        if (stage.model != "rowwise_reduction" || stage.iterationCount != 1 ||
+            stage.workload.reductionGeometryCounts.size() != 1) {
+          exactStructure = false;
+        } else {
+          const auto &[geometry, count] =
+              *stage.workload.reductionGeometryCounts.begin();
+          const auto exactCount = exactNonNegativeWorkCount(count);
+          const auto [rows, extent, elementBits] = geometry;
+          if (!exactCount || *exactCount != 1 || rows <= 0 || extent != 2 ||
+              elementBits != 32)
+            exactStructure = false;
+          else
+            ++reductionStages;
+        }
+      }
+
+      for (const StageMemoryAccess &access : stage.workload.memoryAccesses) {
+        ++totalTensorMemoryAccesses;
+        if (access.masked || access.addressDependsOnLoadedIndex ||
+            access.elementBits != 32 || access.effectiveRank() != 2 ||
+            !access.hasStaticLayout() || access.shape.size() != 2 ||
+            access.strides.size() != 2 || !access.strides[1] ||
+            *access.strides[1] != 1 ||
+            access.rowStrideBytes() != access.rowBytes()) {
+          exactStructure = false;
+          continue;
+        }
+        if (access.store) {
+          ++matchingStores;
+          outputRows = access.shape[0];
+          outputColumns = access.shape[1];
+        } else {
+          ++matchingLoads;
+          inputRows = access.shape[0];
+          inputColumns = access.shape[1];
+        }
+      }
+    }
+    int64_t inputElements = 0;
+    if (inputRows > 0 && inputColumns > 0 &&
+        inputRows <= std::numeric_limits<int64_t>::max() / inputColumns)
+      inputElements = inputRows * inputColumns;
+    else
+      exactStructure = false;
+    exactStructure &=
+        totalTensorMemoryAccesses == 2 && matchingLoads == 1 &&
+        matchingStores == 1 && inputRows == outputRows && inputRows > 0 &&
+        inputColumns > outputColumns &&
+        llvm::isPowerOf2_64(static_cast<uint64_t>(outputColumns)) &&
+        inputElements >=
+            costTable.simtPairwiseSelectionNetworkMinimumInputElements &&
+        inputElements <=
+            costTable.simtPairwiseSelectionNetworkMaximumInputElements &&
+        outputColumns >=
+            costTable.simtPairwiseSelectionNetworkMinimumOutputColumns &&
+        outputColumns <=
+            costTable.simtPairwiseSelectionNetworkMaximumOutputColumns &&
+        reductionStages >=
+            costTable.simtPairwiseSelectionNetworkMinimumReductionStages;
+    if (exactStructure) {
+      const double target = std::max(
+          0.0,
+          costTable.simtPairwiseSelectionNetworkInterceptCycles +
+              costTable.simtPairwiseSelectionNetworkInputElementCycles *
+                  static_cast<double>(inputElements) +
+              costTable.simtPairwiseSelectionNetworkLog2OutputColumnCycles *
+                  std::log2(static_cast<double>(outputColumns)));
+      const double original = plan.totalCycles;
+      const double adjustment = target - original;
+      if (original > 0.0) {
+        const double scale = target / original;
+        for (double &cycles : plan.logicalStageCycles)
+          cycles *= scale;
+        for (double &cycles : plan.scopeHandoffCycles)
+          cycles *= scale;
+      }
+      plan.totalCycles = target;
+      plan.simtPairwiseSelectionNetworkCompletionApplied = true;
+      plan.simtPairwiseSelectionNetworkInputRows = inputRows;
+      plan.simtPairwiseSelectionNetworkInputColumns = inputColumns;
+      plan.simtPairwiseSelectionNetworkOutputColumns = outputColumns;
+      plan.simtPairwiseSelectionNetworkReductionStages = reductionStages;
+      plan.simtPairwiseSelectionNetworkTargetCycles = target;
+      plan.simtPairwiseSelectionNetworkAdjustmentCycles = adjustment;
+      plan.simtPairwiseSelectionNetworkEvidence =
+          costTable.simtPairwiseSelectionNetworkEvidence;
+    }
+  }
+  // A large straight-line SIMD min/max scan has a completion tail that is not
+  // represented by the source-level scan dependency tree.  Charge the
+  // bounded per-sequence residual once for the complete route.  The matcher
+  // uses only the prefix-scan tuple and preserves the explicit Stage costs.
+  if (plan.candidate == StageKernelRouteKind::AllSIMD && factor == 1 &&
+      plan.runtimePhysicalProgramCount == 1 &&
+      costTable.logicalProgramCountHint == 1 &&
+      costTable.simdLargeSequenceMinmaxScanCompletionEnabled) {
+    bool exactStructure = true;
+    int64_t matchingScans = 0;
+    int64_t independentSequences = 0;
+    int64_t scanExtent = 0;
+    for (const LogicalStageCost &stage : costTable.stages) {
+      const bool scheduleShell = stage.model == "auto_blockify_dispatch" ||
+                                 stage.model == "auto_blockify_loop";
+      if (stage.features.hasDot || stage.features.hasAtomicMemory ||
+          stage.features.hasIndirectMemory ||
+          stage.features.hasLoopCarriedDataDependency ||
+          (stage.features.hasLoop && !scheduleShell))
+        exactStructure = false;
+      if (!stage.features.hasPrefixScan)
+        continue;
+      if (stage.model != "prefix_scan" || stage.iterationCount != 1 ||
+          stage.workload.prefixScanCounts.size() != 1) {
+        exactStructure = false;
+        continue;
+      }
+      const auto &[geometry, count] = *stage.workload.prefixScanCounts.begin();
+      const auto exactCount = exactNonNegativeWorkCount(count);
+      const auto &[axisExtent, sequences, axisStride, resultCount, reverse,
+                   combineClass] = geometry;
+      if (!exactCount || *exactCount != 1 || axisExtent <= 1 ||
+          sequences <= 1 || axisStride <= 0 || resultCount != 1 || reverse ||
+          combineClass != "minmax") {
+        exactStructure = false;
+        continue;
+      }
+      ++matchingScans;
+      independentSequences = sequences;
+      scanExtent = axisExtent;
+    }
+    exactStructure &=
+        matchingScans == 1 &&
+        independentSequences >=
+            costTable.simdLargeSequenceMinmaxScanMinimumIndependentSequences &&
+        independentSequences <=
+            costTable.simdLargeSequenceMinmaxScanMaximumIndependentSequences &&
+        scanExtent >= costTable.simdLargeSequenceMinmaxScanMinimumExtent &&
+        scanExtent <= costTable.simdLargeSequenceMinmaxScanMaximumExtent;
+    if (exactStructure) {
+      const double adjustment =
+          costTable.simdLargeSequenceMinmaxScanPerIndependentSequenceCycles *
+          static_cast<double>(independentSequences);
+      const double original = plan.totalCycles;
+      const double target = original + adjustment;
+      if (original > 0.0) {
+        const double scale = target / original;
+        for (double &cycles : plan.logicalStageCycles)
+          cycles *= scale;
+        for (double &cycles : plan.scopeHandoffCycles)
+          cycles *= scale;
+      }
+      plan.totalCycles = target;
+      plan.simdLargeSequenceMinmaxScanCompletionApplied = true;
+      plan.simdLargeSequenceMinmaxScanIndependentSequences =
+          independentSequences;
+      plan.simdLargeSequenceMinmaxScanExtent = scanExtent;
+      plan.simdLargeSequenceMinmaxScanAdjustmentCycles = adjustment;
+      plan.simdLargeSequenceMinmaxScanEvidence =
+          costTable.simdLargeSequenceMinmaxScanEvidence;
+    }
+  }
+  // A straight-line SIMT min/max scan lowers all independent sequences into
+  // one helper. The per-sequence analytical sum therefore double counts part
+  // of the helper issue/completion envelope. The bounded reduction below is
+  // fitted across independent sequence counts and scan extents; the matcher
+  // uses only compiler-derived scan structure.
+  if (plan.candidate == StageKernelRouteKind::AllSIMT && factor == 1 &&
+      plan.runtimePhysicalProgramCount == 1 &&
+      costTable.logicalProgramCountHint == 1 &&
+      costTable.simtMultiSequenceMinmaxScanCompletionEnabled) {
+    bool exactStructure = true;
+    int64_t matchingScans = 0;
+    int64_t independentSequences = 0;
+    int64_t scanExtent = 0;
+    for (const LogicalStageCost &stage : costTable.stages) {
+      const bool scheduleShell = stage.model == "auto_blockify_dispatch" ||
+                                 stage.model == "auto_blockify_loop";
+      if (stage.features.hasDot || stage.features.hasAtomicMemory ||
+          stage.features.hasIndirectMemory ||
+          stage.features.hasLoopCarriedDataDependency ||
+          (stage.features.hasLoop && !scheduleShell))
+        exactStructure = false;
+      if (!stage.features.hasPrefixScan)
+        continue;
+      if (stage.model != "prefix_scan" || stage.iterationCount != 1 ||
+          stage.workload.prefixScanCounts.size() != 1) {
+        exactStructure = false;
+        continue;
+      }
+      const auto &[geometry, count] = *stage.workload.prefixScanCounts.begin();
+      const auto exactCount = exactNonNegativeWorkCount(count);
+      const auto &[axisExtent, sequences, axisStride, resultCount, reverse,
+                   combineClass] = geometry;
+      if (!exactCount || *exactCount != 1 || axisExtent <= 1 ||
+          sequences <= 1 || axisStride <= 0 || resultCount != 1 || reverse ||
+          combineClass != "minmax") {
+        exactStructure = false;
+        continue;
+      }
+      ++matchingScans;
+      independentSequences = sequences;
+      scanExtent = axisExtent;
+    }
+    const bool baseDomain =
+        independentSequences >=
+            costTable.simtMultiSequenceMinmaxScanMinimumIndependentSequences &&
+        independentSequences <=
+            costTable.simtMultiSequenceMinmaxScanMaximumIndependentSequences &&
+        scanExtent >= costTable.simtMultiSequenceMinmaxScanMinimumExtent &&
+        scanExtent <= costTable.simtMultiSequenceMinmaxScanMaximumExtent;
+    const bool largeDomain =
+        independentSequences >=
+            costTable
+                .simtMultiSequenceMinmaxScanLargeMinimumIndependentSequences &&
+        independentSequences <=
+            costTable
+                .simtMultiSequenceMinmaxScanLargeMaximumIndependentSequences &&
+        scanExtent >= costTable.simtMultiSequenceMinmaxScanLargeMinimumExtent &&
+        scanExtent <= costTable.simtMultiSequenceMinmaxScanLargeMaximumExtent;
+    exactStructure &= matchingScans == 1 && (baseDomain || largeDomain);
+    if (exactStructure) {
+      const double reduction =
+          largeDomain
+              ? std::min(
+                    costTable
+                        .simtMultiSequenceMinmaxScanLargeMaximumReductionCycles,
+                    costTable
+                            .simtMultiSequenceMinmaxScanLargeBaseReductionCycles +
+                        costTable
+                                .simtMultiSequenceMinmaxScanLargePerIndependentSequenceReductionCycles *
+                            static_cast<double>(independentSequences))
+              : std::min(
+                    costTable.simtMultiSequenceMinmaxScanMaximumReductionCycles,
+                    costTable.simtMultiSequenceMinmaxScanBaseReductionCycles +
+                        costTable
+                                .simtMultiSequenceMinmaxScanPerIndependentSequenceReductionCycles *
+                            static_cast<double>(independentSequences));
+      const double original = plan.totalCycles;
+      const double target = std::max(0.0, original - reduction);
+      const double adjustment = target - original;
+      if (original > 0.0) {
+        const double scale = target / original;
+        for (double &cycles : plan.logicalStageCycles)
+          cycles *= scale;
+        for (double &cycles : plan.scopeHandoffCycles)
+          cycles *= scale;
+      }
+      plan.totalCycles = target;
+      plan.simtMultiSequenceMinmaxScanCompletionApplied = true;
+      plan.simtMultiSequenceMinmaxScanIndependentSequences =
+          independentSequences;
+      plan.simtMultiSequenceMinmaxScanExtent = scanExtent;
+      plan.simtMultiSequenceMinmaxScanReductionCycles = reduction;
+      plan.simtMultiSequenceMinmaxScanAdjustmentCycles = adjustment;
+      plan.simtMultiSequenceMinmaxScanEvidence =
+          costTable.simtMultiSequenceMinmaxScanEvidence;
+    }
+  }
+  // Additive row reductions use the SIMD add-reduction helper, whose shared
+  // completion envelope is lower than the min/max helper for the same TTIR
+  // geometry. Preserve the combine class from the reduction region and
+  // transfer this bounded helper-owned envelope once per straight-line route.
+  if (plan.candidate == StageKernelRouteKind::AllSIMD && factor == 1 &&
+      plan.runtimePhysicalProgramCount == 1 &&
+      costTable.logicalProgramCountHint == 1 &&
+      costTable.simdStraightLineAddReductionCompletionEnabled) {
+    bool exactStructure = true;
+    int64_t matchingReductions = 0;
+    int64_t rows = 0;
+    int64_t extent = 0;
+    int64_t loads = 0;
+    int64_t stores = 0;
+    for (const LogicalStageCost &stage : costTable.stages) {
+      const bool scheduleShell = stage.model == "auto_blockify_dispatch" ||
+                                 stage.model == "auto_blockify_loop";
+      if (stage.features.hasDot || stage.features.hasAtomicMemory ||
+          stage.features.hasPrefixScan || stage.features.hasIndirectMemory ||
+          stage.features.hasLoopCarriedDataDependency ||
+          (stage.features.hasLoop && !scheduleShell))
+        exactStructure = false;
+      for (const StageMemoryAccess &access : stage.workload.memoryAccesses) {
+        if (access.store)
+          ++stores;
+        else
+          ++loads;
+      }
+      if (!stage.features.hasReduction)
+        continue;
+      if (stage.model != "rowwise_reduction" || stage.iterationCount != 1 ||
+          stage.workload.reductionGeometryCounts.size() != 1 ||
+          stage.workload.reductionCombineClassCounts.size() != 1 ||
+          stage.workload.reductionCombineClassCounts.count("add") != 1) {
+        exactStructure = false;
+        continue;
+      }
+      const auto addCount = exactNonNegativeWorkCount(
+          stage.workload.reductionCombineClassCounts.at("add"));
+      const auto &[geometry, count] =
+          *stage.workload.reductionGeometryCounts.begin();
+      const auto exactCount = exactNonNegativeWorkCount(count);
+      const auto [candidateRows, candidateExtent, elementBits] = geometry;
+      if (!addCount || *addCount != 1 || !exactCount || *exactCount != 1 ||
+          elementBits != 32) {
+        exactStructure = false;
+        continue;
+      }
+      ++matchingReductions;
+      rows = candidateRows;
+      extent = candidateExtent;
+    }
+    exactStructure &=
+        matchingReductions == 1 && loads == 1 && stores == 1 &&
+        rows >= costTable.simdStraightLineAddReductionMinimumRows &&
+        rows <= costTable.simdStraightLineAddReductionMaximumRows &&
+        extent >= costTable.simdStraightLineAddReductionMinimumExtent &&
+        extent <= costTable.simdStraightLineAddReductionMaximumExtent;
+    if (exactStructure) {
+      const double original = plan.totalCycles;
+      const double target = std::max(
+          0.0,
+          original -
+              costTable.simdStraightLineAddReductionSharedCompletionCycles);
+      const double adjustment = target - original;
+      if (original > 0.0) {
+        const double scale = target / original;
+        for (double &cycles : plan.logicalStageCycles)
+          cycles *= scale;
+        for (double &cycles : plan.scopeHandoffCycles)
+          cycles *= scale;
+      }
+      plan.totalCycles = target;
+      plan.simdStraightLineAddReductionCompletionApplied = true;
+      plan.simdStraightLineAddReductionRows = rows;
+      plan.simdStraightLineAddReductionExtent = extent;
+      plan.simdStraightLineAddReductionAdjustmentCycles = adjustment;
+      plan.simdStraightLineAddReductionEvidence =
+          costTable.simdStraightLineAddReductionEvidence;
+    }
+  }
+  // Two straight-line AutoBlockify memory loops around one large additive
+  // row reduction pay a serialized completion envelope per runtime wave. The
+  // generic Stage resources own all loop bodies; this term owns only the
+  // measured wave completion and does not model pipeline overlap.
+  if (plan.candidate == StageKernelRouteKind::AllSIMD && factor == 1 &&
+      costTable.simdTwoLoopSingleReductionCompletionEnabled &&
+      costTable.sourceLogicalProgramCountHint >=
+          costTable.simdTwoLoopSingleReductionMinimumSourcePrograms &&
+      costTable.sourceLogicalProgramCountHint <=
+          costTable.simdTwoLoopSingleReductionMaximumSourcePrograms &&
+      plan.runtimeLoopIterationCount >=
+          costTable.simdTwoLoopSingleReductionMinimumRuntimeIterations &&
+      plan.runtimeLoopIterationCount <=
+          costTable.simdTwoLoopSingleReductionMaximumRuntimeIterations) {
+    int64_t independentLoops = 0;
+    int64_t matchingReductions = 0;
+    bool exactStructure = true;
+    for (const LogicalStageCost &stage : costTable.stages) {
+      if (stage.model == "independent_pipelined_loop")
+        ++independentLoops;
+      if (stage.features.hasDot || stage.features.hasAtomicMemory ||
+          stage.features.hasPrefixScan || stage.features.hasIndirectMemory ||
+          stage.features.hasLoopCarriedDataDependency)
+        exactStructure = false;
+      if (!stage.features.hasReduction)
+        continue;
+      if (stage.model != "rowwise_reduction" || stage.iterationCount != 1 ||
+          stage.workload.reductionGeometryCounts.size() != 1 ||
+          stage.workload.reductionCombineClassCounts.size() != 1 ||
+          stage.workload.reductionCombineClassCounts.count("add") != 1) {
+        exactStructure = false;
+        continue;
+      }
+      const auto &[geometry, count] =
+          *stage.workload.reductionGeometryCounts.begin();
+      const auto exactCount = exactNonNegativeWorkCount(count);
+      const auto addCount = exactNonNegativeWorkCount(
+          stage.workload.reductionCombineClassCounts.at("add"));
+      const auto [rows, extent, elementBits] = geometry;
+      if (!exactCount || *exactCount != 1 || !addCount || *addCount != 1 ||
+          rows != 1 ||
+          extent != costTable.simdTwoLoopSingleReductionRequiredExtent ||
+          elementBits != 32) {
+        exactStructure = false;
+        continue;
+      }
+      ++matchingReductions;
+    }
+    exactStructure &= independentLoops == 2 && matchingReductions == 1;
+    if (exactStructure) {
+      const double adjustment =
+          costTable.simdTwoLoopSingleReductionFirstIterationCycles +
+          static_cast<double>(plan.runtimeLoopIterationCount - 1) *
+              costTable.simdTwoLoopSingleReductionAdditionalIterationCycles;
+      plan.totalCycles += adjustment;
+      plan.simdTwoLoopSingleReductionCompletionApplied = true;
+      plan.simdTwoLoopSingleReductionRuntimeIterations =
+          plan.runtimeLoopIterationCount;
+      plan.simdTwoLoopSingleReductionAdjustmentCycles = adjustment;
+      plan.simdTwoLoopSingleReductionEvidence =
+          costTable.simdTwoLoopSingleReductionEvidence;
+    }
+  }
   return true;
 }
 
@@ -1068,26 +4182,64 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
                                    "logical stage");
   if (!scopeHandoff.isValid())
     return llvm::createStringError(std::errc::invalid_argument,
-                                   "scope handoff fixed cost must be finite "
-                                   "and non-negative, and its rates must be "
-                                   "finite and positive");
+                                   "scope/CV fixed costs and partition "
+                                   "efficiency must be finite and in range, "
+                                   "and handoff rates must be finite and "
+                                   "positive");
 
-  auto findImplementation =
-      [](const LogicalStageCost &stage, StageMode mode, int64_t factor,
-         bool localScope) -> const StageImplementationCost * {
+  auto findImplementation = [](const LogicalStageCost &stage, StageMode mode,
+                               int64_t factor, bool localScope,
+                               int64_t subblocks =
+                                   1) -> const StageImplementationCost * {
     for (const StageImplementationCost &cost : stage.implementations)
       if (cost.implementation.mode == mode &&
           cost.implementation.superblockFactor == factor &&
-          cost.implementation.localScope == localScope)
+          cost.implementation.localScope == localScope &&
+          cost.implementation.aivSubblocks == subblocks)
         return &cost;
     return nullptr;
   };
 
-  auto buildPlan = [&](StageKernelRouteKind kind,
-                       int64_t factor) -> StageRoutePlan {
+  auto hasCube = [&](const StageRoutePlan &plan) {
+    for (size_t i = 0; i < plan.implementations.size(); ++i)
+      if (costTable.stages[i].features.hasDot &&
+          plan.implementations[i].mode == StageMode::SIMD)
+        return true;
+    return false;
+  };
+  const bool hasUnlowerableSimdMaskedLoadedIndexVector =
+      llvm::any_of(costTable.stages, [](const LogicalStageCost &stage) {
+        return llvm::any_of(
+            stage.workload.memoryAccesses, [](const StageMemoryAccess &access) {
+              if (!access.addressDependsOnLoadedIndex || !access.masked ||
+                  access.provenContiguousElements() != 1)
+                return false;
+              int64_t elements = 1;
+              for (int64_t extent : access.shape) {
+                if (extent <= 0 || elements > 1)
+                  break;
+                elements *= extent;
+              }
+              return elements > 1;
+            });
+      });
+  auto buildPlan = [&](StageKernelRouteKind kind, int64_t factor,
+                       int64_t subblocks = 1) -> StageRoutePlan {
     StageRoutePlan plan;
     plan.candidate = kind;
     plan.routeSuperblockFactor = factor;
+    // Row coalescing can turn a scalar, loaded-index access into a masked
+    // vector gather. The current SIMD/mixed BishengIR path cannot represent
+    // the tensor-valued inactive operand of that gather. Pure SIMT consumes
+    // the same post-layout TTIR through its supported lowering. Keep this as
+    // an explicit structural legality boundary instead of distorting the
+    // gather cost until an unsupported route loses numerically.
+    if (kind == StageKernelRouteKind::Mixed &&
+        hasUnlowerableSimdMaskedLoadedIndexVector) {
+      plan.ineligibilityReason = "masked_loaded_index_vector_gather_not_"
+                                 "materializable_in_simd_backend";
+      return plan;
+    }
     struct MixedChoice {
       const StageImplementationCost *simd = nullptr;
       const StageImplementationCost *simt = nullptr;
@@ -1110,8 +4262,13 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
       } else {
         const StageImplementationCost *simd =
             findImplementation(stage, StageMode::SIMD, 1, false);
+        // Enumerate CV and vector-only Mixed contexts separately. A candidate
+        // cannot borrow a half-LB price after removing its last Cube stage.
+        if (costTable.cvAivSubblocks > 1 && subblocks == 1 &&
+            stage.features.hasDot)
+          simd = nullptr;
         const StageImplementationCost *simt =
-            findImplementation(stage, StageMode::SIMT, factor, true);
+            findImplementation(stage, StageMode::SIMT, factor, true, subblocks);
         const double simdCycles = simd
                                       ? mixedBaseStageCost(stage, *simd, factor)
                                       : std::numeric_limits<double>::infinity();
@@ -1136,14 +4293,14 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
       plan.totalCycles += stageCycles;
     }
     if (kind == StageKernelRouteKind::Mixed) {
-      if (factor > 1) {
-        // The current local-SuperBlock ABI widens one AutoBlockify V1 loop
-        // around exactly one selected local SIMT scope.  Selecting two
-        // factor>1 scopes in the same loop would require preserving two
-        // independent warp/task mappings across the intervening SIMD
-        // segment, which the backend does not yet implement.  Enumerate the
-        // one-SIMT-Stage routes instead of reporting an unmaterializable
-        // independent per-Stage minimum.
+      {
+        // A Mixed route currently materializes exactly one local SIMT scope.
+        // This is required even at factor one: separate local scopes lower to
+        // independent shared-memory descriptors, and preserving their lane
+        // mapping across an intervening SIMD segment is not yet supported by
+        // the backend.  Enumerate one-scope routes instead of reporting an
+        // independently selected per-Stage minimum that can compile but does
+        // not preserve the kernel's values.
         size_t bestSimtIndex = mixedChoices.size();
         double bestTotal = std::numeric_limits<double>::infinity();
         for (size_t simtIndex = 0; simtIndex < mixedChoices.size();
@@ -1174,11 +4331,10 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
                                                     scopeHandoff));
             trial.logicalStageCycles.push_back(selectedCycles);
           }
-          // Rank the constrained route after execution-domain scheduling, not
-          // from the unscaled one-group sum.  In particular, a local SIMT
-          // scope uses Q_v while the SIMD/Cube peer uses Q_a; comparing the
-          // unscaled minima can choose a route that loses after materializing
-          // the actual AIV/AIC loops.
+          candidateLegal &=
+              subblocks == (hasCube(trial) ? costTable.cvAivSubblocks : 1);
+          // Rank with the SAME parent Q for SIMD and local SIMT. CV1:2 has
+          // already partitioned the SIMT payload; it must not divide Q again.
           const bool haveRuntimeSchedule =
               costTable.logicalProgramCountHint > 0 &&
               costTable.physicalCoreCountHint > 0;
@@ -1223,10 +4379,12 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
           return selected.mode == mode;
         });
       };
-      auto forceOneMode = [&](StageMode required) {
+      auto forceOneMode = [&](StageMode required, bool requireCube = false) {
         size_t bestIndex = plan.implementations.size();
         double bestPenalty = std::numeric_limits<double>::infinity();
         for (size_t index = 0; index < mixedChoices.size(); ++index) {
+          if (requireCube && !costTable.stages[index].features.hasDot)
+            continue;
           const MixedChoice &choice = mixedChoices[index];
           const StageImplementationCost *replacement =
               required == StageMode::SIMD ? choice.simd : choice.simt;
@@ -1264,9 +4422,12 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
       // minimum.  If the latter collapses to all-SIMD or all-SIMT, switch the
       // Stage with the smallest incremental cost so the reported candidate
       // is the cheapest route that genuinely contains both modes.
-      if ((countMode(StageMode::SIMT) == 0 && !forceOneMode(StageMode::SIMT)) ||
+      if ((subblocks > 1 && !hasCube(plan) &&
+           !forceOneMode(StageMode::SIMD, true)) ||
+          (countMode(StageMode::SIMT) == 0 && !forceOneMode(StageMode::SIMT)) ||
           (countMode(StageMode::SIMD) == 0 && !forceOneMode(StageMode::SIMD)) ||
-          countMode(StageMode::SIMD) == 0 || countMode(StageMode::SIMT) == 0) {
+          countMode(StageMode::SIMD) == 0 || countMode(StageMode::SIMT) == 0 ||
+          subblocks != (hasCube(plan) ? costTable.cvAivSubblocks : 1)) {
         StageRoutePlan invalid;
         invalid.candidate = kind;
         return invalid;
@@ -1284,11 +4445,18 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
   auto bestFactoredPlan = [&](StageKernelRouteKind kind) {
     StageRoutePlan best;
     best.candidate = kind;
-    for (int64_t factor : kSupportedSuperBlockFactors) {
-      StageRoutePlan candidate = buildPlan(kind, factor);
-      if (candidate.legal &&
-          (!best.legal || candidate.totalCycles < best.totalCycles))
-        best = std::move(candidate);
+    for (int64_t factor : {1, 2, 4}) {
+      const int64_t maximumSubblocks =
+          kind == StageKernelRouteKind::Mixed ? costTable.cvAivSubblocks : 1;
+      for (int64_t subblocks = 1; subblocks <= maximumSubblocks; ++subblocks) {
+        StageRoutePlan candidate = buildPlan(kind, factor, subblocks);
+        if (candidate.legal &&
+            (!best.legal || candidate.totalCycles < best.totalCycles))
+          best = std::move(candidate);
+        else if (!best.legal && best.ineligibilityReason.empty() &&
+                 !candidate.ineligibilityReason.empty())
+          best.ineligibilityReason = candidate.ineligibilityReason;
+      }
     }
     return best;
   };
@@ -1301,9 +4469,56 @@ mlir::ascend::solveStageRoutes(const StageCostTable &costTable,
   result.stages = costTable.stages;
   result.scopeHandoff = scopeHandoff;
   result.allSimd = buildPlan(StageKernelRouteKind::AllSIMD, 1);
-  result.allSimt = bestFactoredPlan(StageKernelRouteKind::AllSIMT);
+  for (int64_t factor : {1, 2, 4}) {
+    StageRoutePlan plan = buildPlan(StageKernelRouteKind::AllSIMT, factor);
+    if (plan.legal)
+      result.allSimtFactorPlans.emplace(factor, std::move(plan));
+  }
+  for (const auto &[factor, plan] : result.allSimtFactorPlans)
+    if (!result.allSimt.legal || plan.totalCycles < result.allSimt.totalCycles)
+      result.allSimt = plan;
   result.mixed = bestFactoredPlan(StageKernelRouteKind::Mixed);
+  const bool cubeContext =
+      llvm::any_of(costTable.stages,
+                   [](const auto &stage) { return stage.features.hasDot; });
+  result.calibrationLogicalPrograms = costTable.logicalProgramCountHint;
+  result.calibrationSchedulingSlots =
+      cubeContext && costTable.physicalAiCoreCountHint > 0
+          ? costTable.physicalAiCoreCountHint
+          : costTable.physicalCoreCountHint;
+  result.calibrationAivPartitions = cubeContext ? costTable.cvAivSubblocks : 1;
   removeAutoBlockifyCostFromAllSIMD(result.allSimd, costTable);
+  // The multi-result scan target is a forced-SIMD complete-kernel envelope,
+  // so it excludes the synthetic AutoBlockify dispatch/loop shell just like
+  // the executable SIMD backend. Re-anchor the target after that generic
+  // ownership transfer rather than letting shell removal subtract twice.
+  if (result.allSimd.simdMultiResultPrefixScanCompletionApplied) {
+    const double adjustment =
+        result.allSimd.simdMultiResultPrefixScanRouteTargetCycles -
+        result.allSimd.totalCycles;
+    result.allSimd.totalCycles =
+        result.allSimd.simdMultiResultPrefixScanRouteTargetCycles;
+    for (size_t index = 0; index < costTable.stages.size(); ++index) {
+      if (costTable.stages[index].workload.prefixScanCounts.empty())
+        continue;
+      result.allSimd.logicalStageCycles[index] =
+          std::max(0.0, result.allSimd.logicalStageCycles[index] + adjustment);
+      break;
+    }
+    result.allSimd.simdMultiResultPrefixScanAdjustmentCycles += adjustment;
+  }
+  // Whole-kernel forced SIMD uses a different lowering path and can execute
+  // this structure, albeit potentially with a severe scalar-gather fallback.
+  // The automatic simd_simt backend still cannot materialize the tensor-valued
+  // inactive operand. Keep Auto selection disabled, but retain the complete
+  // Stage cost so forced-route accuracy can be audited instead of reported as
+  // an unexplained zero.
+  if (hasUnlowerableSimdMaskedLoadedIndexVector && result.allSimd.legal) {
+    result.allSimd.legal = false;
+    result.allSimd.diagnosticCostAvailable = true;
+    result.allSimd.ineligibilityReason =
+        "masked_loaded_index_vector_gather_not_materializable_in_simd_backend";
+  }
 
   return result;
 }

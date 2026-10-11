@@ -19,13 +19,16 @@
 # THE SOFTWARE.
 
 import ctypes
+import copy
 import functools
 import hashlib
 import glob
 import json
+import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import warnings
@@ -425,6 +428,469 @@ def _auto_simt_asset_hash(path: str, default_name: str) -> str:
     return digest.hexdigest()
 
 
+_CCEC_RESOURCE_USAGE_RE = re.compile(r"\[BISHENG\]\s+(?:(?P<execution_model>SIMT VF)\s+)?Function properties for\s+"
+                                     r"(?P<function>[^:\r\n]+):\s+Stack size:\s*(?P<stack_bytes>\d+)\s+bytes,\s+"
+                                     r"Used register number:\s*(?P<used_registers>\d+)")
+_CCEC_REGALLOC_SIZE_RE = re.compile(
+    r"Greedy Register Allocator:\s+Function:\s+(?P<function>[^:\r\n]+):\s+"
+    r"MI Instruction count changed from\s+\d+\s+to\s+\d+;\s+Delta:\s*(?P<delta>[+-]?\d+)")
+_OBJDUMP_SYMBOL_RE = re.compile(r"^([0-9a-fA-F]+) <([^>]+)>:", re.MULTILINE)
+_OBJDUMP_INSTRUCTION_RE = re.compile(r"^\s*([0-9a-fA-F]+):\s+(?:[0-9a-fA-F]+\s+)?([A-Z][A-Z0-9_.]*)\s*(.*)$")
+_OBJDUMP_BRANCH_TARGET_RE = re.compile(r"<([^>+]+)\+0x([0-9a-fA-F]+)>")
+
+
+def _bisheng_options_with_resource_usage(bisheng_options):
+    """Request allocator facts without changing CCEC optimization policy."""
+    option = "--cce-res-usage"
+    if not bisheng_options:
+        return option
+    if option in shlex.split(bisheng_options):
+        return bisheng_options
+    return f"{bisheng_options} {option}"
+
+
+def _publish_backend_resource_usage(stdout, stderr, metadata):
+    """Publish CCEC allocator facts as structured, kernel-independent data.
+
+    Stack bytes are deliberately not converted to spill cycles here: the
+    dynamic LDK/STK count depends on allocator placement and use frequency.
+    The raw stack/register facts are nevertheless useful for detecting a
+    SuperBlock candidate whose register allocation has crossed a cliff.
+    """
+    text = b"\n".join(part for part in (stdout, stderr) if part).decode("utf-8", errors="replace")
+    regalloc_generated = {}
+    for match in _CCEC_REGALLOC_SIZE_RE.finditer(text):
+        function = match.group("function").strip()
+        regalloc_generated[function] = (regalloc_generated.get(function, 0) + max(0, int(match.group("delta"))))
+    resources = []
+    for match in _CCEC_RESOURCE_USAGE_RE.finditer(text):
+        function = match.group("function").strip()
+        resource = {
+            "function": function,
+            "execution_model": "simt_vf" if match.group("execution_model") else "cce",
+            "stack_size_bytes": int(match.group("stack_bytes")),
+            "used_registers": int(match.group("used_registers")),
+        }
+        if function in regalloc_generated:
+            resource["regalloc_generated_instructions"] = regalloc_generated[function]
+        resources.append(resource)
+    if not resources:
+        return []
+    metadata["backend_function_resources"] = resources
+    metadata["backend_max_stack_size_bytes"] = max(row["stack_size_bytes"] for row in resources)
+    metadata["backend_min_used_registers"] = min(row["used_registers"] for row in resources)
+    return resources
+
+
+def _parse_simt_private_stack_disassembly(disassembly):
+    """Extract actual LDK/STK placement from one CCEC SIMT entry.
+
+    AutoBlockify's persistent scheduling loop is the widest unconditional
+    backward branch in the SIMT entry.  Keeping instructions before, inside,
+    and after that loop separate is essential: only the body repeats with the
+    route's runtime loop count.  The result is a backend fact, not a cost; its
+    conversion to cycles is kept explicit in backend feedback below.
+    """
+    symbols = list(_OBJDUMP_SYMBOL_RE.finditer(disassembly or ""))
+    for index, symbol in enumerate(symbols):
+        function = symbol.group(2)
+        if not function.endswith("_vf_simt_simt_entry"):
+            continue
+        base = int(symbol.group(1), 16)
+        end = symbols[index + 1].start() if index + 1 < len(symbols) else len(disassembly)
+        instructions = []
+        for line in disassembly[symbol.end():end].splitlines():
+            match = _OBJDUMP_INSTRUCTION_RE.match(line)
+            if match:
+                instructions.append((int(match.group(1), 16), match.group(2), match.group(3)))
+        if not instructions:
+            continue
+
+        backedges = []
+        for address, opcode, operands in instructions:
+            if opcode != "BRANCH":
+                continue
+            target_match = _OBJDUMP_BRANCH_TARGET_RE.search(operands)
+            if not target_match or target_match.group(1) != function:
+                continue
+            target = base + int(target_match.group(2), 16)
+            if target >= address:
+                continue
+            # A predicate appears between the immediate and the wait field.
+            # AutoBlockify's outer scheduling backedge is unconditional.
+            prefix = operands[:target_match.start()]
+            unconditional = not re.search(r"(?:^|[,\s])!?P\d+(?:[,\s]|$)", prefix)
+            backedges.append((address, target, unconditional))
+        unconditional = [edge for edge in backedges if edge[2]]
+        if not unconditional:
+            continue
+        backedge, loop_start, _ = max(unconditional, key=lambda edge: edge[0] - edge[1])
+
+        counts = {
+            "once_before": {"load": 0, "store": 0},
+            "per_persistent_iteration": {"load": 0, "store": 0},
+            "once_after": {"load": 0, "store": 0},
+        }
+        for address, opcode, _ in instructions:
+            if opcode.startswith("LDK"):
+                kind = "load"
+            elif opcode.startswith("STK"):
+                kind = "store"
+            else:
+                continue
+            if address < loop_start:
+                region = "once_before"
+            elif address <= backedge:
+                region = "per_persistent_iteration"
+            else:
+                region = "once_after"
+            counts[region][kind] += 1
+        return {
+            "schema_version": 1,
+            "function": function,
+            "instruction_count": len(instructions),
+            "persistent_loop_detection": "widest_unconditional_backward_branch",
+            "persistent_loop_start_offset": loop_start - base,
+            "persistent_loop_backedge_offset": backedge - base,
+            "static_private_stack_instructions": counts,
+            "static_private_stack_totals":
+            {kind: sum(region[kind]
+                       for region in counts.values())
+             for kind in ("load", "store")},
+        }
+    return None
+
+
+def _find_backend_llvm_objdump(npu_compiler_path, env):
+    """Find the vendor LLVM objdump installed with bishengir-compile."""
+    candidates = []
+    override = (env or {}).get("TRITON_ASCEND_LLVM_OBJDUMP") or os.getenv("TRITON_ASCEND_LLVM_OBJDUMP")
+    if override:
+        candidates.append(Path(override))
+    if npu_compiler_path:
+        candidates.append(Path(npu_compiler_path).with_name("llvm-objdump"))
+    llvm_root = (env or {}).get("LLVM_ROOT") or os.getenv("LLVM_ROOT")
+    if llvm_root:
+        candidates.append(Path(llvm_root) / "bin" / "llvm-objdump")
+    from_path = shutil.which("llvm-objdump", path=(env or {}).get("PATH"))
+    if from_path:
+        candidates.append(Path(from_path))
+    return next((str(path) for path in candidates if path.is_file() and os.access(path, os.X_OK)), None)
+
+
+def _publish_backend_private_stack_disassembly(binary_path, metadata, npu_compiler_path, env):
+    """Disassemble a generated binary and publish exact static LDK/STK facts."""
+    objdump = _find_backend_llvm_objdump(npu_compiler_path, env)
+    if not objdump or not Path(binary_path).is_file():
+        return None
+    completed = subprocess.run(
+        [objdump, "-d", "--triple=hiipu64", str(binary_path)],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode:
+        return None
+    facts = _parse_simt_private_stack_disassembly(completed.stdout)
+    if facts:
+        facts["objdump"] = objdump
+        metadata["backend_simt_private_stack_disassembly"] = facts
+    return facts
+
+
+def _private_stack_dependent_load_group_cycles(arch):
+    """Read the architecture-specific private-load slope from microbench data."""
+    normalized = (arch or "").lower().replace("-", "_")
+    if "950pr" not in normalized:
+        return 0.0
+    profile_path = _costmodel_profiles_dir() / "microbench" / "ascend_950pr_v1.json"
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        metric = profile["metrics"]["simt.private_stack.dependent_access.system_cycles"]
+        return max(0.0, float(metric["value"]))
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return 0.0
+
+
+def _backend_private_stack_load_charge(resource, route, factor, num_warps, group_cycles, calibration_warps=8):
+    """Price actual static private loads with their measured warp-group slope."""
+    facts = resource.get("simt_private_stack_disassembly", {}) if resource else {}
+    regions = facts.get("static_private_stack_instructions", {})
+    if not regions or group_cycles <= 0.0:
+        return None
+    try:
+        iterations = max(1, int(route.get("runtime_loop_iteration_count", 1)))
+        before = float(regions.get("once_before", {}).get("load", 0))
+        body = float(regions.get("per_persistent_iteration", {}).get("load", 0))
+        after = float(regions.get("once_after", {}).get("load", 0))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    static_warp_instructions = before + body * iterations + after
+    active_warps = max(1, int(num_warps)) * max(1, int(factor))
+    charge = static_warp_instructions * active_warps / max(1, calibration_warps) * group_cycles
+    return {
+        "formula":
+        "(once_before + per_iteration * runtime_iterations + once_after) * active_warps / calibration_warps * group_cycles",
+        "once_before_load_instructions_per_warp": before,
+        "per_iteration_load_instructions_per_warp": body,
+        "once_after_load_instructions_per_warp": after,
+        "runtime_loop_iteration_count": iterations,
+        "static_load_instructions_per_warp": static_warp_instructions,
+        "active_warp_count": active_warps,
+        "calibration_active_warp_count": calibration_warps,
+        "group_cycles_per_load_instruction": group_cycles,
+        "system_cycles": charge,
+    }
+
+
+def _compile_options_with_regalloc_size_info(options):
+    """Request machine-instruction deltas from the allocator remark stream."""
+    result = list(options)
+    remark = "-Rpass-analysis=size-info"
+    for index, option in enumerate(result):
+        if not option.startswith("--append-bisheng-options="):
+            continue
+        if remark not in option:
+            result[index] = f"{option} {remark}"
+        return result
+    return result
+
+
+def _representative_simt_resource(resources):
+    """Return the allocator row that owns the pure-SIMT kernel body."""
+    if not resources:
+        return None
+    simt_resources = [row for row in resources if row.get("execution_model") == "simt_vf"]
+    candidates = simt_resources or resources
+    return max(candidates, key=lambda row: (int(row.get("stack_size_bytes", 0)), int(row.get("used_registers", 0))))
+
+
+def _select_backend_resource_aware_factor(report, factor_resources, selected_factor, num_warps=1,
+                                          private_load_group_cycles=0.0):
+    """Reject SuperBlock factors that cross a backend allocation cliff.
+
+    The StageCostModel runs before register allocation, so it cannot know that
+    a wider SuperBlock made the allocator halve the register budget and grow
+    the private stack.  Compare independently compiled legal factors here and
+    keep the StageCostModel score as the ordering among resource-stable ones.
+    The test is deliberately relative: it does not identify a kernel, shape,
+    absolute stack size, or a fitted spill-cycle constant.
+    """
+    try:
+        report_data = json.loads(report) if isinstance(report, str) else dict(report)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return int(selected_factor), {}, report
+
+    routes = report_data.get("stage_model", {}).get("all_simt_factor_routes", {})
+    legal_scores = {}
+    routes_by_factor = {}
+    for factor_text, route in routes.items():
+        try:
+            factor = int(factor_text)
+            score = float(route["total_system_cycles"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if route.get("legal", False) and factor in factor_resources:
+            legal_scores[factor] = score
+            routes_by_factor[factor] = route
+    if not legal_scores:
+        return int(selected_factor), {}, report
+
+    adjusted_scores = dict(legal_scores)
+    private_load_charges = {}
+    for factor, score in legal_scores.items():
+        charge = _backend_private_stack_load_charge(factor_resources[factor], routes_by_factor[factor], factor,
+                                                    num_warps, private_load_group_cycles)
+        if charge is None:
+            continue
+        private_load_charges[factor] = charge
+        adjusted_scores[factor] = score + charge["system_cycles"]
+
+    dominated = set()
+    comparisons = []
+    ordered_factors = sorted(legal_scores)
+    # The allocator remark reports the delta of the complete machine
+    # instruction stream.  It does not identify LDK/STK instructions or tell
+    # whether an insertion is inside the persistent loop.  Keep the delta as
+    # diagnostic evidence, but do not convert it to an absolute spill cost.
+    # Doing so would price moves/address/control instructions as private-stack
+    # traffic and multiply loop-invariant insertions by Q.
+    for factor in ordered_factors:
+        current = factor_resources[factor]
+        current_stack = int(current.get("stack_size_bytes", 0))
+        current_registers = int(current.get("used_registers", 0))
+        for lower_factor in (candidate for candidate in ordered_factors if candidate < factor):
+            lower = factor_resources[lower_factor]
+            lower_stack = int(lower.get("stack_size_bytes", 0))
+            lower_registers = int(lower.get("used_registers", 0))
+            # A simultaneous >=25% register collapse, >=50% stack growth and
+            # at least one 64-byte stack region is a backend allocation cliff,
+            # rather than ordinary factor-to-factor noise.
+            register_cliff = lower_registers > 0 and current_registers * 4 <= lower_registers * 3
+            stack_cliff = (current_stack >= lower_stack + 64 and current_stack * 2 >= max(1, lower_stack) * 3)
+            if register_cliff and stack_cliff:
+                dominated.add(factor)
+                comparisons.append({
+                    "factor": factor,
+                    "dominated_by_factor": lower_factor,
+                    "reason": "register_allocation_cliff",
+                    "used_registers": current_registers,
+                    "reference_used_registers": lower_registers,
+                    "stack_size_bytes": current_stack,
+                    "reference_stack_size_bytes": lower_stack,
+                })
+                break
+
+    admissible = [factor for factor in ordered_factors if factor not in dominated]
+    chosen = min(admissible or ordered_factors, key=lambda factor: (adjusted_scores[factor], factor))
+    resource_report = {str(factor): factor_resources[factor] for factor in ordered_factors}
+    feedback = {
+        "policy":
+        "relative_register_and_stack_allocation_cliff_v2",
+        "factor_resources":
+        resource_report,
+        "rejected_factors":
+        sorted(dominated),
+        "comparisons":
+        comparisons,
+        "base_stage_model_scores": {str(factor): legal_scores[factor]
+                                    for factor in ordered_factors},
+        "backend_adjusted_scores": {str(factor): adjusted_scores[factor]
+                                    for factor in ordered_factors},
+        "private_stack_load_charges":
+        {str(factor): private_load_charges[factor]
+         for factor in sorted(private_load_charges)},
+        "absolute_spill_cost_applied":
+        bool(private_load_charges),
+        "absolute_spill_cost_reason": ("actual_static_ldk_count_with_persistent_loop_placement"
+                                       if private_load_charges else "actual_ldk_count_and_loop_placement_unavailable"),
+        "pre_backend_selected_factor":
+        int(selected_factor),
+        "selected_factor":
+        chosen,
+    }
+
+    chosen_route = routes.get(str(chosen), {})
+    report_data["backend_resource_feedback"] = feedback
+    report_data["selected_superblock_factor"] = chosen
+    report_data["effective_runtime_factor"] = (chosen if chosen_route.get("runtime_full_group_count", 0) else 1)
+    report_data["selection_source"] = "stage_cost_model_with_backend_resource_feedback"
+    report_data["application_reason"] = ("backend_resource_cliff_reselection" if chosen != int(selected_factor) else
+                                         report_data.get("application_reason", "minimum_cost_candidate"))
+    if chosen_route:
+        report_data["full_group_count"] = chosen_route.get("runtime_full_group_count", 0)
+        report_data["tail_count"] = chosen_route.get("runtime_tail_program_count", 0)
+        for key in ("runtime_loop_iteration_count", "runtime_physical_program_count", "runtime_scheduling_slot_count",
+                    "runtime_logical_programs_per_scheduling_slot"):
+            if key in chosen_route:
+                top_key = ("logical_programs_per_scheduling_slot"
+                           if key == "runtime_logical_programs_per_scheduling_slot" else key)
+                report_data[top_key] = chosen_route[key]
+        chosen_score = adjusted_scores[chosen]
+        candidate_costs = report_data.get("candidate_costs")
+        if isinstance(candidate_costs, dict):
+            candidate_costs["all_simt_only"] = chosen_score
+            selectable = report_data.get("selectable_candidates", [])
+            if not isinstance(selectable, list) or not selectable:
+                selectable = ["all_simt_only"]
+            post_backend_scores = {}
+            for candidate in selectable:
+                try:
+                    score = float(candidate_costs[candidate])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if math.isfinite(score) and score >= 0.0:
+                    post_backend_scores[candidate] = score
+            if post_backend_scores:
+                candidate_order = {
+                    "all_simd": 0,
+                    "all_simt_only": 1,
+                    "mixed_simd_simt": 2,
+                }
+                post_backend_selected = min(
+                    post_backend_scores,
+                    key=lambda candidate: (
+                        post_backend_scores[candidate],
+                        candidate_order.get(candidate, len(candidate_order)),
+                    ),
+                )
+                feedback["post_backend_candidate_scores"] = post_backend_scores
+                feedback["post_backend_selected_candidate"] = post_backend_selected
+                report_data["backend_recommended_decision_kind"] = post_backend_selected
+        elapsed = report_data.get("selected_route_elapsed_prediction")
+        if (isinstance(elapsed, dict) and elapsed.get("candidate") == "all_simt_only"
+                and feedback.get("post_backend_selected_candidate", "all_simt_only") == "all_simt_only"):
+            elapsed["pre_backend_base_selection_score"] = legal_scores[chosen]
+            elapsed["base_selection_score"] = chosen_score
+            elapsed["superblock_factor"] = chosen
+            if chosen in private_load_charges:
+                elapsed["backend_private_stack_load_system_cycles"] = (private_load_charges[chosen]["system_cycles"])
+            fixed = float(elapsed.get("fixed_system_cycles", 0.0))
+            frequency = float(elapsed.get("system_counter_frequency_mhz", 1000.0))
+            elapsed["predicted_system_counter_cycles"] = fixed + chosen_score
+            elapsed["predicted_microseconds"] = (fixed + chosen_score) / max(1.0, frequency)
+    updated_report = json.dumps(report_data, sort_keys=True, separators=(",", ":"))
+    return chosen, feedback, updated_report
+
+
+def _metadata_for_backend_cross_route_rerun(metadata, rejected_factors, opt, forced_candidate=None):
+    """Recreate route-neutral metadata after backend evidence changes the winner."""
+    reroute = copy.deepcopy(dict(metadata))
+    generated_prefixes = (
+        "auto_blockify_v1_",
+        "auto_simt_",
+        "backend_forced_",
+        "backend_resource_",
+        "backend_simt_",
+        "backend_superblock_",
+        "route_transform_",
+        "scope_pure_simt_",
+        "ta_auto_blockify_",
+        "ttir_layout_",
+    )
+    for key in list(reroute):
+        if key.startswith(generated_prefixes) or key == "force_simt_only":
+            reroute.pop(key, None)
+    reroute["compile_mode"] = "simd_simt"
+    reroute["parallel_mode"] = opt.parallel_mode
+    reroute["shared_mem_dynamic_size"] = opt.shared_mem_dynamic_size
+    reroute["force_simt_only"] = False
+    reroute["backend_rejected_whole_kernel_factors"] = sorted(
+        {int(factor)
+         for factor in rejected_factors
+         if int(factor) > 1})
+    if forced_candidate in ("all_simd", "all_simt_only", "mixed_simd_simt"):
+        reroute["backend_forced_route_candidate"] = forced_candidate
+    return reroute
+
+
+def _attach_backend_cross_route_feedback(metadata, feedback, adjusted_report, pre_backend_candidate="all_simt_only"):
+    """Keep backend evidence in the report produced by the materialized reroute."""
+    try:
+        report_data = json.loads(metadata.get("auto_simt_scope_report", ""))
+        adjusted_data = json.loads(adjusted_report)
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return
+    candidate_costs = report_data.get("candidate_costs")
+    adjusted_costs = adjusted_data.get("candidate_costs", {})
+    if isinstance(candidate_costs, dict) and isinstance(adjusted_costs, dict):
+        if "all_simt_only" in adjusted_costs:
+            candidate_costs["all_simt_only"] = adjusted_costs["all_simt_only"]
+    report_data["backend_resource_feedback"] = feedback
+    report_data["pre_backend_decision_kind"] = pre_backend_candidate
+    report_data["backend_recommended_decision_kind"] = feedback.get("post_backend_selected_candidate",
+                                                                    report_data.get("effective_decision_kind"))
+    report_data["selection_source"] = "stage_cost_model_with_backend_resource_feedback"
+    report_data["application_reason"] = "backend_resource_cross_route_reselection"
+    updated = json.dumps(report_data, sort_keys=True, separators=(",", ":"))
+    metadata["auto_simt_scope_report"] = updated
+    dump_path = metadata.get("auto_simt_scope_dump")
+    if dump_path:
+        Path(dump_path).write_text(updated, encoding="utf-8", newline="\n")
+
+
 def _default_auto_simt_profile_name(arch: str) -> str:
     """Select the hardware-specific StageCostModel profile by target arch.
 
@@ -478,6 +944,20 @@ def _apply_cpp_simd_simt_decision(metadata, effective: str, superblock_factor: i
             metadata["auto_blockify_v1_enabled"] = True
 
 
+def _preserve_all_simd_auto_blockify_contract(metadata) -> None:
+    """Keep the executable V1 loop that the all-SIMD candidate was scored on.
+
+    The Route Model analyzes the post-AutoBlockify V1 clone.  Clearing this
+    flag after it selects all-SIMD makes the final BiShengIR command omit
+    ``--enable-auto-blockify-loop`` and materializes a different, slower
+    binary than the candidate that won.  Preserve the already-resolved shared
+    policy; this helper never enables V1 when analysis rejected it.
+    """
+    enabled = bool(metadata.get("auto_blockify_v1_enabled", False))
+    metadata["auto_blockify_v1_enabled"] = enabled
+    metadata["auto_blockify_v1_runtime_cap"] = enabled
+
+
 def _selected_npuir_superblock_factor(metadata, opt) -> int:
     """Return the factor owned by the active route.
 
@@ -507,7 +987,12 @@ def _append_pure_simt_auto_blockify_options(options, metadata, opt) -> None:
     if not opt.enable_ta_auto_blockify_v1:
         options.append("--enable-auto-blockify-loop")
     selected_factor = _selected_npuir_superblock_factor(metadata, opt)
-    options.append(f"--super-block-factor={selected_factor}")
+    # F1 is the compiler default.  Older 950PR BiShengIR packages expose the
+    # blockify pass but not the optional SuperBlock-factor flag, so emitting
+    # ``--super-block-factor=1`` makes otherwise ordinary SIMT compilation
+    # fail before IR lowering starts.
+    if selected_factor > 1:
+        options.append(f"--super-block-factor={selected_factor}")
 
 
 def _can_materialize_scope_superblock(metadata, opt, whole_kernel_materializable: bool) -> bool:
@@ -548,9 +1033,17 @@ def _publish_route_transform_capability(metadata, opt) -> str:
     legal_factors = [factor for factor in modeled_factors if num_warps * factor <= 64]
     if not legal_factors:
         legal_factors = [1]
-    whole_kernel_factors = legal_factors if v1_materializable else [1]
-    scope_factors = ([factor for factor in legal_factors
-                      if factor in current_scope_factors] if v1_materializable else [1])
+
+    rejected_whole_kernel_factors = {
+        int(factor)
+        for factor in metadata.get("backend_rejected_whole_kernel_factors", [])
+        if str(factor).isdigit()
+    }
+    whole_kernel_superblock_factors = (
+        [factor for factor in legal_factors
+         if factor not in rejected_whole_kernel_factors] if v1_materializable else [1]) or [1]
+    superblock_factors = ([factor for factor in legal_factors
+                           if factor in current_scope_factors] if v1_materializable else [1]) or [1]
     coalesce_factor = max(1, int(metadata.get("ttir_layout_coalesce_factor", 1) or 1))
 
     coalesce_axis = metadata.get("ttir_layout_coalesce_axis", -1)
@@ -567,40 +1060,71 @@ def _publish_route_transform_capability(metadata, opt) -> str:
                 physical_aic_cores = int(npu_utils.get_aicore_num())
         except Exception:
             pass
+    if not physical_vector_cores:
+        try:
+            physical_vector_cores = int(NPUUtils().get_aivector_core_num())
+        except Exception:
+            physical_vector_cores = 0
     source_logical_program_count = max(0, int(getattr(opt, "logical_program_count_hint", 0) or 0))
     transformed_logical_program_count = ((source_logical_program_count + coalesce_factor - 1) //
                                          coalesce_factor if source_logical_program_count else 0)
     capability = {
-        "schema_version": 2,
-        "layout_merge_applied": bool(metadata.get("ttir_layout_merge_applied", False)),
-        "layout_coalescing_applied": coalesce_factor > 1,
-        "layout_coalescing_factor": coalesce_factor,
-        "layout_coalescing_axis": coalesce_axis,
+        "schema_version":
+        2,
+        "layout_merge_applied":
+        bool(metadata.get("ttir_layout_merge_applied", False)),
+        "layout_coalescing_applied":
+        coalesce_factor > 1,
+        "layout_coalescing_factor":
+        coalesce_factor,
+        "layout_coalescing_axis":
+        coalesce_axis,
         # Compatibility aliases for the pre-layout terminology consumed by
         # older Python guards.  Both names describe the same resolved fact;
         # neither is an independent route decision.
-        "row_coalescing_applied": coalesce_factor > 1,
-        "row_coalescing_factor": coalesce_factor,
-        "row_coalescing_axis": coalesce_axis,
-        "auto_blockify_v1_requested": bool(metadata.get("auto_blockify_v1_requested", False)),
-        "auto_blockify_v1_materializable": v1_materializable,
-        "auto_blockify_v1_disable_reasons": sorted(set(disable_reasons)),
-        "modeled_superblock_factors": list(modeled_factors),
-        "whole_kernel_superblock_factors": whole_kernel_factors,
-        "scope_superblock_factors": scope_factors,
-        "source_logical_program_count_hint": source_logical_program_count,
-        "logical_program_count_hint": transformed_logical_program_count,
-        "physical_vector_core_count_hint": physical_vector_cores,
-        "physical_aicore_count_hint": physical_aic_cores,
+        "row_coalescing_applied":
+        coalesce_factor > 1,
+        "row_coalescing_factor":
+        coalesce_factor,
+        "row_coalescing_axis":
+        coalesce_axis,
+        "auto_blockify_v1_requested":
+        bool(metadata.get("auto_blockify_v1_requested", False)),
+        "auto_blockify_v1_materializable":
+        v1_materializable,
+        "auto_blockify_v1_disable_reasons":
+        sorted(set(disable_reasons)),
+        "whole_kernel_superblock_factors":
+        whole_kernel_superblock_factors,
+        "scope_superblock_factors":
+        superblock_factors,
+        "source_logical_program_count_hint":
+        source_logical_program_count,
+        "logical_program_count_hint":
+        transformed_logical_program_count,
+        "physical_vector_core_count_hint":
+        physical_vector_cores,
+        "physical_aicore_count_hint":
+        physical_aic_cores,
+        "runtime_scalar_values": [{
+            "argument_index": int(argument_index),
+            "value": int(value),
+        } for argument_index, value in getattr(opt, "auto_simt_runtime_scalar_values", ())],
+        "cv_aiv_subblock_count": (2 if physical_aic_cores > 0 and physical_vector_cores == 2 * physical_aic_cores
+                                  and getattr(opt, "enable_auto_bind_sub_block", None) is not False
+                                  and getattr(opt, "auto_tile_and_bind_subblock", True) else 1),
     }
+    forced_candidate = metadata.get("backend_forced_route_candidate")
+    if forced_candidate in ("all_simd", "all_simt_only", "mixed_simd_simt"):
+        capability["backend_forced_route_candidate"] = forced_candidate
     # Keep this contract factual. Route-specific Q/group/tail composition has
     # one implementation in the native RouteSolver; duplicating that formula
     # in Python previously let the two sides drift apart.
     capability_json = json.dumps(capability, sort_keys=True, separators=(",", ":"))
     metadata["route_transform_capability"] = capability_json
     metadata["route_transform_v1_materializable"] = v1_materializable
-    metadata["route_transform_whole_kernel_factors"] = ",".join(map(str, whole_kernel_factors))
-    metadata["route_transform_scope_factors"] = ",".join(map(str, scope_factors))
+    metadata["route_transform_whole_kernel_factors"] = ",".join(map(str, whole_kernel_superblock_factors))
+    metadata["route_transform_scope_factors"] = ",".join(map(str, superblock_factors))
     return capability_json
 
 
@@ -814,6 +1338,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
     # "simd_simt" the C++ cost model runs before the downstream lowering and may
     # materialize SIMT scopes / publish the effective route. This is a no-op for
     # every other mode (auto_simt_scope_mode defaults to "off").
+    route_neutral_ttir = str(mod)
     analysis_ttir_code = ""
     if metadata["compile_mode"] == "simd_simt" and opt.auto_simt_scope_mode != "off":
         if opt.enable_ttir_layout_merge:
@@ -827,11 +1352,17 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         _publish_route_transform_capability(metadata, opt)
         analysis_ttir_code = _build_costmodel_analysis_ttir(mod, metadata, opt)
     cpp_decision = _run_cpp_simd_simt_costmodel(mod, metadata, opt, analysis_ttir_code)
-    if metadata["compile_mode"] == "simd_simt" and (cpp_decision == "all_simt_only"
-                                                    or ascend.ir.is_whole_body_void_simt_scope(mod)):
+    cpp_all_simt = cpp_decision == "all_simt_only"
+    if metadata["compile_mode"] == "simd_simt" and (cpp_all_simt or ascend.ir.is_whole_body_void_simt_scope(mod)):
         # The native Route Model selected pure SIMT (or the kernel body is a
         # single void SIMT scope). Carry TTIR forward to the pure-SIMT compiler;
         # the npubin stage dispatches on metadata["force_simt_only"].
+        if cpp_all_simt:
+            # Backend register allocation is the first point where a whole
+            # SIMT factor's resource cliff is observable. Preserve the input
+            # needed to materialize a different legal route if that evidence
+            # changes the global candidate ordering.
+            metadata["auto_simt_route_neutral_ttir"] = route_neutral_ttir
         metadata["scope_pure_simt_auto"] = True
         metadata["force_simt_only"] = True
         # Mirror NPUOptions.__post_init__ so the runtime launcher observes the
@@ -890,6 +1421,23 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
     if auto_map_parallel_blocks_enabled and has_auto_blockify_blacklist_op and blacklist_reasons:
         kernel_name = re.search(r"tt\.func\spublic\s+@(\w+)", ttir_code).group(1)
         _warn_auto_blockify_disabled(kernel_name or "<unknown>", blacklist_reasons)
+    if metadata.get("auto_simt_effective_kind") == "all_simd":
+        # Preserve the decision-owned V1 policy from
+        # _apply_cpp_simd_simt_decision. Re-running the option policy here
+        # could change the transform contract after candidate scoring.
+        # All-SIMD also runs NPUIR AutoBlockify when the shared policy allows it.
+        # Preserve the values set by _apply_cpp_simd_simt_decision; do not
+        # re-enable or force-disable here.
+        _preserve_all_simd_auto_blockify_contract(metadata)
+    elif metadata.get("auto_simt_effective_kind") == "mixed_simd_simt":
+        # Preserve the mixed SuperBlock contract established above.  NPUIR V1
+        # creates the persistent logical-program loop even for F1; the
+        # selected factor independently controls logical-program aggregation.
+        metadata["auto_blockify_v1_enabled"] = True
+        metadata["auto_blockify_v1_runtime_cap"] = True
+    else:
+        _resolve_auto_blockify_v1_policy(ttir_code, metadata, opt)
+    has_auto_blockify_blacklist_op = metadata["has_auto_blockify_blacklist_op"]
     with tempfile.TemporaryDirectory() as tmpdir:
         src_path = os.path.join(tmpdir, "kernel.ttir.mlir")
         dst_path = os.path.join(tmpdir, "kernel.ttadapter.mlir")
@@ -1495,9 +2043,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 _compile_option_list += ["--enable-hivm-batch-matmul"]
             if metadata.get("enable_vf_stack_limit"):
                 _compile_option_list += ["--enable-vf-stack-limit"]
-        bisheng_options = metadata["bisheng_options"]
-        if bisheng_options is not None:
-            _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
+        bisheng_options = _bisheng_options_with_resource_usage(metadata["bisheng_options"])
+        _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
         if metadata.get("mix_mode") in ["aic"]:
             _compile_option_list += ["--disable-hfusion-vectorize=true"]
         if opt.debug:
@@ -1550,6 +2097,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+
+        _publish_backend_resource_usage(ret.stdout, ret.stderr, metadata)
 
         stdout_str = ret.stdout.decode('utf-8') if ret.stdout else ''
         match = re.search(r'UB\s+size\s*=\s*(\d+)\s*bits', stdout_str)
@@ -1958,6 +2507,11 @@ class NPUOptions:
     logical_program_count_hint: int = 0
     physical_vector_core_count_hint: int = 0
     physical_aicore_count_hint: int = 0
+    # Concrete non-constexpr integer arguments used only by the native route
+    # model.  The JIT backend hook populates (TTIR argument index, value)
+    # pairs before cache lookup, so a different loop bound cannot reuse a
+    # cost-model decision compiled for another bound.
+    auto_simt_runtime_scalar_values: Tuple[Tuple[int, int], ...] = ()
     # Native AscendModel selection: Python only schedules the C++ passes.
     # Empty/"off" disables the route model; "auto" selects, "report" dumps.
     auto_simt_scope_mode: str = ""
@@ -2215,9 +2769,8 @@ def ttir_to_npubin(mod, metadata, opt):
                         f"--custom-aiv-number={npu_utils.get_aivector_core_num()}",
                     ]
 
-            bisheng_options = metadata["bisheng_options"]
-            if bisheng_options is not None:
-                _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
+            bisheng_options = _bisheng_options_with_resource_usage(metadata["bisheng_options"])
+            _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
 
             if metadata.get("auto_blockify_v1_enabled") is not None:
                 # The native Route Model published the executable V1 schedule
@@ -2229,13 +2782,143 @@ def ttir_to_npubin(mod, metadata, opt):
                     _compile_option_list += [f"--super-block-factor={opt.superblock_factor}"]
 
         npu_compiler_path, env = _get_npucompiler_path()
+        selected_factor = _selected_npuir_superblock_factor(metadata, opt)
+        feedback_factors = []
+        if (force_simt_only and metadata.get("scope_pure_simt_auto", False) and not opt.enable_ta_auto_blockify_v1
+                and any(option.startswith("--super-block-factor=") for option in _compile_option_list)):
+            try:
+                report_data = json.loads(metadata.get("auto_simt_scope_report", ""))
+                factor_routes = report_data.get("stage_model", {}).get("all_simt_factor_routes", {})
+                feedback_factors = sorted(
+                    int(factor)
+                    for factor, route in factor_routes.items()
+                    if route.get("legal", False) and int(factor) <= selected_factor)
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                feedback_factors = []
+
+        if len(feedback_factors) > 1:
+            # Compile the selected factor first, then only narrower fallbacks.
+            # A narrower factor cannot introduce the widening allocation cliff
+            # that this feedback resolves, and factors already more expensive
+            # than the native minimum do not need speculative compilation.
+            compile_order = [selected_factor] + [factor for factor in feedback_factors if factor != selected_factor]
+            compiled = {}
+            factor_resources = {}
+            failures = {}
+            for factor in compile_order:
+                factor_options = [
+                    option for option in _compile_option_list if not option.startswith("--super-block-factor=")
+                ]
+                factor_options.append(f"--super-block-factor={factor}")
+                factor_options = _compile_options_with_regalloc_size_info(factor_options)
+                factor_bin_file = os.path.join(tmpdir, f"kernel_f{factor}")
+                factor_bin_path = factor_bin_file + ".o"
+                factor_cmd = [npu_compiler_path, src_path] + factor_options + ["-o", factor_bin_file]
+                try:
+                    factor_ret = subprocess.run(factor_cmd, env=env, capture_output=True, check=True)
+                except subprocess.CalledProcessError as error:
+                    failures[str(factor)] = {
+                        "returncode": error.returncode,
+                        "stderr": (error.stderr or b"").decode("utf-8", errors="replace")[-4096:],
+                    }
+                    if factor == selected_factor:
+                        raise
+                    continue
+                if not Path(factor_bin_path).exists():
+                    if factor == selected_factor:
+                        raise subprocess.CalledProcessError(factor_ret.returncode, factor_cmd, factor_ret.stdout,
+                                                            factor_ret.stderr)
+                    failures[str(factor)] = {
+                        "returncode": factor_ret.returncode, "stderr": "compiler did not produce kernel.o"
+                    }
+                    continue
+                resource_metadata = {}
+                resources = _publish_backend_resource_usage(factor_ret.stdout, factor_ret.stderr, resource_metadata)
+                representative = _representative_simt_resource(resources)
+                if representative is not None:
+                    representative = dict(representative)
+                    private_stack = _publish_backend_private_stack_disassembly(factor_bin_path, resource_metadata,
+                                                                               npu_compiler_path, env)
+                    if private_stack:
+                        representative["simt_private_stack_disassembly"] = private_stack
+                    factor_resources[factor] = representative
+                compiled[factor] = (Path(factor_bin_path).read_bytes(), factor_ret)
+
+            chosen_factor, feedback, updated_report = _select_backend_resource_aware_factor(
+                metadata.get("auto_simt_scope_report", ""), factor_resources, selected_factor, num_warps=opt.num_warps,
+                private_load_group_cycles=_private_stack_dependent_load_group_cycles(opt.arch))
+            if chosen_factor not in compiled:
+                chosen_factor = selected_factor
+            chosen_binary, chosen_ret = compiled[chosen_factor]
+            _publish_backend_resource_usage(chosen_ret.stdout, chosen_ret.stderr, metadata)
+            chosen_resource = factor_resources.get(chosen_factor, {})
+            if chosen_resource.get("simt_private_stack_disassembly"):
+                metadata["backend_simt_private_stack_disassembly"] = (chosen_resource["simt_private_stack_disassembly"])
+            metadata["backend_superblock_factor_resources"] = {
+                str(factor): resource
+                for factor, resource in sorted(factor_resources.items())
+            }
+            if failures:
+                metadata["backend_superblock_factor_compile_failures"] = failures
+            if feedback:
+                feedback["compile_failures"] = failures
+                metadata["backend_resource_feedback"] = feedback
+                metadata["auto_simt_superblock_factor"] = chosen_factor
+                metadata["auto_simt_scope_report"] = updated_report
+                if opt.auto_simt_scope_dump:
+                    Path(opt.auto_simt_scope_dump).write_text(updated_report, encoding="utf-8", newline="\n")
+            post_backend_candidate = feedback.get("post_backend_selected_candidate", "all_simt_only")
+            if post_backend_candidate != "all_simt_only":
+                route_neutral_ttir = metadata.get("auto_simt_route_neutral_ttir", "")
+                if not route_neutral_ttir:
+                    raise RuntimeError("backend resource feedback changed the route winner, but the "
+                                       "route-neutral TTIR snapshot is unavailable")
+                reroute_metadata = _metadata_for_backend_cross_route_rerun(metadata,
+                                                                           feedback.get("rejected_factors", []), opt,
+                                                                           post_backend_candidate)
+                reroute_mod = _parse_ttir_text(route_neutral_ttir)
+                rerouted_linalg = ttir_to_linalg(reroute_mod, reroute_metadata, opt, named_ops=True)
+                reroute_dump = os.environ.get("TRITON_ASCEND_BACKEND_REROUTE_DUMP", "")
+                if reroute_dump:
+                    Path(reroute_dump).write_text(rerouted_linalg, encoding="utf-8", newline="\n")
+                materialized_candidate = reroute_metadata.get("auto_simt_effective_kind")
+                if materialized_candidate != post_backend_candidate:
+                    raise RuntimeError("backend resource reroute selected "
+                                       f"{post_backend_candidate!r}, but route materialization produced "
+                                       f"{materialized_candidate!r}")
+                rerouted_compile_input = rerouted_linalg
+                if opt.use_bytecode:
+                    rerouted_bytecode = linalg_to_bc_by_triton_mlir_opt(rerouted_linalg, reroute_metadata, opt)
+                    rerouted_compile_input = bc_to_linalg_by_bishengir_opt(rerouted_bytecode, reroute_metadata, opt)
+                rerouted_binary = linalg_to_bin_enable_npu_compile_910_95(rerouted_compile_input, reroute_metadata, opt)
+                reroute_metadata["backend_superblock_factor_resources"] = {
+                    str(factor): resource
+                    for factor, resource in sorted(factor_resources.items())
+                }
+                if failures:
+                    reroute_metadata["backend_superblock_factor_compile_failures"] = failures
+                reroute_metadata["backend_resource_feedback"] = feedback
+                _attach_backend_cross_route_feedback(reroute_metadata, feedback, updated_report)
+                reroute_metadata.pop("auto_simt_route_neutral_ttir", None)
+                metadata.clear()
+                metadata.update(reroute_metadata)
+                if opt.auto_simt_scope_dump:
+                    Path(opt.auto_simt_scope_dump).write_text(metadata["auto_simt_scope_report"], encoding="utf-8",
+                                                              newline="\n")
+                return rerouted_binary
+            metadata.pop("auto_simt_route_neutral_ttir", None)
+            return chosen_binary
+
         cmd_list = ([npu_compiler_path, src_path] + _compile_option_list + ["-o", bin_file])
         ret = subprocess.run(cmd_list, env=env, capture_output=True, check=True)
+        _publish_backend_resource_usage(ret.stdout, ret.stderr, metadata)
         if not Path(bin_path).exists():
             error_msg = ret.stderr.decode('utf-8')
             print(f"[DEBUG] {bin_path} is not found")
             print(f"[DEBUG] Stderr:\n{error_msg}")
             raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
+        _publish_backend_private_stack_disassembly(bin_path, metadata, npu_compiler_path, env)
+        metadata.pop("auto_simt_route_neutral_ttir", None)
         return Path(bin_path).read_bytes()
 
 
@@ -2274,9 +2957,41 @@ class AscendBackend(BaseBackend):
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
         if target.backend == "npu":
+            from triton.backends.ascend import _apply_ascend_patch
+            _apply_ascend_patch()
             self.binary_ext = "npubin"
             # Include all binary file extensions (mlirbc is always emitted for normal kernels).
             self.binary_extensions = {"npubin", "mlirbc"}
+
+    def get_runtime_compile_options(self, bound_args, specialization, options):
+        """Expose concrete integer scalar values to the native route model.
+
+        TTIR intentionally keeps ordinary integer parameters dynamic.  The
+        route model nevertheless needs their concrete values when they form
+        loop bounds or affine strides.  Record every non-constexpr integer
+        scalar by its compact TTIR argument index.  This is a generic launch
+        fact: it does not inspect a kernel name, argument name, source path, or
+        tensor shape.
+        """
+        compile_mode = options.get("compile_mode") or os.environ.get("TRITON_ASCEND_COMPILE_MODE", "")
+        if compile_mode != "simd_simt":
+            return {}
+        explicit = options.get("auto_simt_runtime_scalar_values")
+        # parse_options defaults this field to an empty tuple and some launch
+        # paths feed that default back through the binder.  Empty therefore
+        # means "not supplied"; only a non-empty value is an explicit override.
+        if explicit:
+            return {"auto_simt_runtime_scalar_values": tuple(tuple(pair) for pair in explicit)}
+
+        values = []
+        ttir_argument_index = 0
+        for (_, value), spec in zip(bound_args.items(), specialization):
+            if spec[0] == "constexpr":
+                continue
+            if isinstance(value, int) and not isinstance(value, bool):
+                values.append((ttir_argument_index, int(value)))
+            ttir_argument_index += 1
+        return {"auto_simt_runtime_scalar_values": tuple(values)}
 
     def parse_options(self, opts) -> Any:
         # TODO: get available targets when building options?

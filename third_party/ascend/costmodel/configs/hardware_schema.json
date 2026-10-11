@@ -12,7 +12,6 @@
     "compute_units",
     "data_movers"
   ],
-
   "properties": {
     "$schema": {
       "type": "string",
@@ -65,7 +64,6 @@
       "type": "string",
       "description": "Path, relative to this hardware config, to the shared model-neutral measurement catalog"
     },
-
     "clock": {
       "type": "object",
       "description": "Device-compute clock configuration. SYS_CNT is a separate clock domain stored in the shared microbenchmark profile.",
@@ -91,7 +89,6 @@
         }
       }
     },
-
     "memory_spaces": {
       "type": "object",
       "description": "Named addressable memory hierarchy. Names are referenced by compute units and data movers.",
@@ -141,15 +138,24 @@
             "description": "Capacity returned by the runtime device query. It may exclude firmware/runtime reservations and therefore need not equal nominal physical capacity."
           },
           "bandwidth_tbps": {
-            "type": ["number", "null"],
+            "type": [
+              "number",
+              "null"
+            ],
             "description": "Theoretical or model bandwidth in decimal 10^12 byte/s; converted to byte/device-compute-cycle. null means target-specific evidence is not yet available and must not be treated as zero."
           },
           "bandwidth_gbps": {
-            "type": ["number", "null"],
+            "type": [
+              "number",
+              "null"
+            ],
             "description": "Theoretical or model bandwidth in decimal 10^9 byte/s; converted to byte/device-compute-cycle. null means target-specific evidence is not yet available and must not be treated as zero."
           },
           "latency_cycles": {
-            "type": ["integer", "null"],
+            "type": [
+              "integer",
+              "null"
+            ],
             "description": "Fixed access-latency prior in device-compute cycles. null means target-specific evidence is not yet available and must not be treated as zero."
           },
           "description": {
@@ -166,7 +172,6 @@
         }
       }
     },
-
     "compute_units": {
       "type": "object",
       "description": "Named compute engines and their declared topology, peak rates, legal types, and memory-space contract.",
@@ -191,15 +196,24 @@
             "description": "Purpose and evidence boundary of this compute unit."
           },
           "tflops_fp16": {
-            "type": ["number", "null"],
+            "type": [
+              "number",
+              "null"
+            ],
             "description": "Declared FP16 peak arithmetic rate in TFLOP/s."
           },
           "tflops_fp32": {
-            "type": ["number", "null"],
+            "type": [
+              "number",
+              "null"
+            ],
             "description": "Declared FP32 peak arithmetic rate in TFLOP/s."
           },
           "tflops_int8": {
-            "type": ["number", "null"],
+            "type": [
+              "number",
+              "null"
+            ],
             "description": "Declared INT8 peak operation rate; the legacy field name says TFLOPS although TOPS is the more precise unit."
           },
           "fractal_sizes": {
@@ -222,7 +236,10 @@
             "description": "Fallback Cube reduction dimension K when no dtype-specific fractal shape is found."
           },
           "width_elements": {
-            "type": ["integer", "null"],
+            "type": [
+              "integer",
+              "null"
+            ],
             "description": "Nominal SIMD element count, traditionally expressed for the reference dtype; do not use as a dtype-independent lane count."
           },
           "width_bytes": {
@@ -268,7 +285,6 @@
         }
       }
     },
-
     "data_movers": {
       "type": "object",
       "description": "Named hardware transfer paths between memory spaces.",
@@ -299,15 +315,24 @@
             }
           },
           "bandwidth_gbps": {
-            "type": ["number", "null"],
+            "type": [
+              "number",
+              "null"
+            ],
             "description": "Modeled transfer bandwidth in decimal GB/s."
           },
           "max_burst_bytes": {
-            "type": ["integer", "null"],
+            "type": [
+              "integer",
+              "null"
+            ],
             "description": "Maximum bytes in one modeled burst."
           },
           "alignment_bytes": {
-            "type": ["integer", "null"],
+            "type": [
+              "integer",
+              "null"
+            ],
             "description": "Required or efficient byte alignment for this transfer path."
           },
           "supports_accumulate": {
@@ -324,7 +349,6 @@
         }
       }
     },
-
     "pipeline": {
       "type": "object",
       "description": "Pipeline path declarations and intended overlap relationships.",
@@ -359,7 +383,6 @@
         "$ref": "#/definitions/pipeline_path"
       }
     },
-
     "performance_model": {
       "type": "object",
       "description": "Documentary analytical formulas. The current C++ loader does not interpret or execute this block.",
@@ -394,7 +417,6 @@
         }
       }
     },
-
     "calibration": {
       "type": "object",
       "description": "Absolute-model priors, evidence notes, and target-specific calibration parameters.",
@@ -412,23 +434,38 @@
               "description": "Consumption status or provenance shared by the startup-latency fields."
             },
             "vector_startup_cycles": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "Vector pipeline startup prior in device-compute cycles."
             },
             "mte2_startup_cycles": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "MTE2 startup prior in device-compute cycles."
             },
             "mte3_startup_cycles": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "MTE3 startup prior in device-compute cycles."
             },
             "cube_startup_cycles": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "Cube engine startup prior in device-compute cycles."
             },
             "fixpipe_startup_cycles": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "FixPipe startup prior in device-compute cycles."
             },
             "notes": {
@@ -446,35 +483,59 @@
               "description": "Consumption status or provenance shared by these operation-cycle priors."
             },
             "exp": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "Vector exponential cycles per instruction."
             },
             "log": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "Vector logarithm cycles per instruction."
             },
             "tanh": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "Vector tanh cycles per instruction."
             },
             "sigmoid": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "Vector sigmoid cycles per instruction."
             },
             "sqrt": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "Vector square-root cycles per instruction."
             },
             "rsqrt": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "Vector reciprocal-square-root cycles per instruction."
             },
             "div": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "Vector division cycles per instruction."
             },
             "simple_ops_add_sub_mul_etc": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "Shared legacy cycle prior for simple vector add, sub, mul, and cast instructions."
             },
             "notes": {
@@ -492,19 +553,31 @@
               "description": "Source and interpretation shared by the scalar-overhead fields."
             },
             "aiv_scalar_to_vec_ratio_steady_state": {
-              "type": ["number", "null"],
+              "type": [
+                "number",
+                "null"
+              ],
               "description": "Steady-state AIV scalar cost relative to vector cost."
             },
             "aic_scalar_to_mac_ratio_steady_state": {
-              "type": ["number", "null"],
+              "type": [
+                "number",
+                "null"
+              ],
               "description": "Steady-state AIC scalar cost relative to Cube MAC cost."
             },
             "aiv_vec_ratio_observed": {
-              "type": ["number", "null"],
+              "type": [
+                "number",
+                "null"
+              ],
               "description": "Observed fraction of AIV time attributed to vector work."
             },
             "aiv_scalar_overhead_factor": {
-              "type": ["number", "null"],
+              "type": [
+                "number",
+                "null"
+              ],
               "description": "Non-vector overhead factor in total ≈ vector × (1 + factor)."
             }
           }
@@ -536,7 +609,10 @@
               "description": "Calibration source and interpretation of the barrier prior."
             },
             "cycles_per_inner_iteration": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "Modeled AIC/AIV pipe-barrier cost per inner iteration."
             }
           }
@@ -554,7 +630,6 @@
       }
     }
   },
-
   "definitions": {
     "pipeline_path": {
       "type": "object",
@@ -681,7 +756,10 @@
           "description": "Human-readable expression."
         },
         "base_cycles": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "description": "Nominal cycles per atomic unit in the documented formula."
         }
       }

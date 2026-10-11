@@ -150,17 +150,15 @@ public:
     // block owns one contiguous chunk of logical programs.  The factor only
     // changes how that chunk is consumed by the SuperBlock; it does not turn
     // the chunk into a global strided loop or change the tile shape.
-    Value chunk = builder.create<arith::CeilDivUIOp>(
-        loc, logicalBlockCount, physicalBlockCount);
-    Value lowerBound =
-        builder.create<arith::MulIOp>(loc, blockIdx, chunk);
+    Value chunk = builder.create<arith::CeilDivUIOp>(loc, logicalBlockCount,
+                                                     physicalBlockCount);
+    Value lowerBound = builder.create<arith::MulIOp>(loc, blockIdx, chunk);
     Value end = builder.create<arith::AddIOp>(loc, lowerBound, chunk);
-    Value upperBound = builder.create<arith::MinUIOp>(
-        loc, end, logicalBlockCount);
+    Value upperBound =
+        builder.create<arith::MinUIOp>(loc, end, logicalBlockCount);
     Value one = builder.create<arith::ConstantIntOp>(loc, 1, 32);
 
-    auto forOp = builder.create<scf::ForOp>(loc, lowerBound, upperBound,
-                                           one);
+    auto forOp = builder.create<scf::ForOp>(loc, lowerBound, upperBound, one);
     forOp->setAttr(autoBlockifyV1LoopAttr, builder.getUnitAttr());
     // Keep the selected factor on the scheduling loop as well as on the
     // function.  NPUIR exposes this loop-local fact and downstream scope
@@ -194,12 +192,12 @@ public:
     if (factor > 1) {
       Value iv = forOp.getInductionVar();
       builder.setInsertionPoint(forOp);
-      Value factorValue = builder.create<arith::ConstantIntOp>(
-          loc, iv.getType(), factor);
+      Value factorValue =
+          builder.create<arith::ConstantIntOp>(loc, iv.getType(), factor);
       // Keep the warp-size constant outside the loop body, as in NPUIR.  It
       // is a schedule parameter, not per-logical-program work.
-      Value warpSize = builder.create<arith::ConstantIntOp>(
-          loc, iv.getType(), 32);
+      Value warpSize =
+          builder.create<arith::ConstantIntOp>(loc, iv.getType(), 32);
       Block *loopBody = forOp.getBody();
       forOp.setStep(factorValue);
       OpBuilder bodyBuilder(loopBody, loopBody->begin());
@@ -344,11 +342,9 @@ public:
         bodyBuilder.create<arith::IndexCastOp>(loc, iv.getType(), tidIndex);
     Value warpId = bodyBuilder.create<arith::DivUIOp>(loc, tid, warpSize);
     Value taskId = bodyBuilder.create<arith::RemUIOp>(loc, warpId, factorValue);
-    Value logicalProgramId =
-        bodyBuilder.create<arith::AddIOp>(loc, iv, taskId);
+    Value logicalProgramId = bodyBuilder.create<arith::AddIOp>(loc, iv, taskId);
     Value inBounds = bodyBuilder.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::slt, logicalProgramId,
-        oldUpper);
+        loc, arith::CmpIPredicate::slt, logicalProgramId, oldUpper);
     auto ifOp = bodyBuilder.create<scf::IfOp>(loc, inBounds);
 
     for (OpOperand &use : llvm::make_early_inc_range(iv.getUses()))

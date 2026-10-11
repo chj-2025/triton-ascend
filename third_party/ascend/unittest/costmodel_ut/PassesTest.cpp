@@ -159,7 +159,8 @@ TEST(CostModelPassesTest, EstimateCyclesAnnotatesComputeAndTransferOps) {
   EXPECT_TRUE(storeOp->getAttrOfType<StringAttr>("hw_unit"));
 }
 
-TEST(CostModelPassesTest, Ascend950PRF32AddConsumesSharedThroughputInAbsoluteModel) {
+TEST(CostModelPassesTest,
+     Ascend950PRF32AddConsumesSharedThroughputInAbsoluteModel) {
   mlir::MLIRContext context;
   auto module = parseModule(context, R"mlir(
 module {
@@ -600,6 +601,43 @@ TEST(CostModelPassesTest, SimdSimtScoresGenericSemanticStages) {
   EXPECT_EQ(*reportReason, "report_mode");
 }
 
+TEST(CostModelPassesTest, BackendResourceRerunForcesRecomparedLegalRoute) {
+  mlir::MLIRContext context;
+  auto module = parseModule(context, kOutOfSimdSimtCoverageModule);
+  ASSERT_TRUE(module);
+
+  SelectSimdSimtCostModelPassOptions options;
+  options.mode = "auto";
+  options.profilePath = TRITON_ASCEND_SIMD_SIMT_TEST_PROFILE_PATH;
+  options.actualTarget = "Ascend950PR_9579";
+  options.numWarps = 4;
+  options.compileOn91095 = true;
+  options.routeTransformCapabilityJSON =
+      R"json({"backend_forced_route_candidate":"all_simt_only","whole_kernel_superblock_factors":[1],"scope_superblock_factors":[1]})json";
+
+  ASSERT_TRUE(runPasses(*module, createSelectSimdSimtCostModelPass(options)));
+  auto effective =
+      (*module)->getAttrOfType<StringAttr>("ascend.simt_costmodel.effective");
+  ASSERT_TRUE(effective);
+  EXPECT_EQ(effective.getValue(), "all_simt_only");
+
+  auto report = llvm::json::parse(
+      (*module)
+          ->getAttrOfType<StringAttr>("ascend.simt_costmodel.report_json")
+          .getValue());
+  ASSERT_TRUE(static_cast<bool>(report));
+  auto *object = report->getAsObject();
+  ASSERT_NE(object, nullptr);
+  auto decision = object->getString("decision_kind");
+  ASSERT_TRUE(decision);
+  EXPECT_EQ(*decision, "all_simt_only");
+  auto *prediction = object->getObject("selected_route_elapsed_prediction");
+  ASSERT_NE(prediction, nullptr);
+  auto predictedCandidate = prediction->getString("candidate");
+  ASSERT_TRUE(predictedCandidate);
+  EXPECT_EQ(*predictedCandidate, "all_simt_only");
+}
+
 TEST(CostModelPassesTest, SimdSimtProfileRejectsDifferentProductTarget) {
   mlir::MLIRContext context;
   auto module = parseModule(context, kOutOfSimdSimtCoverageModule);
@@ -611,8 +649,7 @@ TEST(CostModelPassesTest, SimdSimtProfileRejectsDifferentProductTarget) {
   options.actualTarget = "Ascend950DT_9582";
   options.numWarps = 4;
   options.compileOn91095 = true;
-  EXPECT_FALSE(
-      runPasses(*module, createSelectSimdSimtCostModelPass(options)));
+  EXPECT_FALSE(runPasses(*module, createSelectSimdSimtCostModelPass(options)));
 }
 
 TEST(CostModelPassesTest, SimtSetupUsesMeasuredWarpCountCurve) {
@@ -629,8 +666,8 @@ TEST(CostModelPassesTest, SimtSetupUsesMeasuredWarpCountCurve) {
     options.compileOn91095 = true;
     if (!runPasses(*module, createSelectSimdSimtCostModelPass(options)))
       return std::nullopt;
-    auto reportAttr =
-        (*module)->getAttrOfType<StringAttr>("ascend.simt_costmodel.report_json");
+    auto reportAttr = (*module)->getAttrOfType<StringAttr>(
+        "ascend.simt_costmodel.report_json");
     if (!reportAttr)
       return std::nullopt;
     auto report = llvm::json::parse(reportAttr.getValue());
@@ -648,8 +685,8 @@ TEST(CostModelPassesTest, SimtSetupUsesMeasuredWarpCountCurve) {
     for (const auto &candidate : *implementations) {
       auto *cost = candidate.getAsObject();
       auto *implementation = cost->getObject("implementation");
-      auto mode = implementation ? implementation->getString("mode")
-                                 : std::nullopt;
+      auto mode =
+          implementation ? implementation->getString("mode") : std::nullopt;
       auto *resources = cost->getObject("resource_system_cycles");
       if (mode && *mode == "simt" && resources)
         return resources->getNumber("setup");
@@ -661,8 +698,9 @@ TEST(CostModelPassesTest, SimtSetupUsesMeasuredWarpCountCurve) {
   auto thirtyTwoWarps = setupForWarps(32);
   ASSERT_TRUE(fourWarps);
   ASSERT_TRUE(thirtyTwoWarps);
-  EXPECT_NEAR(*fourWarps, 196.31, 1e-6);
-  EXPECT_NEAR(*thirtyTwoWarps, 224.50, 1e-6);
+  // Exact setup-only SYS_CNT values in ascend_950pr_v1.json, not rounded us.
+  EXPECT_NEAR(*fourWarps, 196.278571, 1e-6);
+  EXPECT_NEAR(*thirtyTwoWarps, 224.504388, 1e-6);
 }
 
 TEST(CostModelPassesTest, SimdSimtProfileRejectsNullThroughputMeasurement) {
@@ -715,7 +753,7 @@ TEST(CostModelPassesTest, SimdSimtProfileRejectsNullThroughputMeasurement) {
 }
 
 TEST(CostModelPassesTest, BackendFactorSetIsNotRegeneratedByStageLegality) {
-  for (int64_t factor : {0, 1, 2, 4}) {
+  for (int64_t factor : {0, 1, 2, 4, 8, 16}) {
     mlir::MLIRContext context;
     auto module = parseModule(context, kOutOfSimdSimtCoverageModule);
     ASSERT_TRUE(module);

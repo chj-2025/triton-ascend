@@ -9,8 +9,7 @@
 // V1: %[[GZ:.*]] = tt.get_num_programs z {{.*}} : i32
 // V1: %[[YZ:.*]] = arith.muli %[[GY]], %[[GZ]] {{.*}} : i32
 // V1: %[[LOGICAL:.*]] = arith.muli %[[GX]], %[[YZ]] {{.*}} : i32
-// V1: %[[HW_ID:.*]] = gpu.linear_block_id
-// V1: %[[HW:.*]] = arith.index_cast %[[HW_ID]] {{.*}} : index to i32
+// V1: %[[HW:.*]] = tt.get_program_id x {{.*}} : i32
 // V1: %[[PHYSICAL:.*]] = arith.constant {{.*}}64 : i32
 // V1: %[[CHUNK:.*]] = arith.ceildivui %[[LOGICAL]], %[[PHYSICAL]] {{.*}} : i32
 // V1: %[[LOWER:.*]] = arith.muli %[[HW]], %[[CHUNK]] {{.*}} : i32
@@ -29,8 +28,8 @@
 
 // SUPERBLOCK-LABEL: tt.func public @v1_keeps_tile_shape(
 // SUPERBLOCK-SAME: attributes {ta.auto_blockify_v1, ta.auto_blockify_v1.superblock_factor = 2 : i32}
-// SUPERBLOCK: %[[TWO:.*]] = arith.constant {{.*}}2 : i32
 // SUPERBLOCK: %[[CHUNK:.*]] = arith.ceildivui {{.*}} : i32
+// SUPERBLOCK: %[[TWO:.*]] = arith.constant {{.*}}2 : i32
 // SUPERBLOCK: scf.for %[[IV:.*]] = {{.*}} to %[[UPPER:.*]] step %[[TWO]] : i32 {
 // SUPERBLOCK-NOT: tt.get_program_id
 // SUPERBLOCK: %[[TID_INDEX:.*]] = gpu.thread_id x {{.*}}

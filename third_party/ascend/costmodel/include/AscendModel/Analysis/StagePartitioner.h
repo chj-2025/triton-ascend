@@ -18,6 +18,7 @@ struct StagePartitionerOptions {
   int64_t tinyDotFlopsMax = 16384;
   int64_t maximumSuperblockFactor = 1;
   int64_t maximumScopeSuperblockFactor = 4;
+  int64_t logicalProgramCountHint = 0;
   bool scopeSuperblockMaterializable = false;
 };
 
@@ -66,16 +67,27 @@ public:
 /// using per-kind weights.
 class StageWorkloadAnalysis {
 public:
-  llvm::Error analyze(StagePartition &partition) const;
+  llvm::Error analyze(StagePartition &partition,
+                      int64_t logicalProgramCountHint = 0) const;
 };
 
 /// Derives legal SIMD/SIMT implementations from structural Stage facts.
 class StageModeLegalityAnalysis {
 public:
   llvm::Error analyze(StagePartition &partition,
-                      int64_t maximumSuperblockFactor = 64,
+                      int64_t maximumSuperblockFactor = 4,
                       bool scopeSuperblockMaterializable = false,
                       int64_t maximumScopeSuperblockFactor = 4) const;
+};
+
+/// Applies profile-backed resource limits after the structural legality pass.
+/// Register-pressure and target-capacity facts are unavailable when the
+/// initial Stage partition is formed, so they must not be folded into
+/// StageModeLegalityAnalysis::analyze().
+class StageResourceLegalityAnalysis {
+public:
+  llvm::Error applySimtUbCapacity(StagePartition &partition,
+                                  int64_t usableUbBytes) const;
 };
 
 class StagePartitionVerifier {

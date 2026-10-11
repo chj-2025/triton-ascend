@@ -13,7 +13,6 @@ data_provider/
   build_commands.md                  # normal build/run commands
     camodel/
     README.md                        # this workflow
-    camodel_experiment_matrix.json   # planned CAModel experiment coverage
     extract_camodel_system_cycle_profile.py
     compare_stage_costs.py           # Stage prediction / CaModel evidence join
     summarize_local_traffic.py       # PC-attributed LDK/STK and LDS/STS audit

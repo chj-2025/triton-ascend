@@ -14,7 +14,7 @@
 // CHECK-SAME: ta.ttir_layout_merge.applied
 // CHECK-LABEL: tt.func public @layout_then_blockify
 // CHECK-SAME: attributes {ta.auto_blockify_v1, ta.auto_blockify_v1.superblock_factor = 1 : i32}
-// CHECK: gpu.linear_block_id
+// CHECK: tt.get_program_id x {{.*}} : i32
 // CHECK: scf.for
 // CHECK-NOT: tt.get_program_id
 // CHECK: tt.load {{.*}} : tensor<16x16x!tt.ptr<f32>>
