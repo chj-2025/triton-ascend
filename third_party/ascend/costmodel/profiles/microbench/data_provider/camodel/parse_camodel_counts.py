@@ -147,28 +147,24 @@ def _parse_instr_exe(root):
         group_calls = Counter()
         for instr, cycles in instr_cycles.items():
             group = next(
-                (name for name, prefixes in OP_GROUPS.items()
-                 if any(instr == prefix or instr.startswith(prefix + "_")
-                        for prefix in prefixes)),
+                (name for name, prefixes in OP_GROUPS.items() if any(instr == prefix or instr.startswith(prefix + "_")
+                                                                     for prefix in prefixes)),
                 "other",
             )
             group_cycles[group] += cycles
         for instr, calls in instr_calls.items():
             group = next(
-                (name for name, prefixes in OP_GROUPS.items()
-                 if any(instr == prefix or instr.startswith(prefix + "_")
-                        for prefix in prefixes)),
+                (name for name, prefixes in OP_GROUPS.items() if any(instr == prefix or instr.startswith(prefix + "_")
+                                                                     for prefix in prefixes)),
                 "other",
             )
             group_calls[group] += calls
         vector_pipe_cycles = {
-            pipe: sum(instr_cycles.get(op, 0.0) for op in ops)
+            pipe: sum(instr_cycles.get(op, 0.0)
+                      for op in ops)
             for pipe, ops in VECTOR_PIPE_OPS.items()
         }
-        vector_pipe_calls = {
-            pipe: sum(instr_calls.get(op, 0.0) for op in ops)
-            for pipe, ops in VECTOR_PIPE_OPS.items()
-        }
+        vector_pipe_calls = {pipe: sum(instr_calls.get(op, 0.0) for op in ops) for pipe, ops in VECTOR_PIPE_OPS.items()}
         unit_match = re.search(r"(core\d+\.veccore\d+)", path.name)
         result["files"].append({
             "path": str(path),
@@ -195,11 +191,13 @@ def _parse_instr_exe(root):
     result["group_cycles"] = dict(result["group_cycles"].most_common())
     result["group_calls"] = dict(result["group_calls"].most_common())
     result["vector_pipe_cycles"] = {
-        pipe: sum(all_instr_cycles.get(op, 0.0) for op in ops)
+        pipe: sum(all_instr_cycles.get(op, 0.0)
+                  for op in ops)
         for pipe, ops in VECTOR_PIPE_OPS.items()
     }
     result["vector_pipe_calls"] = {
-        pipe: sum(all_instr_calls.get(op, 0.0) for op in ops)
+        pipe: sum(all_instr_calls.get(op, 0.0)
+                  for op in ops)
         for pipe, ops in VECTOR_PIPE_OPS.items()
     }
     return result
@@ -244,8 +242,7 @@ def extract(root):
             aggregate_first.setdefault(op, timestamp)
             aggregate_examples.setdefault(op, examples.get(op, ""))
         for op, timestamp in last_ts.items():
-            per_unit[unit_key]["last_ts"][op] = max(
-                per_unit[unit_key]["last_ts"].get(op, timestamp), timestamp)
+            per_unit[unit_key]["last_ts"][op] = max(per_unit[unit_key]["last_ts"].get(op, timestamp), timestamp)
             aggregate_last[op] = max(aggregate_last.get(op, timestamp), timestamp)
 
     # Some OPPROF captures preserve instr_exe CSVs but not the raw primary

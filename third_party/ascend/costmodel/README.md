@@ -47,40 +47,34 @@ therefore returns `unknown_loop_trip_count` rather than silently admitting a
 generic dynamic loop.  The regression tests for both paths are in
 `unittest/costmodel_ut/SimdSimtCostModelTest.cpp`.
 
-## Generic SIMT Stage spill model
+## Whole-SIMT register-pressure observation
 
-The route model does not recognize a particular operator to predict register
-spill.  `StageWorkloadAnalysis` computes the peak SSA live set of each owned
-Stage and records it as `peak_live_register_units_per_logical_program`, where
-one unit is one 32-bit register word.  A value is live from its definition (or
-first Stage use for a live-in) through its last use; an escaping value remains
-live to the Stage boundary.
+`SimtRegisterPressureAnalysis` records a TTIR liveness proxy for the whole
+prospective pure-SIMT function.  The report includes 32-bit live units,
+predicate definitions and uses, predicate fanout, and any available lowering
+observation.  It also reports integer equality, integer ordered, predicate
+shape-transform, and other predicate-definition units, predicate-DAG edges and maximum depth, plus
+predicate uses by `arith.select` and boolean consumers.  These are structural
+TTIR observations; they do not claim machine predicate kinds, register counts,
+or spill accesses.  All pressure fields are diagnostics, not allocator
+predictions, so the observation object always keeps
+`spill_cost_included=false`.  Candidate costs
+report any separately owned private-stack cycles in the implementation's
+`private_stack_load_per_iteration` and `private_stack_store_per_iteration`
+resource fields.
 
-For a SIMT candidate the profile then applies the generic rule
+An enabled `private_load_source_fit` or `private_store_source_fit` may consume
+the whole-function observation only for the executable all-SIMT candidate.
+Mixed-route local SIMT scopes have different live ranges and require their own
+lowering-provided private-stack counts; the whole-function pressure is never
+copied into their calibration estimates.  Exact non-negative counts attached
+by lowering take precedence over a source fit for either route.
 
-```text
-threads = logical_warp_group_count * simt.issue_width
-excess_per_program = max(0, ceil(peak_units / threads)
-                            - simt.register_budget_per_thread)
-spill_transactions = excess_per_program * threads
-                     * simt.spill_transaction_coverage
-                     * superblock_factor
-spill_cycles = spill_transactions / simt.spill_transactions_per_system_cycle
-```
-
-The resulting `register_pressure_per_iteration` is emitted separately from
-explicit lowering-provided `spill_per_iteration`, so a report shows whether a
-cost came from static SSA pressure or an already observed `LDK/STK` stream.
-`register_budget_per_thread` and `spill_transaction_coverage` are optional
-stage-resource profile fields with conservative defaults of 32 and 1.0;
-target-specific values must be backed by allocator/CaModel evidence.
-
-The 10,240 B P4 value used in earlier notes is a grouped Stage traffic value;
-it must not be treated as the peak live set of one logical program.  The
-online model only accepts the SSA-derived
-`peak_live_register_units_per_logical_program`; the F2 loop grouping then
-multiplies per-program spill work, rather than multiplying the per-thread
-register footprint by two.
+The checked-in Ascend950PR profile does not enable a private-stack source fit.
+Its whole-SIMT pressure fields therefore remain observation-only while the B
+access-count model and C schedule-aware price model are being validated.  A
+fit must be backed by frozen allocator/CaModel evidence before it can affect
+route selection.
 
 ## TTIR memory traffic and generated vector-pipe traffic
 

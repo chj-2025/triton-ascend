@@ -1,0 +1,211 @@
+{
+  "schema": "triton-costmodel-regression-subset-v1",
+  "description": "Historical second pytest_ut structural holdout promoted into the canonical regression matrix.",
+  "parent_manifest": "generalization_matrix.json",
+  "cases": [
+    {
+      "name": "pytest_discrete_mask_4way_f16_8x8",
+      "family": "discrete_memory",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "discrete_mask_4way_f16_8x8",
+        "--batch",
+        "100"
+      ]
+    },
+    {
+      "name": "pytest_reduce_sum_epilogue_f32_8x8x512",
+      "family": "reduction",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "reduce_sum_epilogue_f32_8x8x512",
+        "--batch",
+        "30"
+      ]
+    },
+    {
+      "name": "pytest_max_dim0_f32_64x8",
+      "family": "reduction",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "max_dim0_f32_64x8",
+        "--batch",
+        "50"
+      ]
+    },
+    {
+      "name": "pytest_argmax_f32_37x125_dim1",
+      "family": "reduction",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "argmax_f32_37x125_dim1",
+        "--batch",
+        "50"
+      ]
+    },
+    {
+      "name": "pytest_gather_after_reduce_f32_16x1024",
+      "family": "discrete_reduce_scalar",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "gather_after_reduce_f32_16x1024",
+        "--batch",
+        "30"
+      ]
+    },
+    {
+      "name": "pytest_view_f32_2x256x16",
+      "family": "view_layout",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "view_f32_2x256x16",
+        "--batch",
+        "50"
+      ]
+    },
+    {
+      "name": "pytest_permute_reshape_fused_f32",
+      "family": "view_fusion",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "permute_reshape_fused_f32",
+        "--batch",
+        "20"
+      ]
+    },
+    {
+      "name": "pytest_nearest_resize_i32_1x4x64x64",
+      "family": "cv_discrete_memory",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "nearest_resize_i32_1x4x64x64",
+        "--batch",
+        "30"
+      ]
+    },
+    {
+      "name": "pytest_sort_f32_256x16",
+      "family": "sorting",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "sort_f32_256x16",
+        "--batch",
+        "30"
+      ]
+    },
+    {
+      "name": "pytest_topk_f32_16x64_k4",
+      "family": "sorting",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "topk_f32_16x64_k4",
+        "--batch",
+        "30"
+      ]
+    },
+    {
+      "name": "pytest_multi_input_scan_f32_2x5x10",
+      "family": "scan",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "multi_input_scan_f32_2x5x10",
+        "--batch",
+        "50"
+      ]
+    },
+    {
+      "name": "pytest_cummin_f32_3x5x7_dim1",
+      "family": "scan",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "cummin_f32_3x5x7_dim1",
+        "--batch",
+        "50"
+      ]
+    },
+    {
+      "name": "pytest_histogram_i32_2048_bins2",
+      "family": "histogram",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "histogram_i32_2048_bins2",
+        "--batch",
+        "50"
+      ]
+    },
+    {
+      "name": "pytest_scalar_reduce_store_f32_n16",
+      "family": "scalar_memory",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "scalar_reduce_store_f32_n16",
+        "--batch",
+        "100"
+      ]
+    },
+    {
+      "name": "pytest_conditional_load_f32_n32",
+      "family": "scalar_control_memory",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "conditional_load_f32_n32",
+        "--batch",
+        "100"
+      ]
+    },
+    {
+      "name": "pytest_dot_bf16_16x32x16",
+      "family": "dot",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "dot_bf16_16x32x16",
+        "--batch",
+        "30"
+      ]
+    },
+    {
+      "name": "pytest_fused_softmax_f32_128x257",
+      "family": "fusion_reduction",
+      "split": "holdout",
+      "driver": "bench_pytest_ut_structural_costmodel.py",
+      "arguments": [
+        "--case",
+        "fused_softmax_f32_128x257",
+        "--batch",
+        "20"
+      ]
+    }
+  ]
+}

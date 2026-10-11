@@ -16,6 +16,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,11 @@ struct SimdSimtCostModelOptions {
   std::string actualTarget;
   unsigned numWarps = 32;
   bool includeFeaturesInJSON = true;
+  /// Full Stage implementation matrices are diagnostic-only. The online
+  /// selector keeps a compact report and skips candidates that cannot be
+  /// selected; report mode can request the complete matrix.
+  bool includeDiagnosticStageDetailsInJSON = true;
+  bool collectCalibrationEstimates = true;
   /// True only when the target backend can materialize the shared TTIR anchor
   /// plan.  Candidate costs remain reportable when false, but mixed is not
   /// eligible for selection.
@@ -89,16 +95,29 @@ struct SimdSimtCostModelOptions {
   /// prevents the solver from pricing factors that cannot form one full
   /// logical-program group.
   int64_t logicalProgramCountHint = 0;
+  /// Launch count before AutoBlockify V1 row coalescing.  This stays separate
+  /// from logicalProgramCountHint because the transformed module is scheduled
+  /// with the latter while completion of per-source-program work can still
+  /// depend on the former. Zero means that no distinct source count was
+  /// provided by the backend.
+  int64_t sourceLogicalProgramCountHint = 0;
   int64_t physicalVectorCoreCountHint = 0;
   int64_t physicalAiCoreCountHint = 0;
+  /// Backend CV payload partition capability; one when binding is disabled.
+  int64_t cvAivSubblocks = 1;
   /// Backend capability sets, intersected with structural/resource legality.
   /// Empty explicitly disables the corresponding SIMT implementations.
   std::vector<int64_t> wholeKernelSuperblockFactors = {1, 2, 4};
   std::vector<int64_t> scopeSuperblockFactors = {1, 2, 4};
+  /// A backend resource pass can invalidate the pre-register-allocation
+  /// winner.  A second analysis/materialization pass uses this field to apply
+  /// the already re-compared legal route while rebuilding its elapsed-time
+  /// prediction from the route-neutral TTIR.
+  std::optional<SimdSimtCandidateKind> backendForcedDecision;
 };
 
 struct SimdSimtCostReport {
-  int64_t schemaVersion = 18;
+  int64_t schemaVersion = 21;
   std::string model = "ascend_stage_route_cost_v3_cpp";
   std::string profileVersion;
   std::string profileTarget;
@@ -109,7 +128,52 @@ struct SimdSimtCostReport {
   std::string microbenchmarkProfileTarget;
   std::string microbenchmarkProfileContentSha256;
   std::string scoreUnit;
+  int64_t kernelArgumentCount = 0;
+  int64_t logicalProgramCountHint = 0;
+  int64_t sourceLogicalProgramCountHint = 0;
+  /// Compiler-derived Stage resources before the one-time route envelope.
   SimdSimtCandidateScores candidateCosts;
+  /// Complete candidate scores used for route selection: Stage resources plus
+  /// the route/factor/program-count boundary, global-load completion, and
+  /// argument setup. Keeping both tables makes the ownership explicit and
+  /// prevents a route-specific one-time term from changing only the reported
+  /// elapsed time after a different route was already selected.
+  SimdSimtCandidateScores candidateElapsedCosts;
+  /// Absolute elapsed-time prediction for the selected route.
+  struct SelectedRouteElapsedPrediction {
+    bool applied = false;
+    std::string reason = "no_structural_route_elapsed_calibration";
+    std::string calibrationName;
+    std::string candidate;
+    std::string dotUseSignature;
+    std::string formula;
+    std::string evidence;
+    int64_t superblockFactor = 1;
+    int64_t baseWarpCount = 0;
+    int64_t runtimeSchedulingSlotCount = 0;
+    int64_t minimumRuntimeSchedulingSlotCount = 0;
+    int64_t maximumRuntimeSchedulingSlotCount = 0;
+    int64_t minimumRuntimeLoopIterations = 0;
+    int64_t maximumRuntimeLoopIterations = 0;
+    double minimumSelectionScore = 0.0;
+    double maximumSelectionScore = 0.0;
+    double selectionScoreScale = 0.0;
+    double schedulingSlotScale = 0.0;
+    double fixedSystemCycles = 0.0;
+    int64_t runtimeKernelArgumentCount = 0;
+    double runtimeArgumentSetupSystemCycles = 0.0;
+    /// Accounting split of the measured route-independent kernel boundary.
+    /// The two fields are report provenance; only their sum participates in
+    /// the elapsed-time formula.
+    double scalarPrologueSystemCycles = 0.0;
+    double scalarEpilogueSystemCycles = 0.0;
+    double systemCounterFrequencyMHz = 0.0;
+    double baseSelectionScore = 0.0;
+    double predictedSystemCounterCycles = 0.0;
+    double predictedMicroseconds = 0.0;
+
+    llvm::json::Object toJSON() const;
+  } selectedRouteElapsed;
   bool allSimdCandidateLegal = true;
   bool allSimtOnlyCandidateLegal = true;
   bool mixedCandidateLegal = false;
@@ -119,6 +183,7 @@ struct SimdSimtCostReport {
   SimdSimtFeatureSummary features;
   StageCostModelSummary stageModel;
   bool includeFeaturesInJSON = true;
+  bool includeDiagnosticStageDetailsInJSON = true;
 
   llvm::json::Object toJSON() const;
   void printJSON(llvm::raw_ostream &os, bool pretty = true) const;

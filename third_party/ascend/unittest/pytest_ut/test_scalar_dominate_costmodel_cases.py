@@ -537,7 +537,7 @@ def test_costmodel_padded_copy_wgrad(tmp_path):
     launch()
     torch.npu.synchronize()
     torch.testing.assert_close(output.cpu().float(), expected, rtol=1e-2, atol=1e-2)
-    _load_route_report(report_path, "all_simt_only")
+    _load_route_report(report_path, "all_simd")
 
 
 @simd_simt_910_95_only
@@ -640,4 +640,4 @@ def test_costmodel_binned_copy_wgrad(tmp_path):
     launch()
     torch.npu.synchronize()
     torch.testing.assert_close(output.cpu().float(), expected, rtol=1e-2, atol=1e-2)
-    _load_route_report(report_path, "all_simt_only")
+    _load_route_report(report_path, "all_simd")

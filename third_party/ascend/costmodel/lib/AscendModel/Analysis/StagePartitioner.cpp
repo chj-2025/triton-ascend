@@ -3,13 +3,18 @@
 #include "AscendModel/Analysis/StagePartitioner.h"
 #include "ascend/include/Utils/SuperBlockFactor.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -25,13 +30,18 @@ using namespace mlir::ascend;
 namespace {
 
 static void recomputeIssueElements(StageWorkload &work) {
-  double elements = work.scalarOperations;
+  double elements =
+      work.scalarOperations + work.scalarLoadCount + work.scalarStoreCount;
   for (const auto &[size, count] : work.predicateCounts)
     elements += static_cast<double>(size) * count;
   for (const auto &entry : work.operationCounts)
     for (const auto &[size, count] : entry.second)
       elements += static_cast<double>(size) * count;
-  elements += 32.0 * (work.loadWarpInstructions + work.storeWarpInstructions);
+  elements +=
+      32.0 *
+      (work.loadWarpInstructions + work.storeWarpInstructions +
+       work.sharedLocalLoadInstructions + work.sharedLocalStoreInstructions +
+       work.privateStackLoadInstructions + work.privateStackStoreInstructions);
   for (const AtomicWorkload &atomic : work.atomicWorkloads)
     elements += atomic.logicalElements;
   work.issueElements = elements;
@@ -69,9 +79,10 @@ static bool isPointerLikeType(Type type) {
 static std::optional<unsigned> getMemoryMaskOperandIndex(Operation *operation);
 static bool isMemoryMaskOnlyValue(Value value);
 static bool shouldSplitLoopBodyIntoStages(Operation *operation);
+static bool isGridStrideLoop(Operation *operation);
 
 /// True when a loop argument only participates in address induction or in
-/// masking the accesses that addressing guards.  Such a value is an
+/// masking the accesses that addressing guards. Such a value is an
 /// implementation recurrence that later pointer canonicalization can
 /// eliminate; it is not an algorithmic loop-carried dependency and must not
 /// disable the SIMD independent-loop roofline model.
@@ -96,7 +107,7 @@ static bool isAddressOnlyLoopValue(Value root) {
       }
       if (name == "arith.cmpi" || name == "arith.cmpf") {
         // A comparison feeding only memory masks is addressing boundary
-        // logic (e.g. a per-iteration bound), not a data recurrence.
+        // logic, rather than a data recurrence.
         if (!llvm::all_of(user->getResults(), isMemoryMaskOnlyValue))
           return false;
         reachesAddressUse = true;
@@ -136,6 +147,12 @@ static double getValueBytes(Value value) {
 }
 
 static double getOperationElements(Operation *operation) {
+  // Histogram result width is the number of bins, while the helper consumes
+  // every source element.  Counting only the result made M=256 and M=2048
+  // indistinguishable whenever BINS was unchanged.
+  if (operation->getName().getStringRef() == "tt.histogram" &&
+      operation->getNumOperands() > 0)
+    return getTypeElementCount(operation->getOperand(0).getType());
   double elements = 1.0;
   for (Type type : operation->getResultTypes())
     elements = std::max(elements, getTypeElementCount(type));
@@ -150,24 +167,147 @@ static bool hasTensorResult(Operation *operation) {
                       [](Type type) { return isa<ShapedType>(type); });
 }
 
-static llvm::StringRef getProfileOperationName(Operation *operation) {
+static bool isDotOperationName(llvm::StringRef name) {
+  return name == "tt.dot" || name == "tt.dot_scaled";
+}
+
+/// Return true when an otherwise-unclassified TTIR operation represents
+/// numeric execution rather than shape, address, layout, or bookkeeping work.
+/// These operations use the measured FP32 saturated arithmetic rate as a
+/// conservative execution lower bound until an operation-specific rate is
+/// available. Keep the original operation name in the workload key so reports
+/// show exactly which TTIR computation consumed the fallback.
+static bool isSaturatedComputeFallback(Operation *operation) {
+  if (!operation)
+    return false;
   const llvm::StringRef name = operation->getName().getStringRef();
-  return llvm::StringSwitch<llvm::StringRef>(name)
+  if (name == "arith.constant" || name == "arith.cmpi" ||
+      name == "arith.cmpf" || name == "arith.select" ||
+      name == "arith.bitcast" || name == "tt.bitcast" ||
+      name == "tt.int_to_ptr" || name == "tt.ptr_to_int" ||
+      name == "tt.addptr" || name == "tt.advance" || name == "tt.splat" ||
+      name == "tt.unsplat" || name == "tt.broadcast" ||
+      name == "tt.expand_dims" || name == "tt.reshape" || name == "tt.cat" ||
+      name == "tt.join" || name == "tt.split" || name == "tt.make_range" ||
+      name == "tt.get_program_id" || name == "tt.get_num_programs" ||
+      name == "tt.make_tensor_ptr" || name == "tt.make_tensor_descriptor" ||
+      name == "tt.load" || name == "tt.store" || name == "tt.gather" ||
+      name == "tt.atomic_rmw" || name == "tt.atomic_cas" || name == "tt.dot" ||
+      name == "tt.dot_scaled" || name == "tt.reduce" || name == "tt.scan" ||
+      name == "tt.histogram" || name == "tt.trans" ||
+      name == "tt.descriptor_load" || name == "tt.descriptor_store" ||
+      name == "tt.descriptor_reduce" || name == "tt.descriptor_gather" ||
+      name == "tt.descriptor_scatter")
+    return false;
+
+  const bool hasNumericResult =
+      llvm::any_of(operation->getResultTypes(), [](Type type) {
+        Type scalar = getScalarElementType(type);
+        return isa<FloatType, IntegerType, IndexType>(scalar);
+      });
+  const bool hasNumericOperand =
+      llvm::any_of(operation->getOperandTypes(), [](Type type) {
+        Type scalar = getScalarElementType(type);
+        return isa<FloatType, IntegerType, IndexType>(scalar);
+      });
+
+  // Arithmetic and math dialect operations with a numeric result are
+  // executable ALU work. Specific high-cost operations are mapped before this
+  // fallback; this branch guarantees that the remaining TTIR operations do
+  // not disappear from C_compute.
+  if (name.starts_with("arith.") || name.starts_with("math."))
+    return hasNumericResult;
+
+  // Triton elementwise operations that survive into TTIR. Pointer/shape/view
+  // operations are deliberately absent: they are accounted by address issue,
+  // memory geometry, or layout models rather than FP32 arithmetic throughput.
+  if (name == "tt.mulhiui" || name == "tt.extern_elementwise")
+    return hasNumericResult;
+  if (name == "tt.elementwise_inline_asm")
+    return hasNumericResult ||
+           (operation->getNumResults() == 0 && hasNumericOperand);
+
+  // Registered elementwise numeric ops and future TTIR numeric ops both keep a
+  // non-zero execution floor; pointer-valued operations remain excluded.
+  if (!operation->hasTrait<OpTrait::Elementwise>())
+    // Keep future TTIR numeric execution visible even when the new operation
+    // does not declare Elementwise.  Every currently structural, address,
+    // memory, collective and layout-only TT operation is excluded above; an
+    // unrecognized numeric TT result is safer as a named non-zero execution
+    // lower bound than as a silent issue-only operation.
+    return name.starts_with("tt.") && hasNumericResult;
+  return hasNumericResult;
+}
+
+static std::string getProfileOperationName(Operation *operation) {
+  const llvm::StringRef name = operation->getName().getStringRef();
+  if (name == "tt.histogram") {
+    for (Type type : operation->getResultTypes())
+      if (getScalarBitWidth(type) == 32)
+        return "histogram.i32";
+  }
+  if (name == "tt.extern_elementwise") {
+    // Extern elementwise is a transport op: the symbol carries the actual
+    // numerical semantics.  Reuse a measured execution class only when the
+    // mapping is unambiguous.  Unknown helpers retain the symbol in their
+    // fallback key so a later microbenchmark can override that helper without
+    // adding another C++ allowlist entry.
+    if (auto symbol = operation->getAttrOfType<StringAttr>("symbol")) {
+      const llvm::StringRef value = symbol.getValue();
+      if (value.contains("relu"))
+        return "f32.relu";
+      if (value.contains("isinf") || value.contains("isnan") ||
+          value.contains("finite"))
+        return "predicate.cmp";
+      if (value.contains("fast_divide") || value.contains("recip") ||
+          value.contains("rcp_") || value.contains("div_r"))
+        return "f32.div";
+      if (value.contains("sqrt_"))
+        return "f32.sqrt";
+      if (value.contains("fast_exp") || value.contains("exp10"))
+        return "f32.exp";
+      if (value.contains("log1p") || value.contains("fast_log"))
+        return "f32.log";
+      if (value.contains("fast_cos"))
+        return "f32.cos";
+      if (value.contains("saturate"))
+        return "f32.clamp";
+      if (value.contains("add_r"))
+        return "f32.add";
+      if (value.contains("sub_r"))
+        return "f32.sub";
+      if (value.contains("mul_r"))
+        return "f32.mul";
+      return (llvm::Twine("fp32.saturated.tt.extern_elementwise.") + value)
+          .str();
+    }
+    return "fp32.saturated.tt.extern_elementwise";
+  }
+  return llvm::StringSwitch<std::string>(name)
       .Cases("arith.addf", "tt.add", "f32.add")
       .Case("arith.subf", "f32.sub")
       .Case("arith.mulf", "f32.mul")
       .Case("arith.divf", "f32.div")
-      .Cases("arith.maximumf", "arith.maxnumf", "f32.max")
+      .Cases("arith.maximumf", "arith.maxnumf", "arith.minimumf",
+             "arith.minnumf", "f32.max")
       .Cases("math.absf", "tt.abs", "f32.abs")
       .Cases("math.exp", "tt.exp", "f32.exp")
       .Cases("math.log", "tt.log", "f32.log")
-      .Cases("math.sin", "tt.sin", "f32.sin")
-      .Cases("math.cos", "tt.cos", "f32.cos")
-      .Cases("tt.trans", "linalg.transpose", "f32.trans")
+      .Cases("math.sqrt", "tt.precise_sqrt", "f32.sqrt")
+      .Case("tt.precise_divf", "f32.div")
+      .Case("math.cos", "f32.cos")
+      .Cases("math.isfinite", "math.isnan", "math.isinf", "predicate.cmp")
+      .Case("arith.select", "predicate.select")
+      .Case("tt.clampf", "f32.clamp")
       .Cases("arith.extf", "arith.truncf", "arith.sitofp", "arith.uitofp",
              "convert.cast")
-      .Cases("arith.fptosi", "arith.fptoui", "convert.cast")
-      .Default("generic.issue");
+      .Cases("arith.fptosi", "arith.fptoui", "arith.extsi", "arith.extui",
+             "arith.trunci", "arith.index_cast", "arith.index_castui",
+             "tt.fp_to_fp", "convert.cast")
+      .Case("tt.trans", "layout.transpose")
+      .Default(isSaturatedComputeFallback(operation)
+                   ? (llvm::Twine("fp32.saturated.") + name).str()
+                   : std::string("generic.issue"));
 }
 
 static RankedTensorType getRepresentativeTensorType(Operation *operation) {
@@ -191,12 +331,9 @@ static RankedTensorType getRepresentativeTensorType(Operation *operation) {
   return representative;
 }
 
-// Project the dense, static pointwise subset of HIVM's uniform reassociation.
-// Flatten first drops unit dimensions, then merges adjacent dimensions only
-// when all operands agree on their broadcast role. The returned width is the
-// final collapse group's extent, not the original TTIR last dimension.
-// Physical UB strides, inline transposes and inter-op layout constraints are
-// not present in TTIR: this is a projection, not an invocation of lowering.
+/// Project the dense static subset of HIVM's pointwise reassociation. Unit
+/// axes disappear; adjacent axes merge only while every tensor operand keeps
+/// the same broadcast role. The final run is the SIMD segment width.
 static int64_t getPostFlattenPointwiseRun(Operation *operation,
                                           RankedTensorType outputType) {
   SmallVector<int64_t> activeAxes;
@@ -216,14 +353,11 @@ static int64_t getPostFlattenPointwiseRun(Operation *operation,
     if (!input || !input.hasStaticShape() ||
         input.getRank() != outputType.getRank())
       continue;
-    // A scalar splat does not introduce a row boundary.
     if (input.getNumElements() == 1)
       continue;
     for (size_t i = 1; i < activeAxes.size(); ++i) {
       const int64_t left = activeAxes[i - 1];
       const int64_t right = activeAxes[i];
-      // HIVM's broadcast path checks input consistency as well as target
-      // dimensions; do not merge across either side of a broadcast axis.
       if (input.getDimSize(left) != outputType.getDimSize(left) ||
           input.getDimSize(right) != outputType.getDimSize(right))
         mergeWithPrevious[i] = false;
@@ -235,40 +369,30 @@ static int64_t getPostFlattenPointwiseRun(Operation *operation,
   return run;
 }
 
-static void accumulateTensorOperationWorkload(Operation *operation,
-                                              llvm::StringRef profileName,
-                                              double elements,
-                                              StageWorkload &work) {
-  RankedTensorType tensor = getRepresentativeTensorType(operation);
+static void accumulateTensorOperationWorkload(
+    Operation *operation, llvm::StringRef profileName, double elements,
+    StageWorkload &work, RankedTensorType mappedTensor = {}) {
+  RankedTensorType tensor =
+      mappedTensor ? mappedTensor : getRepresentativeTensorType(operation);
   if (!tensor || tensor.getRank() == 0 || !tensor.hasStaticShape())
     return;
-  int64_t elementBits = getScalarBitWidth(tensor.getElementType());
-  // Comparison results are i1 masks, not the width of the compared data.
+  int64_t elementBits =
+      mappedTensor && operation->getNumResults() > 0
+          ? getScalarBitWidth(operation->getResult(0).getType())
+          : getScalarBitWidth(tensor.getElementType());
   if (profileName == "predicate.cmp")
     for (Value operand : operation->getOperands())
       elementBits = std::max(elementBits, getScalarBitWidth(operand.getType()));
-  // TTIR rank is not physical vector geometry: Auto Flatten can collapse
-  // dense pointwise operations, including rows shorter than a data block.
-  // Geometry follows operation semantics, not the profile's lookup key.
-  // Integer arithmetic/select may use generic.issue but are still pointwise.
-  // Non-pointwise operations retain their original segment estimate.
-  const bool knownPointwise = operation->hasTrait<OpTrait::Elementwise>();
+  const bool knownPointwise =
+      mappedTensor || operation->hasTrait<OpTrait::Elementwise>();
   const int64_t contiguousElements =
       knownPointwise ? getPostFlattenPointwiseRun(operation, tensor)
                      : tensor.getShape().back();
   if (elementBits <= 0 || contiguousElements <= 0)
     return;
   const double segments = elements / static_cast<double>(contiguousElements);
-  // An empty or unknown-geometry tensor clamps its element count to one,
-  // which can yield a fractional segment count. Fractional geometry does
-  // not describe a real tensor; skip the group so mapWorkload falls back
-  // to the legacy per-operation estimate instead of underpricing it.
   if (segments <= 0.0 || segments != std::floor(segments))
     return;
-  // Shape alone does not prove scalar lowering, especially on the register
-  // vector backend. Do not infer it from the pre-flatten row stride.
-  // TODO: Model scalar fallback only from proven lowered layout information.
-
   for (TensorOperationWorkload &group : work.tensorOperationWorkloads) {
     if (group.operation == profileName &&
         group.elementBitWidth == elementBits &&
@@ -278,14 +402,11 @@ static void accumulateTensorOperationWorkload(Operation *operation,
       return;
     }
   }
-  TensorOperationWorkload group;
-  group.operation = profileName.str();
-  group.elementBitWidth = elementBits;
-  group.logicalElements = elements;
-  group.segmentCount = segments;
-  group.contiguousElementsPerSegment = contiguousElements;
-  work.tensorOperationWorkloads.push_back(std::move(group));
+  work.tensorOperationWorkloads.push_back(
+      {profileName.str(), elementBits, elements, segments, contiguousElements});
 }
+
+static std::optional<std::string> describeDotOperandPath(Operation *operation);
 
 static void accumulateDotWorkload(Operation *operation, StageWorkload &work) {
   if (operation->getNumOperands() < 2)
@@ -295,9 +416,26 @@ static void accumulateDotWorkload(Operation *operation, StageWorkload &work) {
   if (!lhs || !rhs || !lhs.hasStaticShape() || !rhs.hasStaticShape() ||
       lhs.getRank() < 2 || rhs.getRank() < 2)
     return;
-  const int64_t m = lhs.getShape()[lhs.getRank() - 2];
-  const int64_t k = lhs.getShape()[lhs.getRank() - 1];
-  const int64_t n = rhs.getShape()[rhs.getRank() - 1];
+  int64_t m = lhs.getShape()[lhs.getRank() - 2];
+  int64_t k = lhs.getShape()[lhs.getRank() - 1];
+  int64_t n = rhs.getShape()[rhs.getRank() - 1];
+  if (operation->getNumResults() > 0) {
+    auto result = dyn_cast<ShapedType>(operation->getResult(0).getType());
+    if (result && result.hasStaticShape() && result.getRank() >= 2) {
+      // The dot_scaled result always carries logical M/N even when an E2M1
+      // input physically packs two FP4 values into one i8 dimension.
+      m = result.getShape()[result.getRank() - 2];
+      n = result.getShape()[result.getRank() - 1];
+    }
+  }
+  if (auto scaled = dyn_cast<triton::DotScaledOp>(operation)) {
+    if (scaled.getAElemType() == triton::ScaleDotElemType::E2M1 &&
+        scaled.getLhsKPack()) {
+      if (k > std::numeric_limits<int64_t>::max() / 2)
+        return;
+      k *= 2;
+    }
+  }
   double batch = 1.0;
   for (int64_t dim : lhs.getShape().drop_back(2))
     batch *= static_cast<double>(dim);
@@ -311,11 +449,282 @@ static void accumulateDotWorkload(Operation *operation, StageWorkload &work) {
     work.dotOperations += batch;
     work.dotFlopCounts[flopsPerMatrix] += batch;
     work.dotFlops += static_cast<double>(flopsPerMatrix) * batch;
+    if (auto path = describeDotOperandPath(operation)) {
+      auto &entry = work.dotOperandPaths[*path];
+      entry.first = flopsPerMatrix;
+      entry.second += batch;
+    }
   }
 }
 
+/// Classify a scan from the operation that directly defines each
+/// tt.scan.return operand. Diagnostic operations in the combine region (for
+/// example integer-overflow assertions) are deliberately ignored because
+/// they do not define the associative value returned by the region.
+static std::string classifyScanCombine(Operation *scan) {
+  if (!scan || scan->getName().getStringRef() != "tt.scan" ||
+      scan->getNumRegions() == 0)
+    return "other";
+  std::optional<std::string> result;
+  for (Region &region : scan->getRegions()) {
+    if (region.empty())
+      return "other";
+    for (Block &block : region) {
+      Operation *terminator = block.getTerminator();
+      if (!terminator ||
+          terminator->getName().getStringRef() != "tt.scan.return" ||
+          terminator->getNumOperands() == 0)
+        return "other";
+      for (Value returned : terminator->getOperands()) {
+        Operation *combine = returned.getDefiningOp();
+        if (!combine)
+          return "other";
+        const llvm::StringRef name = combine->getName().getStringRef();
+        std::string kind;
+        if (name == "arith.addf" || name == "arith.addi")
+          kind = "add";
+        else if (name == "arith.mulf" || name == "arith.muli")
+          kind = "mul";
+        else if (name == "arith.maximumf" || name == "arith.minimumf" ||
+                 name == "arith.maxnumf" || name == "arith.minnumf" ||
+                 name == "arith.maxsi" || name == "arith.maxui" ||
+                 name == "arith.minsi" || name == "arith.minui")
+          kind = "minmax";
+        else
+          return "other";
+        if (result && *result != kind)
+          return "other";
+        result = std::move(kind);
+      }
+    }
+  }
+  return result.value_or("other");
+}
+
+static std::string classifyReductionCombine(Operation *reduce) {
+  if (!reduce || reduce->getName().getStringRef() != "tt.reduce" ||
+      reduce->getNumRegions() == 0)
+    return "other";
+  std::optional<std::string> result;
+  for (Region &region : reduce->getRegions()) {
+    if (region.empty())
+      return "other";
+    for (Block &block : region) {
+      Operation *terminator = block.getTerminator();
+      if (!terminator ||
+          terminator->getName().getStringRef() != "tt.reduce.return" ||
+          terminator->getNumOperands() == 0)
+        return "other";
+      for (Value returned : terminator->getOperands()) {
+        Operation *combine = returned.getDefiningOp();
+        if (!combine)
+          return "other";
+        const llvm::StringRef name = combine->getName().getStringRef();
+        std::string kind;
+        if (name == "arith.addf" || name == "arith.addi")
+          kind = "add";
+        else if (name == "arith.mulf" || name == "arith.muli")
+          kind = "mul";
+        else if (name == "arith.maximumf" || name == "arith.minimumf" ||
+                 name == "arith.maxnumf" || name == "arith.minnumf" ||
+                 name == "arith.maxsi" || name == "arith.minsi" ||
+                 name == "arith.maxui" || name == "arith.minui")
+          kind = "minmax";
+        else
+          return "other";
+        if (result && *result != kind)
+          return "other";
+        result = std::move(kind);
+      }
+    }
+  }
+  return result.value_or("other");
+}
+
+static std::optional<int64_t> getConstantInteger(Value value);
+
+static bool isZeroConstant(Value value) {
+  Operation *definition = value.getDefiningOp();
+  if (!definition || definition->getName().getStringRef() != "arith.constant")
+    return false;
+  Attribute attribute = definition->getAttr("value");
+  if (auto integer = dyn_cast_or_null<IntegerAttr>(attribute))
+    return integer.getValue().isZero();
+  if (auto floating = dyn_cast_or_null<FloatAttr>(attribute))
+    return floating.getValue().isZero();
+  auto dense = dyn_cast_or_null<DenseElementsAttr>(attribute);
+  if (!dense || !dense.isSplat())
+    return false;
+  if (isa<IntegerType>(dense.getElementType()))
+    return dense.getSplatValue<APInt>().isZero();
+  if (isa<FloatType>(dense.getElementType()))
+    return dense.getSplatValue<APFloat>().isZero();
+  return false;
+}
+
+static bool valueDependsOn(Value value, Value dependency, unsigned depth = 0) {
+  if (value == dependency)
+    return true;
+  Operation *definition = value.getDefiningOp();
+  if (!definition || depth >= 24)
+    return false;
+  return llvm::any_of(definition->getOperands(), [&](Value operand) {
+    return valueDependsOn(operand, dependency, depth + 1);
+  });
+}
+
+static bool valueTreeHasOperation(Value value, llvm::StringRef operationName,
+                                  unsigned depth = 0) {
+  Operation *definition = value.getDefiningOp();
+  if (!definition || depth >= 24)
+    return false;
+  if (definition->getName().getStringRef() == operationName)
+    return true;
+  return llvm::any_of(definition->getOperands(), [&](Value operand) {
+    return valueTreeHasOperation(operand, operationName, depth + 1);
+  });
+}
+
+static bool maskProvesPrefixBound(Value mask, Value bound, unsigned depth = 0) {
+  Operation *definition = mask.getDefiningOp();
+  if (!definition || depth >= 16)
+    return false;
+  if (auto conjunction = dyn_cast<arith::AndIOp>(definition))
+    return maskProvesPrefixBound(conjunction.getLhs(), bound, depth + 1) ||
+           maskProvesPrefixBound(conjunction.getRhs(), bound, depth + 1);
+  if ((definition->getName().getStringRef() == "tt.broadcast" ||
+       definition->getName().getStringRef() == "tt.expand_dims") &&
+      definition->getNumOperands() == 1)
+    return maskProvesPrefixBound(definition->getOperand(0), bound, depth + 1);
+  auto comparison = dyn_cast<arith::CmpIOp>(definition);
+  if (!comparison)
+    return false;
+  const bool lhsIsRange =
+      valueTreeHasOperation(comparison.getLhs(), "tt.make_range");
+  const bool rhsIsRange =
+      valueTreeHasOperation(comparison.getRhs(), "tt.make_range");
+  const bool lhsIsBound = valueDependsOn(comparison.getLhs(), bound);
+  const bool rhsIsBound = valueDependsOn(comparison.getRhs(), bound);
+  switch (comparison.getPredicate()) {
+  case arith::CmpIPredicate::slt:
+  case arith::CmpIPredicate::ult:
+  case arith::CmpIPredicate::sle:
+  case arith::CmpIPredicate::ule:
+    return lhsIsRange && rhsIsBound;
+  case arith::CmpIPredicate::sgt:
+  case arith::CmpIPredicate::ugt:
+  case arith::CmpIPredicate::sge:
+  case arith::CmpIPredicate::uge:
+    return lhsIsBound && rhsIsRange;
+  default:
+    return false;
+  }
+}
+
+struct MaskedAccumulatorDerivation {
+  bool valid = false;
+  bool hasMatchingLoad = false;
+};
+
+/// Prove that a loop contribution is composed only from constants and
+/// arithmetic rooted in zero-filled loads guarded by the loop's active-prefix
+/// bound. Unknown operations and external block arguments stop the proof.
+static MaskedAccumulatorDerivation
+analyzeMaskedAccumulatorContribution(Value value, Value bound,
+                                     unsigned depth = 0) {
+  if (depth >= 24)
+    return {};
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return {};
+  const llvm::StringRef name = definition->getName().getStringRef();
+  if (name == "arith.constant")
+    return {true, false};
+  if (name == "tt.load") {
+    auto maskIndex = getMemoryMaskOperandIndex(definition);
+    if (!maskIndex || *maskIndex >= definition->getNumOperands() ||
+        definition->getNumOperands() <= *maskIndex + 1 ||
+        !maskProvesPrefixBound(definition->getOperand(*maskIndex), bound) ||
+        !isZeroConstant(
+            definition->getOperand(definition->getNumOperands() - 1)))
+      return {};
+    return {true, true};
+  }
+  const bool allowed = name.starts_with("arith.") || name == "tt.splat" ||
+                       name == "tt.broadcast" || name == "tt.expand_dims" ||
+                       name == "tt.reshape" || name == "tt.trans";
+  if (!allowed || definition->getNumOperands() == 0)
+    return {};
+  MaskedAccumulatorDerivation result{true, false};
+  for (Value operand : definition->getOperands()) {
+    auto child =
+        analyzeMaskedAccumulatorContribution(operand, bound, depth + 1);
+    if (!child.valid)
+      return {};
+    result.hasMatchingLoad |= child.hasMatchingLoad;
+  }
+  return result;
+}
+
+/// Return the exact active reduction extent when the reduction operand is a
+/// physically wide accumulator produced by one loop iteration. The proof is
+/// deliberately narrow: zero init, additive loop carry, and a zero-filled
+/// prefix-masked load using the same exact runtime upper bound.
+static std::optional<int64_t>
+getOneTripMaskedAccumulatorExtent(Operation *reduction,
+                                  int64_t physicalExtent) {
+  if (!reduction || reduction->getNumOperands() == 0 || physicalExtent <= 1)
+    return std::nullopt;
+  auto loopResult = dyn_cast<OpResult>(reduction->getOperand(0));
+  if (!loopResult)
+    return std::nullopt;
+  Operation *loop = loopResult.getOwner();
+  if (!loop || loop->getName().getStringRef() != "scf.for" ||
+      loop->getNumOperands() < 4 || loop->getNumRegions() != 1 ||
+      loop->getRegion(0).empty())
+    return std::nullopt;
+  const unsigned resultNumber = loopResult.getResultNumber();
+  if (3 + resultNumber >= loop->getNumOperands() ||
+      !isZeroConstant(loop->getOperand(3 + resultNumber)))
+    return std::nullopt;
+  const auto lower = getConstantInteger(loop->getOperand(0));
+  const auto upper = getConstantInteger(loop->getOperand(1));
+  const auto step = getConstantInteger(loop->getOperand(2));
+  if (!lower || !upper || !step || *step <= 0 || *upper <= *lower)
+    return std::nullopt;
+  const uint64_t distance = uint64_t(*upper) - uint64_t(*lower);
+  if (distance > uint64_t(*step) || distance > uint64_t(physicalExtent))
+    return std::nullopt;
+  Block &body = loop->getRegion(0).front();
+  Operation *yield = body.getTerminator();
+  if (!yield || yield->getName().getStringRef() != "scf.yield" ||
+      resultNumber >= yield->getNumOperands() ||
+      1 + resultNumber >= body.getNumArguments())
+    return std::nullopt;
+  Value yielded = yield->getOperand(resultNumber);
+  Operation *addition = yielded.getDefiningOp();
+  if (!addition ||
+      (addition->getName().getStringRef() != "arith.addf" &&
+       addition->getName().getStringRef() != "arith.addi") ||
+      addition->getNumOperands() != 2)
+    return std::nullopt;
+  Value carried = body.getArgument(1 + resultNumber);
+  Value contribution;
+  if (addition->getOperand(0) == carried)
+    contribution = addition->getOperand(1);
+  else if (addition->getOperand(1) == carried)
+    contribution = addition->getOperand(0);
+  else
+    return std::nullopt;
+  auto derivation =
+      analyzeMaskedAccumulatorContribution(contribution, loop->getOperand(1));
+  if (!derivation.valid || !derivation.hasMatchingLoad)
+    return std::nullopt;
+  return static_cast<int64_t>(distance);
+}
+
 static void accumulateReductionWorkload(Operation *operation,
-                                        StageWorkload &work, bool isScan) {
+                                        StageWorkload &work) {
   if (operation->getNumOperands() == 0)
     return;
   auto input = dyn_cast<ShapedType>(operation->getOperand(0).getType());
@@ -333,15 +742,45 @@ static void accumulateReductionWorkload(Operation *operation,
   if (operation->getName().getStringRef() == "tt.scan") {
     const int64_t totalElements = input.getNumElements();
     const int64_t independentSequences = totalElements / extent;
+    int64_t axisStride = 1;
+    for (int64_t axisIndex = dimension + 1; axisIndex < input.getRank();
+         ++axisIndex)
+      axisStride *= input.getShape()[axisIndex];
+    const auto reverse = operation->getAttrOfType<mlir::BoolAttr>("reverse");
     if (independentSequences > 0)
-      work.prefixScanCounts[{extent, independentSequences}] += 1.0;
+      work.prefixScanCounts[{extent, independentSequences, axisStride,
+                             static_cast<int64_t>(operation->getNumResults()),
+                             reverse && reverse.getValue(),
+                             classifyScanCombine(operation)}] += 1.0;
     return;
   }
-  const double depth = std::ceil(std::log2(static_cast<double>(extent)));
-  const double steps = getTypeElementCount(input) * depth;
-  work.shuffleLaneSteps += steps;
-  if (isScan)
-    work.scanShuffleLaneSteps += steps;
+  const int64_t independentRows = input.getNumElements() / extent;
+  int64_t effectiveExtent = extent;
+  if (auto active = getOneTripMaskedAccumulatorExtent(operation, extent)) {
+    effectiveExtent = *active;
+    work.oneTripMaskedAccumulatorReductionExtents[{extent, effectiveExtent}] +=
+        1.0;
+  }
+  const double depth =
+      effectiveExtent > 1
+          ? std::ceil(std::log2(static_cast<double>(effectiveExtent)))
+          : 0.0;
+  work.reductionOperations += 1.0;
+  if (operation->getName().getStringRef() == "tt.reduce")
+    work.reductionCombineClassCounts[classifyReductionCombine(operation)] +=
+        1.0;
+  work.shuffleLaneSteps += static_cast<double>(independentRows) *
+                           static_cast<double>(effectiveExtent) * depth;
+  const int64_t elementBits = getScalarBitWidth(input.getElementType());
+  if (independentRows > 0 && elementBits > 0) {
+    work.reductionGeometryCounts[{independentRows, extent, elementBits}] += 1.0;
+    if (operation->getName().getStringRef() == "tt.reduce" &&
+        operation->getNumResults() > 1)
+      work.scalarizedMultiResultReductionCounts[{
+          independentRows, extent,
+          static_cast<int64_t>(operation->getNumResults()), elementBits}] +=
+          1.0;
+  }
 }
 
 static bool blockPointerCanUseFlatMemoryCurve(Value pointer, Type valueType);
@@ -349,15 +788,285 @@ static StageMemoryAccess describeMemoryAccess(Operation *operation,
                                               Value pointer, Type valueType,
                                               bool store);
 
-static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
+static double getNonNegativeNumericAttr(Operation *operation,
+                                        llvm::ArrayRef<llvm::StringRef> names) {
+  for (llvm::StringRef name : names) {
+    Attribute attr = operation->getAttr(name);
+    if (auto integer = dyn_cast_or_null<IntegerAttr>(attr))
+      return std::max(0.0, static_cast<double>(integer.getInt()));
+    if (auto floating = dyn_cast_or_null<FloatAttr>(attr))
+      return std::max(0.0, floating.getValueAsDouble());
+  }
+  return 0.0;
+}
+
+static bool hasNumericAttr(Operation *operation,
+                           llvm::ArrayRef<llvm::StringRef> names) {
+  for (llvm::StringRef name : names)
+    if (operation->hasAttr(name))
+      return true;
+  return false;
+}
+
+static void accumulateGeneratedTraffic(Operation *operation,
+                                       StageWorkload &work) {
+  work.sharedLocalLoadInstructions += getNonNegativeNumericAttr(
+      operation, {"ascend.simt.shared_local_load_instructions",
+                  "ascend.simt.shared_local_load_warp_instructions"});
+  work.sharedLocalStoreInstructions += getNonNegativeNumericAttr(
+      operation, {"ascend.simt.shared_local_store_instructions",
+                  "ascend.simt.shared_local_store_warp_instructions"});
+  work.privateStackLoadInstructions += getNonNegativeNumericAttr(
+      operation, {"ascend.simt.private_stack_load_instructions",
+                  "ascend.simt.private_stack_load_warp_instructions"});
+  work.privateStackStoreInstructions += getNonNegativeNumericAttr(
+      operation, {"ascend.simt.private_stack_store_instructions",
+                  "ascend.simt.private_stack_store_warp_instructions"});
+}
+
+static bool isScalarLoadOperation(Operation *operation);
+static bool isScalarStoreOperation(Operation *operation);
+
+static std::string getAtomicEnumName(Operation *operation,
+                                     llvm::StringRef attribute,
+                                     llvm::ArrayRef<llvm::StringRef> names) {
+  auto value = operation->getAttrOfType<IntegerAttr>(attribute);
+  if (!value || value.getInt() < 0 ||
+      static_cast<size_t>(value.getInt()) >= names.size() ||
+      names[value.getInt()].empty())
+    return "unknown";
+  return names[value.getInt()].str();
+}
+
+static AtomicWorkload getAtomicWorkload(Operation *operation) {
+  static const llvm::StringRef rmwNames[] = {"",     "and",  "or",  "xor",
+                                             "add",  "fadd", "max", "min",
+                                             "umax", "umin", "exch"};
+  static const llvm::StringRef semanticNames[] = {"", "relaxed", "acquire",
+                                                  "release", "acq_rel"};
+  static const llvm::StringRef scopeNames[] = {"", "gpu", "cta", "sys"};
+  const llvm::StringRef name = operation->getName().getStringRef();
+  AtomicWorkload atomic;
+  atomic.kind = name == "tt.atomic_cas"
+                    ? "cas"
+                    : getAtomicEnumName(operation, "atomic_rmw_op", rmwNames);
+  atomic.memorySemantic = getAtomicEnumName(operation, "sem", semanticNames);
+  atomic.memoryScope = getAtomicEnumName(operation, "scope", scopeNames);
+  const unsigned valueOperand = name == "tt.atomic_cas" ? 2 : 1;
+  Value value = operation->getNumOperands() > valueOperand
+                    ? operation->getOperand(valueOperand)
+                    : Value{};
+  Type elementType = value ? getScalarElementType(value.getType()) : Type{};
+  atomic.dataType = elementType ? typeToString(elementType) : "unknown";
+  atomic.logicalElements = value ? getTypeElementCount(value.getType()) : 0.0;
+  atomic.logicalOperationInstances = 1.0;
+  atomic.resultUsed =
+      operation->getNumResults() > 0 && !operation->getResult(0).use_empty();
+  atomic.addressDependsOnLoadedIndex =
+      isLoadedIndexDependentMemoryOp(operation);
+  if (operation->getNumOperands() > 0 && value) {
+    const StageMemoryAccess access = describeMemoryAccess(
+        operation, operation->getOperand(0), value.getType(), /*store=*/true);
+    atomic.provenContiguousRunWidth =
+        static_cast<double>(access.provenContiguousElements());
+  }
+  atomic.contentionUnknown = true;
+  return atomic;
+}
+
+static bool isDiagnosticAssertionSink(Operation *operation) {
+  if (!operation)
+    return false;
+  const llvm::StringRef name = operation->getName().getStringRef();
+  return name == "tt.assert" || name == "cf.assert";
+}
+
+/// Return whether an operation is a side-effect-free building block emitted
+/// only to compute a diagnostic assertion condition.  Keep this list narrow:
+/// an operation is excluded from the workload only when every result use also
+/// reaches an assertion through this same allowlist.
+static bool isDiagnosticAssertionSupport(Operation *operation) {
+  if (!operation || operation->getNumRegions() != 0)
+    return false;
+  return llvm::StringSwitch<bool>(operation->getName().getStringRef())
+      .Cases("arith.constant", "arith.extsi", "arith.extui", true)
+      .Cases("arith.trunci", "arith.index_cast", "arith.index_castui", true)
+      .Cases("arith.addi", "arith.subi", "arith.muli", true)
+      .Cases("arith.cmpi", "arith.andi", "arith.ori", true)
+      .Cases("arith.xori", "arith.select", "tt.splat", true)
+      .Case("tt.broadcast", true)
+      .Default(false);
+}
+
+static bool isElidedDiagnosticOnlyOperationImpl(
+    Operation *operation, llvm::SmallPtrSetImpl<Operation *> &visiting) {
+  if (isDiagnosticAssertionSink(operation))
+    return true;
+  if (!isDiagnosticAssertionSupport(operation) ||
+      operation->getNumResults() == 0 || !visiting.insert(operation).second)
+    return false;
+
+  bool hasUse = false;
+  for (Value result : operation->getResults()) {
+    for (OpOperand &use : result.getUses()) {
+      hasUse = true;
+      if (!isElidedDiagnosticOnlyOperationImpl(use.getOwner(), visiting)) {
+        visiting.erase(operation);
+        return false;
+      }
+    }
+  }
+  visiting.erase(operation);
+  return hasUse;
+}
+
+/// Triton debug overflow checks appear in TTIR as arithmetic feeding
+/// tt.assert, but Ascend lowering removes the complete chain from NPUIR.  Such
+/// diagnostic-only IR must not consume SIMD/SIMT issue or execution resources.
+/// A shared value with any real consumer remains fully counted.
+static bool isElidedDiagnosticOnlyOperation(Operation *operation) {
+  llvm::SmallPtrSet<Operation *, 16> visiting;
+  return isElidedDiagnosticOnlyOperationImpl(operation, visiting);
+}
+
+struct FoldedAddressProof {
+  bool valid = false;
+  bool reachesFlatMemory = false;
+};
+
+static bool isStaticAddressForwardingOperation(Operation *operation) {
+  if (!operation || operation->getNumRegions() != 0)
+    return false;
+  return llvm::StringSwitch<bool>(operation->getName().getStringRef())
+      .Cases("arith.constant", "arith.extsi", "arith.extui", true)
+      .Cases("arith.trunci", "arith.index_cast", "arith.index_castui", true)
+      .Cases("arith.addi", "arith.subi", "arith.muli", true)
+      .Cases("tt.make_range", "tt.splat", "tt.broadcast", true)
+      .Cases("tt.expand_dims", "tt.addptr", "tt.advance", true)
+      .Default(false);
+}
+
+/// Prove that a TTIR value is only static affine address scaffolding for a
+/// flat contiguous transfer.  The Ascend lowering folds this DAG into the DMA
+/// descriptor, so charging its tensor-shaped arithmetic in addition to the
+/// memory service double counts work.  Any data use, indirect address, mask,
+/// control use, or unknown layout stops the proof.
+static FoldedAddressProof
+proveFoldedFlatAddressUses(Operation *operation,
+                           llvm::SmallPtrSetImpl<Operation *> &visiting) {
+  if (!isStaticAddressForwardingOperation(operation) ||
+      operation->getNumResults() == 0 || !visiting.insert(operation).second)
+    return {};
+
+  bool hasUse = false;
+  bool reachesFlatMemory = false;
+  for (Value result : operation->getResults()) {
+    for (OpOperand &use : result.getUses()) {
+      hasUse = true;
+      Operation *user = use.getOwner();
+      const llvm::StringRef name = user->getName().getStringRef();
+      if (isElidedDiagnosticOnlyOperation(user))
+        continue;
+      if ((name == "tt.load" || name == "tt.store") &&
+          use.getOperandNumber() == 0) {
+        Type valueType;
+        const bool store = name == "tt.store";
+        if (store && user->getNumOperands() > 1)
+          valueType = user->getOperand(1).getType();
+        else if (!store && user->getNumResults() > 0)
+          valueType = user->getResult(0).getType();
+        if (!valueType) {
+          visiting.erase(operation);
+          return {};
+        }
+        const StageMemoryAccess access =
+            describeMemoryAccess(user, user->getOperand(0), valueType, store);
+        if (access.addressDependsOnLoadedIndex || !access.isFlatContiguous()) {
+          visiting.erase(operation);
+          return {};
+        }
+        reachesFlatMemory = true;
+        continue;
+      }
+      const FoldedAddressProof child =
+          proveFoldedFlatAddressUses(user, visiting);
+      if (!child.valid) {
+        visiting.erase(operation);
+        return {};
+      }
+      reachesFlatMemory |= child.reachesFlatMemory;
+    }
+  }
+  visiting.erase(operation);
+  return {hasUse && reachesFlatMemory, reachesFlatMemory};
+}
+
+static bool isFoldedFlatAddressScaffolding(Operation *operation) {
+  llvm::SmallPtrSet<Operation *, 16> visiting;
+  return proveFoldedFlatAddressUses(operation, visiting).valid;
+}
+
+static void accumulateOneOperation(Operation *operation, StageWorkload &work,
+                                   RankedTensorType mappedTensor = {}) {
   if (!operation || operation->hasTrait<OpTrait::IsTerminator>())
     return;
   const llvm::StringRef name = operation->getName().getStringRef();
+  // Generic/unregistered TTIR used by diagnostics and unit tests does not
+  // carry the registered IsTerminator trait.  Region return/yield operations
+  // are still structural terminators and must never become issue or execution
+  // work merely because their dialect was intentionally left unregistered.
+  if (name.ends_with(".return") || name.ends_with(".yield"))
+    return;
+  if (isElidedDiagnosticOnlyOperation(operation))
+    return;
+  accumulateGeneratedTraffic(operation, work);
+  if (name == "tt.reshape" || name == "tt.expand_dims" ||
+      name == "tt.map_elementwise")
+    return;
   const double elements = getOperationElements(operation);
+  // A tt.map_elementwise region is scalar in TTIR but the Ascend lowering
+  // promotes each region operation to the map's complete tensor shape.  Keep
+  // that tensor width on both issue and execution work; multiplying scalar
+  // operation count by the element count would invent one scalar instruction
+  // per element and lose 2048-bit SIMD segmentation.
+  const double executionElements =
+      mappedTensor ? static_cast<double>(mappedTensor.getNumElements())
+                   : elements;
+  if (isFoldedFlatAddressScaffolding(operation)) {
+    // Keep route-neutral semantic work visible for SIMT, whose lane lowering
+    // can still issue these operations.  SIMD recognizes this reserved class
+    // as address work folded into the already-priced flat DMA descriptor.
+    work.operationCounts["simd.folded_flat_address"]
+                        [static_cast<int64_t>(elements)] += 1.0;
+    return;
+  }
+
+  // Some post-layout IRs expose shared/local traffic directly.  Count those
+  // semantic vector operations when no lowering attribute supplied an exact
+  // stream count; the attribute path above remains authoritative when present.
+  const double localWarpInstructions = std::ceil(elements / 32.0);
+  if ((name == "ttg.local_load" || name == "hivm.hir.local_load") &&
+      !hasNumericAttr(operation,
+                      {"ascend.simt.shared_local_load_instructions",
+                       "ascend.simt.shared_local_load_warp_instructions"})) {
+    work.sharedLocalLoadInstructions += localWarpInstructions;
+    return;
+  }
+  if ((name == "ttg.local_store" || name == "hivm.hir.local_store") &&
+      !hasNumericAttr(operation,
+                      {"ascend.simt.shared_local_store_instructions",
+                       "ascend.simt.shared_local_store_warp_instructions"})) {
+    work.sharedLocalStoreInstructions += localWarpInstructions;
+    return;
+  }
 
   if ((name == "tt.load" || name == "tt.gather") &&
       operation->getNumResults() > 0) {
     Value result = operation->getResult(0);
+    if (isScalarLoadOperation(operation)) {
+      work.scalarLoadCount += 1.0;
+      return;
+    }
     const int64_t warpInstructions =
         static_cast<int64_t>(std::ceil(elements / 32.0));
     const double bytes = getValueBytes(result);
@@ -367,7 +1076,29 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
     work.memoryAccesses.push_back(
         describeMemoryAccess(operation, operation->getOperand(0),
                              result.getType(), /*store=*/false));
-    if (name == "tt.gather" || isLoadedIndexDependentMemoryOp(operation))
+    // Credit a load only if all consumers use a supported dot operand path
+    // in the same dynamic region. An escape or non-dot use retains GM cost.
+    auto &paths = work.memoryAccesses.back().dotConsumerPaths;
+    for (OpOperand &use : result.getUses()) {
+      Operation *consumer = use.getOwner();
+      auto path = describeDotOperandPath(consumer);
+      if (consumer->getBlock() != operation->getBlock() ||
+          use.getOperandNumber() >= 2 || !path) {
+        paths.clear();
+        break;
+      }
+      paths.push_back(*path);
+    }
+    const bool indirect =
+        name == "tt.gather" || isLoadedIndexDependentMemoryOp(operation);
+    work.memoryAccesses.back().addressDependsOnLoadedIndex = indirect;
+    const int64_t contiguousElements =
+        work.memoryAccesses.back().provenContiguousElements();
+    if (indirect && contiguousElements > 1)
+      work.segmentedIndirectLoadCounts[{
+          static_cast<int64_t>(std::llround(bytes)),
+          static_cast<int64_t>(elements), contiguousElements}] += 1.0;
+    else if (indirect)
       work.indirectLoadCounts[{static_cast<int64_t>(std::llround(bytes)),
                                static_cast<int64_t>(elements)}] += 1.0;
     else if (blockPointerCanUseFlatMemoryCurve(operation->getOperand(0),
@@ -378,22 +1109,40 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
   }
   if (name == "tt.store" && operation->getNumOperands() > 1) {
     Value value = operation->getOperand(1);
+    if (isScalarStoreOperation(operation)) {
+      work.scalarStoreCount += 1.0;
+      return;
+    }
     work.storeBytes += getValueBytes(value);
     work.storeOperations += 1.0;
     const int64_t warpInstructions = static_cast<int64_t>(
         std::ceil(getTypeElementCount(value.getType()) / 32.0));
     work.storeWarpInstructions += warpInstructions;
-    work.memoryAccesses.push_back(
-        describeMemoryAccess(operation, operation->getOperand(0),
-                             value.getType(), /*store=*/true));
-    if (name == "tt.store" && blockPointerCanUseFlatMemoryCurve(
-                                  operation->getOperand(0), value.getType()))
-      work.continuousStoreCounts[{
-          getValueBytes(value),
-          static_cast<int64_t>(getTypeElementCount(value.getType()))}] += 1.0;
+    work.memoryAccesses.push_back(describeMemoryAccess(
+        operation, operation->getOperand(0), value.getType(), /*store=*/true));
+    const bool indirect = isLoadedIndexDependentMemoryOp(operation);
+    work.memoryAccesses.back().addressDependsOnLoadedIndex = indirect;
+    const int64_t contiguousElements =
+        work.memoryAccesses.back().provenContiguousElements();
+    const int64_t bytes =
+        static_cast<int64_t>(std::llround(getValueBytes(value)));
+    const int64_t valueElements =
+        static_cast<int64_t>(getTypeElementCount(value.getType()));
+    if (indirect && contiguousElements > 1)
+      work.segmentedIndirectStoreCounts[{bytes, valueElements,
+                                         contiguousElements}] += 1.0;
+    else if (indirect)
+      work.indirectStoreCounts[{bytes, valueElements}] += 1.0;
+    else if (blockPointerCanUseFlatMemoryCurve(operation->getOperand(0),
+                                               value.getType()))
+      work.continuousStoreCounts[{bytes, valueElements}] += 1.0;
     return;
   }
-  if (name == "tt.dot") {
+  if (name.starts_with("tt.atomic")) {
+    work.atomicWorkloads.push_back(getAtomicWorkload(operation));
+    return;
+  }
+  if (isDotOperationName(name)) {
     accumulateDotWorkload(operation, work);
     return;
   }
@@ -402,19 +1151,71 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
     if (name == "tt.scan")
       return;
   }
-  if (name == "arith.cmpi" || name == "arith.cmpf") {
-    work.predicateCounts[static_cast<int64_t>(elements)] += 1.0;
+  if (name == "ascend.sort" && operation->getNumOperands() == 1) {
+    auto input = dyn_cast<ShapedType>(operation->getOperand(0).getType());
+    auto axis = operation->getAttrOfType<IntegerAttr>("dim");
+    if (input && input.hasStaticShape() && axis && input.getRank() > 0) {
+      int64_t dimension = axis.getInt();
+      if (dimension < 0)
+        dimension += input.getRank();
+      if (dimension >= 0 && dimension < input.getRank()) {
+        const int64_t extent = input.getShape()[dimension];
+        const int64_t rows = extent > 0 ? input.getNumElements() / extent : 0;
+        const int64_t bits = getScalarBitWidth(input.getElementType());
+        if (rows > 0 && extent > 1 && bits > 0)
+          work.sortCounts[{rows, extent, bits}] += 1.0;
+      }
+    }
+  }
+  if (name == "arith.cmpi" || name == "arith.cmpf" || name == "math.isfinite" ||
+      name == "math.isnan" || name == "math.isinf") {
+    work.predicateCounts[static_cast<int64_t>(executionElements)] += 1.0;
+    accumulateTensorOperationWorkload(operation, "predicate.cmp",
+                                      executionElements, work, mappedTensor);
     return;
   }
   if (name == "scf.for" || name == "scf.if" || name == "scf.while")
     return;
 
-  if (!hasTensorResult(operation)) {
-    work.scalarOperations += 1.0;
+  if (name == "tt.trans" && operation->getNumOperands() > 0) {
+    auto input = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+    auto order = operation->getAttrOfType<DenseI32ArrayAttr>("order");
+    if (input && input.hasStaticShape() && input.getRank() > 1 && order &&
+        static_cast<int64_t>(order.size()) == input.getRank()) {
+      bool identity = true;
+      for (auto indexed : llvm::enumerate(order.asArrayRef()))
+        identity &= indexed.value() == static_cast<int32_t>(indexed.index());
+      if (!identity) {
+        // The lowering exchanges every logical element across the moved
+        // innermost axis.  Keep this as an explicit layout workload rather
+        // than treating tt.trans as one generic vector instruction.
+        const int64_t inner = input.getDimSize(input.getRank() - 1);
+        const int64_t logical = input.getNumElements();
+        if (inner > 0 && logical > 0 &&
+            logical <= std::numeric_limits<int64_t>::max() / inner) {
+          work.operationCounts["layout.transpose"][logical * inner] += 1.0;
+          return;
+        }
+      }
+    }
+  }
+
+  const std::string profileName = getProfileOperationName(operation);
+  const bool hasTensorExecutionGeometry =
+      hasTensorResult(operation) ||
+      (profileName != "generic.issue" &&
+       static_cast<bool>(getRepresentativeTensorType(operation)));
+  if (!mappedTensor && !hasTensorExecutionGeometry) {
+    if (profileName != "generic.issue")
+      work.operationCounts[profileName][1] += 1.0;
+    else
+      work.scalarOperations += 1.0;
     return;
   }
-  work.operationCounts[getProfileOperationName(operation)]
-                      [static_cast<int64_t>(elements)] += 1.0;
+  work.operationCounts[profileName][static_cast<int64_t>(executionElements)] +=
+      1.0;
+  accumulateTensorOperationWorkload(operation, profileName, executionElements,
+                                    work, mappedTensor);
 }
 
 static void mergeWorkload(StageWorkload &into, StageWorkload from);
@@ -427,9 +1228,23 @@ static void scaleWorkload(StageWorkload &work, double scale) {
   work.storeOperations *= scale;
   work.loadWarpInstructions *= scale;
   work.storeWarpInstructions *= scale;
+  work.sharedLocalLoadInstructions *= scale;
+  work.sharedLocalStoreInstructions *= scale;
+  work.privateStackLoadInstructions *= scale;
+  work.privateStackStoreInstructions *= scale;
   for (auto &access : work.memoryAccesses)
     access.count *= scale;
+  for (AtomicWorkload &atomic : work.atomicWorkloads) {
+    atomic.logicalElements *= scale;
+    atomic.logicalOperationInstances *= scale;
+  }
   for (auto &[size, count] : work.indirectLoadCounts)
+    count *= scale;
+  for (auto &[shape, count] : work.segmentedIndirectLoadCounts)
+    count *= scale;
+  for (auto &[shape, count] : work.indirectStoreCounts)
+    count *= scale;
+  for (auto &[shape, count] : work.segmentedIndirectStoreCounts)
     count *= scale;
   for (auto &[size, count] : work.continuousLoadCounts)
     count *= scale;
@@ -439,22 +1254,48 @@ static void scaleWorkload(StageWorkload &work, double scale) {
     count *= scale;
   for (auto &[shape, count] : work.prefixScanCounts)
     count *= scale;
+  work.reductionOperations *= scale;
   work.shuffleLaneSteps *= scale;
+  for (auto &[shape, count] : work.reductionGeometryCounts)
+    count *= scale;
+  for (auto &[combineClass, count] : work.reductionCombineClassCounts)
+    count *= scale;
+  for (auto &[shape, count] : work.scalarizedMultiResultReductionCounts)
+    count *= scale;
+  for (auto &[shape, count] : work.sortCounts)
+    count *= scale;
+  for (auto &[shape, count] : work.oneTripMaskedAccumulatorReductionExtents)
+    count *= scale;
   work.dotOperations *= scale;
   for (auto &[flops, count] : work.dotFlopCounts)
     count *= scale;
+  for (auto &[key, entry] : work.dotOperandPaths)
+    entry.second *= scale;
   work.dotFlops *= scale;
   work.loopBackedges *= scale;
   work.conditionalBranches *= scale;
   work.divergentBranches *= scale;
   work.synchronizations *= scale;
+  work.scalarLoadCount *= scale;
+  work.scalarStoreCount *= scale;
   for (auto &entry : work.operationCounts)
     for (auto &[size, count] : entry.second)
       count *= scale;
+  for (TensorOperationWorkload &tensor : work.tensorOperationWorkloads) {
+    tensor.logicalElements *= scale;
+    tensor.segmentCount *= scale;
+  }
   recomputeIssueElements(work);
 }
 
 static std::optional<int64_t> getConstantInteger(Value value) {
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    if (auto function = dyn_cast_or_null<FunctionOpInterface>(
+            argument.getOwner()->getParentOp()))
+      if (auto attribute = function.getArgAttrOfType<IntegerAttr>(
+              argument.getArgNumber(), "ascend.costmodel.runtime_value"))
+        return attribute.getInt();
+  }
   Operation *definition = value.getDefiningOp();
   if (!definition)
     return std::nullopt;
@@ -462,6 +1303,247 @@ static std::optional<int64_t> getConstantInteger(Value value) {
   if (!attribute)
     return std::nullopt;
   return attribute.getInt();
+}
+
+static std::optional<int64_t> getSplatConstantInteger(Value value) {
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return getConstantInteger(value);
+  if (definition->getName().getStringRef() == "tt.splat" &&
+      definition->getNumOperands() == 1)
+    return getConstantInteger(definition->getOperand(0));
+  Attribute attribute = definition->getAttr("value");
+  if (auto integer = dyn_cast_or_null<IntegerAttr>(attribute))
+    return integer.getInt();
+  if (auto dense = dyn_cast_or_null<DenseIntElementsAttr>(attribute)) {
+    if (!dense.isSplat())
+      return std::nullopt;
+    return dense.getSplatValue<APInt>().getSExtValue();
+  }
+  return std::nullopt;
+}
+
+using TensorAffineStrides = llvm::SmallVector<std::optional<int64_t>, 4>;
+
+/// Infer the coefficient of each tensor index in a tensor-of-pointer offset.
+/// The result is expressed in pointed-to elements. Scalar values and splats
+/// are uniform across tensor lanes and therefore have zero lane stride even
+/// when their runtime value is unknown. Unknown/non-affine operations stop the
+/// proof instead of guessing a memory layout.
+static std::optional<TensorAffineStrides>
+inferTensorAffineStrides(Value value, unsigned depth = 0) {
+  auto outputType = dyn_cast<RankedTensorType>(value.getType());
+  if (!outputType || !outputType.hasStaticShape() || depth >= 32)
+    return std::nullopt;
+  const int64_t rank = outputType.getRank();
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return std::nullopt;
+  const llvm::StringRef name = definition->getName().getStringRef();
+
+  if (name == "tt.make_range") {
+    if (rank != 1)
+      return std::nullopt;
+    return TensorAffineStrides{int64_t(1)};
+  }
+  if (name == "tt.splat" || name == "arith.constant")
+    return TensorAffineStrides(rank, int64_t(0));
+  if (name == "tt.load" || name == "tt.gather") {
+    TensorAffineStrides result;
+    result.reserve(rank);
+    for (int64_t extent : outputType.getShape())
+      result.push_back(extent == 1 ? std::optional<int64_t>(int64_t(0))
+                                   : std::nullopt);
+    return result;
+  }
+
+  const bool shapePreservingCast =
+      name == "arith.extsi" || name == "arith.extui" ||
+      name == "arith.trunci" || name == "arith.index_cast" ||
+      name == "arith.index_castui" || name == "arith.sitofp" ||
+      name == "arith.uitofp" || name == "arith.fptosi" ||
+      name == "arith.fptoui";
+  if (shapePreservingCast && definition->getNumOperands() == 1) {
+    auto input =
+        dyn_cast<RankedTensorType>(definition->getOperand(0).getType());
+    if (!input || input.getShape() != outputType.getShape())
+      return std::nullopt;
+    return inferTensorAffineStrides(definition->getOperand(0), depth + 1);
+  }
+
+  if (name == "tt.expand_dims" && definition->getNumOperands() == 1) {
+    auto axis = definition->getAttrOfType<IntegerAttr>("axis");
+    auto input = inferTensorAffineStrides(definition->getOperand(0), depth + 1);
+    if (!axis || !input || static_cast<int64_t>(input->size()) + 1 != rank ||
+        axis.getInt() < 0 || axis.getInt() >= rank)
+      return std::nullopt;
+    input->insert(input->begin() + axis.getInt(), int64_t(0));
+    return input;
+  }
+
+  if (name == "tt.broadcast" && definition->getNumOperands() == 1) {
+    auto inputType =
+        dyn_cast<RankedTensorType>(definition->getOperand(0).getType());
+    auto input = inferTensorAffineStrides(definition->getOperand(0), depth + 1);
+    if (!inputType || !inputType.hasStaticShape() || !input ||
+        inputType.getRank() != rank)
+      return std::nullopt;
+    for (int64_t axis = 0; axis < rank; ++axis) {
+      const int64_t from = inputType.getDimSize(axis);
+      const int64_t to = outputType.getDimSize(axis);
+      if (from == to)
+        continue;
+      if (from != 1 || to <= 0)
+        return std::nullopt;
+      (*input)[axis] = int64_t(0);
+    }
+    return input;
+  }
+
+  auto combine = [&](bool subtract) -> std::optional<TensorAffineStrides> {
+    if (definition->getNumOperands() != 2)
+      return std::nullopt;
+    auto lhs = inferTensorAffineStrides(definition->getOperand(0), depth + 1);
+    auto rhs = inferTensorAffineStrides(definition->getOperand(1), depth + 1);
+    if (!lhs || !rhs || lhs->size() != rhs->size() ||
+        static_cast<int64_t>(lhs->size()) != rank)
+      return std::nullopt;
+    TensorAffineStrides result;
+    result.reserve(rank);
+    for (int64_t axis = 0; axis < rank; ++axis) {
+      if (!(*lhs)[axis] || !(*rhs)[axis]) {
+        result.push_back(std::nullopt);
+        continue;
+      }
+      const int64_t left = *(*lhs)[axis];
+      const int64_t right = *(*rhs)[axis];
+      int64_t coefficient = 0;
+      if (subtract ? llvm::SubOverflow(left, right, coefficient)
+                   : llvm::AddOverflow(left, right, coefficient))
+        result.push_back(std::nullopt);
+      else
+        result.push_back(coefficient);
+    }
+    return result;
+  };
+  if (name == "arith.addi" || name == "tt.addptr")
+    return combine(false);
+  if (name == "arith.subi")
+    return combine(true);
+
+  if (name == "arith.muli" && definition->getNumOperands() == 2) {
+    std::optional<int64_t> scale =
+        getSplatConstantInteger(definition->getOperand(0));
+    Value varying = definition->getOperand(1);
+    if (!scale) {
+      scale = getSplatConstantInteger(definition->getOperand(1));
+      varying = definition->getOperand(0);
+    }
+    auto input = inferTensorAffineStrides(varying, depth + 1);
+    if (scale && input && static_cast<int64_t>(input->size()) == rank) {
+      for (auto &coefficient : *input) {
+        if (!coefficient)
+          continue;
+        int64_t product = 0;
+        if (llvm::MulOverflow(*coefficient, *scale, product))
+          coefficient = std::nullopt;
+        else
+          coefficient = product;
+      }
+      return input;
+    }
+
+    // Multiplication by a runtime scalar splat is not affine with a known
+    // coefficient, but it does preserve axes that are provably uniform. Keep
+    // those zero coefficients so an orthogonal unit-stride component can
+    // still prove a contiguous run (for example rows[index, 0:16]).
+    auto lhs = inferTensorAffineStrides(definition->getOperand(0), depth + 1);
+    auto rhs = inferTensorAffineStrides(definition->getOperand(1), depth + 1);
+    auto isUniform = [rank](const auto &coefficients) {
+      return coefficients &&
+             static_cast<int64_t>(coefficients->size()) == rank &&
+             llvm::all_of(*coefficients, [](const auto &coefficient) {
+               return coefficient && *coefficient == 0;
+             });
+    };
+    const TensorAffineStrides *varyingCoefficients = nullptr;
+    if (isUniform(lhs) && rhs && static_cast<int64_t>(rhs->size()) == rank)
+      varyingCoefficients = &*rhs;
+    else if (isUniform(rhs) && lhs && static_cast<int64_t>(lhs->size()) == rank)
+      varyingCoefficients = &*lhs;
+    if (!varyingCoefficients)
+      return std::nullopt;
+    TensorAffineStrides result;
+    result.reserve(rank);
+    for (const auto &coefficient : *varyingCoefficients)
+      result.push_back(coefficient && *coefficient == 0
+                           ? std::optional<int64_t>(int64_t(0))
+                           : std::nullopt);
+    return result;
+  }
+  return std::nullopt;
+}
+
+/// Detect address expressions that the SIMD backend currently expands into a
+/// scalar lane loop. Keep this as source-structure provenance: the cost model
+/// still requires an unknown rank-one layout and an explicit measured profile
+/// before charging a completion term.
+static bool addressHasNonAffineTensorComputation(
+    Value value, llvm::SmallPtrSetImpl<Operation *> &visited,
+    unsigned depth = 0) {
+  if (depth >= 32)
+    return false;
+  Operation *definition = value.getDefiningOp();
+  if (!definition || !visited.insert(definition).second)
+    return false;
+  const llvm::StringRef name = definition->getName().getStringRef();
+  if (name == "tt.load" || name == "tt.gather")
+    return false;
+
+  const bool tensorResult = llvm::any_of(definition->getResults(), [](Value r) {
+    return isa<RankedTensorType>(r.getType());
+  });
+  if (tensorResult &&
+      (name == "math.floor" || name == "math.ceil" || name == "math.round" ||
+       name == "tt.clampf" || name == "arith.mulf" || name == "arith.divf" ||
+       name == "arith.remf" || name == "arith.fptosi" ||
+       name == "arith.fptoui"))
+    return true;
+
+  return llvm::any_of(definition->getOperands(), [&](Value operand) {
+    return addressHasNonAffineTensorComputation(operand, visited, depth + 1);
+  });
+}
+
+static bool addressHasNonAffineTensorComputation(Value value) {
+  llvm::SmallPtrSet<Operation *, 32> visited;
+  return addressHasNonAffineTensorComputation(value, visited);
+}
+
+static bool addressHasTensorControlFlowSelection(
+    Value value, llvm::SmallPtrSetImpl<Operation *> &visited,
+    unsigned depth = 0) {
+  if (depth >= 32)
+    return false;
+  Operation *definition = value.getDefiningOp();
+  if (!definition || !visited.insert(definition).second)
+    return false;
+  const llvm::StringRef name = definition->getName().getStringRef();
+  if (name == "tt.load" || name == "tt.gather")
+    return false;
+  const bool tensorResult = llvm::any_of(definition->getResults(), [](Value r) {
+    return isa<RankedTensorType>(r.getType());
+  });
+  if (tensorResult && name == "scf.if")
+    return true;
+  return llvm::any_of(definition->getOperands(), [&](Value operand) {
+    return addressHasTensorControlFlowSelection(operand, visited, depth + 1);
+  });
+}
+
+static bool addressHasTensorControlFlowSelection(Value value) {
+  llvm::SmallPtrSet<Operation *, 32> visited;
+  return addressHasTensorControlFlowSelection(value, visited);
 }
 
 static int64_t getElementBits(Type type) {
@@ -481,11 +1563,200 @@ static bool isPredicateType(Type type) {
   return integer && integer.getWidth() == 1;
 }
 
+/// A shape-preserving elementwise operation inherits its nonconstant tensor
+/// inputs' layout. Do not follow transposes, reshapes, loads or loop results:
+/// their physical representation requires a different lowering contract.
+static bool fromDotAccumulator(Value value, unsigned depth = 0) {
+  Operation *producer = value.getDefiningOp();
+  if (!producer || depth >= 16)
+    return false;
+  auto tensor = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensor || !tensor.hasStaticShape())
+    return false;
+  llvm::StringRef name = producer->getName().getStringRef();
+  if (isDotOperationName(name))
+    return true;
+  if (name != "arith.addf" && name != "arith.subf" && name != "arith.mulf" &&
+      name != "arith.negf")
+    return false;
+  bool foundDot = false;
+  for (Value input : producer->getOperands()) {
+    if (!isa<RankedTensorType>(input.getType()))
+      continue;
+    if (input.getType() != value.getType())
+      return false;
+    Operation *definition = input.getDefiningOp();
+    if (definition && definition->getName().getStringRef() == "arith.constant")
+      continue;
+    if (!fromDotAccumulator(input, depth + 1))
+      return false;
+    foundDot = true;
+  }
+  return foundDot;
+}
+
+static Value stripPredicateShapeOps(Value value) {
+  for (unsigned depth = 0; depth < 16; ++depth) {
+    Operation *definition = value.getDefiningOp();
+    if (!definition || definition->getNumOperands() != 1)
+      break;
+    const llvm::StringRef name = definition->getName().getStringRef();
+    if (name != "tt.broadcast" && name != "tt.expand_dims" &&
+        name != "tt.splat")
+      break;
+    value = definition->getOperand(0);
+  }
+  return value;
+}
+
+static std::optional<std::pair<int64_t, int64_t>> getStaticRange(Value value) {
+  Operation *definition = stripPredicateShapeOps(value).getDefiningOp();
+  if (!definition || definition->getName().getStringRef() != "tt.make_range")
+    return std::nullopt;
+  auto start = definition->getAttrOfType<IntegerAttr>("start");
+  auto end = definition->getAttrOfType<IntegerAttr>("end");
+  if (!start || !end || end.getInt() <= start.getInt())
+    return std::nullopt;
+  return std::make_pair(start.getInt(), end.getInt());
+}
+
+static std::optional<int64_t> getStaticSplatInteger(Value value) {
+  Operation *definition = stripPredicateShapeOps(value).getDefiningOp();
+  if (!definition || definition->getName().getStringRef() != "arith.constant")
+    return std::nullopt;
+  Attribute attribute = definition->getAttr("value");
+  if (auto integer = dyn_cast_or_null<IntegerAttr>(attribute))
+    return integer.getInt();
+  auto dense = dyn_cast_or_null<DenseIntElementsAttr>(attribute);
+  if (!dense || !dense.isSplat())
+    return std::nullopt;
+  return dense.getSplatValue<llvm::APInt>().getSExtValue();
+}
+
+static arith::CmpIPredicate reversePredicate(arith::CmpIPredicate predicate) {
+  switch (predicate) {
+  case arith::CmpIPredicate::eq:
+  case arith::CmpIPredicate::ne:
+    return predicate;
+  case arith::CmpIPredicate::slt:
+    return arith::CmpIPredicate::sgt;
+  case arith::CmpIPredicate::sle:
+    return arith::CmpIPredicate::sge;
+  case arith::CmpIPredicate::sgt:
+    return arith::CmpIPredicate::slt;
+  case arith::CmpIPredicate::sge:
+    return arith::CmpIPredicate::sle;
+  case arith::CmpIPredicate::ult:
+    return arith::CmpIPredicate::ugt;
+  case arith::CmpIPredicate::ule:
+    return arith::CmpIPredicate::uge;
+  case arith::CmpIPredicate::ugt:
+    return arith::CmpIPredicate::ult;
+  case arith::CmpIPredicate::uge:
+    return arith::CmpIPredicate::ule;
+  }
+  llvm_unreachable("unknown integer comparison predicate");
+}
+
+static std::optional<double> staticPredicateTrueRatio(Value value,
+                                                      unsigned depth = 0) {
+  if (depth >= 16)
+    return std::nullopt;
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return std::nullopt;
+  const llvm::StringRef name = definition->getName().getStringRef();
+  if ((name == "tt.broadcast" || name == "tt.expand_dims") &&
+      definition->getNumOperands() == 1)
+    return staticPredicateTrueRatio(definition->getOperand(0), depth + 1);
+  if (auto conjunction = dyn_cast<arith::AndIOp>(definition)) {
+    auto left = staticPredicateTrueRatio(conjunction.getLhs(), depth + 1);
+    auto right = staticPredicateTrueRatio(conjunction.getRhs(), depth + 1);
+    if (left && right)
+      return std::min(*left, *right);
+    return left ? left : right;
+  }
+  auto comparison = dyn_cast<arith::CmpIOp>(definition);
+  if (!comparison)
+    return std::nullopt;
+  auto range = getStaticRange(comparison.getLhs());
+  auto bound = getStaticSplatInteger(comparison.getRhs());
+  arith::CmpIPredicate predicate = comparison.getPredicate();
+  if (!range || !bound) {
+    range = getStaticRange(comparison.getRhs());
+    bound = getStaticSplatInteger(comparison.getLhs());
+    predicate = reversePredicate(predicate);
+  }
+  if (!range || !bound)
+    return std::nullopt;
+  const auto [start, end] = *range;
+  const int64_t count = end - start;
+  int64_t active = 0;
+  switch (predicate) {
+  case arith::CmpIPredicate::slt:
+  case arith::CmpIPredicate::ult:
+    active = std::clamp(*bound - start, int64_t(0), count);
+    break;
+  case arith::CmpIPredicate::sle:
+  case arith::CmpIPredicate::ule:
+    active = std::clamp(*bound - start + 1, int64_t(0), count);
+    break;
+  case arith::CmpIPredicate::sgt:
+  case arith::CmpIPredicate::ugt:
+    active = std::clamp(end - *bound - 1, int64_t(0), count);
+    break;
+  case arith::CmpIPredicate::sge:
+  case arith::CmpIPredicate::uge:
+    active = std::clamp(end - *bound, int64_t(0), count);
+    break;
+  case arith::CmpIPredicate::eq:
+    active = *bound >= start && *bound < end ? 1 : 0;
+    break;
+  case arith::CmpIPredicate::ne:
+    active = count - (*bound >= start && *bound < end ? 1 : 0);
+    break;
+  }
+  return static_cast<double>(active) / static_cast<double>(count);
+}
+
+static bool
+valueDependsOnLoadWithExactMask(Value value, Value mask,
+                                llvm::SmallPtrSetImpl<Operation *> &visited,
+                                unsigned depth = 0) {
+  if (depth >= 32)
+    return false;
+  Operation *definition = value.getDefiningOp();
+  if (!definition || !visited.insert(definition).second)
+    return false;
+  const llvm::StringRef name = definition->getName().getStringRef();
+  if (name == "tt.load") {
+    auto maskIndex = getMemoryMaskOperandIndex(definition);
+    return maskIndex && *maskIndex < definition->getNumOperands() &&
+           definition->getOperand(*maskIndex) == mask;
+  }
+  if (name == "tt.store" || name.starts_with("tt.atomic"))
+    return false;
+  return llvm::any_of(definition->getOperands(), [&](Value operand) {
+    return valueDependsOnLoadWithExactMask(operand, mask, visited, depth + 1);
+  });
+}
+
+static bool valueDependsOnLoadWithExactMask(Value value, Value mask) {
+  llvm::SmallPtrSet<Operation *, 32> visited;
+  return valueDependsOnLoadWithExactMask(value, mask, visited);
+}
+
 static StageMemoryAccess describeMemoryAccess(Operation *operation,
                                               Value pointer, Type valueType,
                                               bool store) {
   StageMemoryAccess access;
   access.store = store;
+  access.addressDependsOnLoadedIndex =
+      operation->getName().getStringRef() == "tt.gather" ||
+      isLoadedIndexDependentMemoryOp(operation);
+  access.fromDotAccumulator =
+      store && operation->getName().getStringRef() == "tt.store" &&
+      fromDotAccumulator(operation->getOperand(1));
   access.elementBits = getElementBits(valueType);
   if (auto shaped = dyn_cast<ShapedType>(valueType))
     if (shaped.hasStaticShape())
@@ -500,21 +1771,92 @@ static StageMemoryAccess describeMemoryAccess(Operation *operation,
   }
   const int64_t rank = static_cast<int64_t>(access.shape.size());
   access.strides.resize(access.shape.size());
-  if (definition && definition->getName().getStringRef() ==
-                        "tt.make_tensor_ptr" &&
+  bool hasCompleteAffineStrideProof = false;
+  if (definition &&
+      definition->getName().getStringRef() == "tt.make_tensor_ptr" &&
       definition->getNumOperands() == 1 + 3 * rank) {
     for (int64_t axis = 0; axis < rank; ++axis)
-      access.strides[axis] = getConstantInteger(
-          definition->getOperand(1 + rank + axis));
+      access.strides[axis] =
+          getConstantInteger(definition->getOperand(1 + rank + axis));
+    hasCompleteAffineStrideProof = llvm::all_of(
+        access.strides, [](const auto &stride) { return stride.has_value(); });
+  } else if (auto inferred = inferTensorAffineStrides(pointer)) {
+    if (static_cast<int64_t>(inferred->size()) == rank) {
+      access.strides.assign(inferred->begin(), inferred->end());
+      hasCompleteAffineStrideProof =
+          llvm::all_of(access.strides,
+                       [](const auto &stride) { return stride.has_value(); });
+    }
   }
+  access.addressHasNonAffineTensorComputation =
+      !hasCompleteAffineStrideProof &&
+      addressHasNonAffineTensorComputation(pointer);
+  access.addressHasTensorControlFlowSelection =
+      !hasCompleteAffineStrideProof &&
+      addressHasTensorControlFlowSelection(pointer);
   access.masked = llvm::any_of(operation->getOperands(), [](Value operand) {
     return isPredicateType(operand.getType());
   });
-  if (auto boundary = operation->getAttrOfType<DenseI32ArrayAttr>("boundaryCheck"))
+  if (auto boundary =
+          operation->getAttrOfType<DenseI32ArrayAttr>("boundaryCheck"))
     access.masked |= !boundary.empty();
-  if (auto boundary = operation->getAttrOfType<DenseI32ArrayAttr>("boundary_check"))
+  if (auto boundary =
+          operation->getAttrOfType<DenseI32ArrayAttr>("boundary_check"))
     access.masked |= !boundary.empty();
+  if (auto mask = getMemoryMaskOperandIndex(operation);
+      mask && *mask < operation->getNumOperands() &&
+      isPredicateType(operation->getOperand(*mask).getType())) {
+    Value maskValue = operation->getOperand(*mask);
+    if (auto ratio = staticPredicateTrueRatio(maskValue))
+      access.activeElementRatio = std::clamp(*ratio, 0.0, 1.0);
+    access.maskedStoreHasMatchingLoadDependency =
+        store && operation->getNumOperands() > 1 &&
+        valueDependsOnLoadWithExactMask(operation->getOperand(1), maskValue);
+  }
   return access;
+}
+
+/// Provenance at the TTIR boundary, not a claim that arbitrary values reside
+/// in shared memory. Only a profile with a matching lowering contract may use
+/// these facts. Unknown producers, transposes, batches and non-FP32 dots fall
+/// back to the existing analytical dot model.
+static std::optional<std::string> describeDotOperandPath(Operation *operation) {
+  if (operation->getName().getStringRef() != "tt.dot" ||
+      operation->getNumOperands() != 3 || operation->getNumResults() != 1)
+    return std::nullopt;
+  auto lhs = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+  auto rhs = dyn_cast<RankedTensorType>(operation->getOperand(1).getType());
+  auto out = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
+  if (!lhs || !rhs || !out || lhs.getRank() != 2 || rhs.getRank() != 2 ||
+      out.getRank() != 2 || !lhs.hasStaticShape() || !rhs.hasStaticShape() ||
+      !lhs.getElementType().isF32() || !rhs.getElementType().isF32() ||
+      !out.getElementType().isF32() || lhs.getDimSize(1) != rhs.getDimSize(0))
+    return std::nullopt;
+  auto operandKey = [&](Value operand) -> std::optional<std::string> {
+    Operation *producer = operand.getDefiningOp();
+    if (!producer || producer->getBlock() != operation->getBlock())
+      return std::nullopt;
+    llvm::StringRef name = producer->getName().getStringRef();
+    if (name == "tt.load") {
+      auto access = describeMemoryAccess(producer, producer->getOperand(0),
+                                         operand.getType(), false);
+      if (!access.hasStaticLayout() || !access.hasUnitInnerStride())
+        return std::nullopt;
+      return "gm{" + access.layoutKey() + "}";
+    }
+    if (isDotOperationName(name) || name == "arith.addf" ||
+        name == "arith.subf" || name == "arith.mulf" ||
+        name == "arith.select" || name == "scf.for")
+      return std::string("computed");
+    return std::nullopt;
+  };
+  auto left = operandKey(operation->getOperand(0));
+  auto right = operandKey(operation->getOperand(1));
+  if (!left || !right)
+    return std::nullopt;
+  return "f32:" + std::to_string(lhs.getDimSize(0)) + "x" +
+         std::to_string(rhs.getDimSize(1)) + "x" +
+         std::to_string(lhs.getDimSize(1)) + ":lhs=" + *left + ":rhs=" + *right;
 }
 
 /// A unit inner stride does not make a rectangular block a flat transfer.
@@ -581,9 +1923,80 @@ static std::optional<int64_t> getSignedUpperBound(Value value,
   return left ? left : right;
 }
 
+static Operation *stripIntegerCastDefinition(Value value) {
+  Operation *definition = value.getDefiningOp();
+  for (unsigned depth = 0; definition && depth < 8; ++depth) {
+    const llvm::StringRef name = definition->getName().getStringRef();
+    if ((name == "arith.index_cast" || name == "arith.extsi" ||
+         name == "arith.extui" || name == "arith.trunci") &&
+        definition->getNumOperands() == 1) {
+      definition = definition->getOperand(0).getDefiningOp();
+      continue;
+    }
+    break;
+  }
+  return definition;
+}
+
+static bool valueDependsOnProgramQuery(Value value, StringRef query,
+                                       unsigned depth = 0) {
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    Operation *parent = argument.getOwner()->getParentOp();
+    if (parent && parent->getName().getStringRef() == "scf.for" &&
+        argument.getArgNumber() == 0 && parent->getNumOperands() >= 1 &&
+        depth < 8)
+      return valueDependsOnProgramQuery(parent->getOperand(0), query,
+                                        depth + 1);
+    return false;
+  }
+  Operation *definition = stripIntegerCastDefinition(value);
+  if (!definition || depth >= 8)
+    return false;
+  if (definition->getName().getStringRef() == query)
+    return true;
+  const llvm::StringRef name = definition->getName().getStringRef();
+  if (name != "arith.remsi" && name != "arith.remui" && name != "arith.addi" &&
+      name != "arith.subi" && name != "arith.muli" && name != "arith.divsi" &&
+      name != "arith.divui" && name != "arith.ceildivsi" &&
+      name != "arith.ceildivui" && name != "arith.minsi" &&
+      name != "arith.minui" && name != "arith.maxsi" && name != "arith.maxui")
+    return false;
+  return llvm::any_of(definition->getOperands(), [&](Value operand) {
+    return valueDependsOnProgramQuery(operand, query, depth + 1);
+  });
+}
+
+/// Triton grid-stride loops use
+///   for iv = program_id(0); iv < runtime_upper; iv += num_programs(0)
+/// (or the AutoBlockify equivalent with a remainder-derived lower bound).
+/// Runtime scalar arguments are attached to the analysis function before
+/// Stage partitioning.  The launch grid is supplied independently as the
+/// logical-program hint, so the slowest participating program executes
+/// ceil(runtime_upper / logical_programs) iterations.  Recognize only this
+/// structural induction form; arbitrary dynamic loops retain the existing
+/// unknown-trip fallback.
+static std::optional<int64_t>
+getGridStrideTripCount(Operation *operation, int64_t logicalProgramCountHint) {
+  if (!operation || operation->getName().getStringRef() != "scf.for" ||
+      operation->getNumOperands() < 3 || logicalProgramCountHint <= 0)
+    return std::nullopt;
+  const auto upper = getConstantInteger(operation->getOperand(1));
+  if (!upper || *upper <= 0)
+    return int64_t{0};
+  if (!valueDependsOnProgramQuery(operation->getOperand(0),
+                                  "tt.get_program_id") ||
+      !valueDependsOnProgramQuery(operation->getOperand(2),
+                                  "tt.get_num_programs"))
+    return std::nullopt;
+  const uint64_t extent = static_cast<uint64_t>(*upper);
+  const uint64_t programs = static_cast<uint64_t>(logicalProgramCountHint);
+  return static_cast<int64_t>(extent / programs + (extent % programs != 0));
+}
+
 static int64_t getLoopTripCount(Operation *operation,
                                 int64_t stageIterationCount,
-                                StageModelFeatures *estimates = nullptr) {
+                                StageModelFeatures *estimates = nullptr,
+                                int64_t logicalProgramCountHint = 0) {
   const llvm::StringRef name = operation->getName().getStringRef();
   if (name == "scf.for" && operation->getNumOperands() >= 3) {
     const std::optional<int64_t> lower =
@@ -604,6 +2017,9 @@ static int64_t getLoopTripCount(Operation *operation,
         return static_cast<int64_t>(count);
       }
     }
+    if (auto gridStride =
+            getGridStrideTripCount(operation, logicalProgramCountHint))
+      return *gridStride;
   }
   if (name == "scf.for" || name == "scf.while") {
     if (estimates)
@@ -613,6 +2029,23 @@ static int64_t getLoopTripCount(Operation *operation,
   return 1;
 }
 
+static bool hasKnownAtMostOneIteration(Operation *operation) {
+  if (!operation || operation->getName().getStringRef() != "scf.for" ||
+      operation->getNumOperands() < 3)
+    return false;
+  const auto lower = getConstantInteger(operation->getOperand(0));
+  const auto upper = getConstantInteger(operation->getOperand(1));
+  const auto step = getConstantInteger(operation->getOperand(2));
+  if (!lower || !upper || !step || *step <= 0)
+    return false;
+  if (*upper <= *lower)
+    return true;
+  const uint64_t distance = uint64_t(*upper) - uint64_t(*lower);
+  const uint64_t trips =
+      distance / uint64_t(*step) + (distance % uint64_t(*step) != 0);
+  return trips <= 1;
+}
+
 /// Accumulate dynamic work, not merely the number of syntactic TTIR ops.
 /// A loop body appears once in TTIR but executes `tripCount` times.  The
 /// resulting total dynamic work is normalized to one Stage iteration by
@@ -620,21 +2053,21 @@ static int64_t getLoopTripCount(Operation *operation,
 /// loop iteration instead of accidentally counting the body once.
 /// AutoBlockify V1 is the exception: its loop is a scheduling shell and its
 /// direct body operations are already separate semantic roots.
-static void accumulateDynamicOperationTree(Operation *operation,
-                                           StageWorkload &work,
-                                           double multiplicity,
-                                           int64_t fallbackLoopTripCount,
-                                           StageModelFeatures &estimates) {
+static void accumulateDynamicOperationTree(
+    Operation *operation, StageWorkload &work, double multiplicity,
+    int64_t fallbackLoopTripCount, StageModelFeatures &estimates,
+    int64_t logicalProgramCountHint, RankedTensorType mappedTensor = {}) {
   if (!operation)
     return;
   StageWorkload local;
-  accumulateOneOperation(operation, local);
+  accumulateOneOperation(operation, local, mappedTensor);
   const llvm::StringRef name = operation->getName().getStringRef();
   const bool schedulingLoop = operation->hasAttr("ta.auto_blockify_v1.loop");
   const double trips = schedulingLoop
                            ? 1.0
                            : static_cast<double>(getLoopTripCount(
-                                 operation, fallbackLoopTripCount, &estimates));
+                                 operation, fallbackLoopTripCount, &estimates,
+                                 logicalProgramCountHint));
   if (name == "scf.for" || name == "scf.while")
     local.loopBackedges = trips;
   if (name == "scf.if" || name == "cf.cond_br")
@@ -646,12 +2079,20 @@ static void accumulateDynamicOperationTree(Operation *operation,
 
   if (schedulingLoop)
     return;
+  // A split independent-loop shell owns only control overhead. Its body
+  // operations are separate semantic roots and must not be double-counted.
+  if (shouldSplitLoopBodyIntoStages(operation))
+    return;
   const double childMultiplicity = multiplicity * trips;
+  RankedTensorType childMappedTensor = mappedTensor;
+  if (name == "tt.map_elementwise")
+    childMappedTensor = getRepresentativeTensorType(operation);
   for (Region &region : operation->getRegions())
     for (Block &block : region)
       for (Operation &nested : block.getOperations())
-        accumulateDynamicOperationTree(&nested, work, childMultiplicity,
-                                       fallbackLoopTripCount, estimates);
+        accumulateDynamicOperationTree(
+            &nested, work, childMultiplicity, fallbackLoopTripCount, estimates,
+            logicalProgramCountHint, childMappedTensor);
 }
 
 static int64_t countAlgorithmLoops(const LogicalStage &stage) {
@@ -669,6 +2110,26 @@ static int64_t countAlgorithmLoops(const LogicalStage &stage) {
   return count;
 }
 
+static int64_t
+inferRuntimeGridStrideIterations(const LogicalStage &stage,
+                                 int64_t logicalProgramCountHint) {
+  int64_t iterations = 1;
+  if (logicalProgramCountHint <= 0)
+    return iterations;
+  for (Operation *root : stage.operations) {
+    if (!root)
+      continue;
+    root->walk([&](Operation *operation) {
+      if (operation->hasAttr("ta.auto_blockify_v1.loop"))
+        return;
+      if (auto trips =
+              getGridStrideTripCount(operation, logicalProgramCountHint))
+        iterations = std::max(iterations, *trips);
+    });
+  }
+  return iterations;
+}
+
 static void mergeWorkload(StageWorkload &into, StageWorkload from) {
   into.scalarOperations += from.scalarOperations;
   into.loadBytes += from.loadBytes;
@@ -677,10 +2138,22 @@ static void mergeWorkload(StageWorkload &into, StageWorkload from) {
   into.storeOperations += from.storeOperations;
   into.loadWarpInstructions += from.loadWarpInstructions;
   into.storeWarpInstructions += from.storeWarpInstructions;
-  into.memoryAccesses.insert(into.memoryAccesses.end(), from.memoryAccesses.begin(),
+  into.sharedLocalLoadInstructions += from.sharedLocalLoadInstructions;
+  into.sharedLocalStoreInstructions += from.sharedLocalStoreInstructions;
+  into.privateStackLoadInstructions += from.privateStackLoadInstructions;
+  into.privateStackStoreInstructions += from.privateStackStoreInstructions;
+  into.memoryAccesses.insert(into.memoryAccesses.end(),
+                             from.memoryAccesses.begin(),
                              from.memoryAccesses.end());
+  llvm::append_range(into.atomicWorkloads, std::move(from.atomicWorkloads));
   for (const auto &[size, count] : from.indirectLoadCounts)
     into.indirectLoadCounts[size] += count;
+  for (const auto &[shape, count] : from.segmentedIndirectLoadCounts)
+    into.segmentedIndirectLoadCounts[shape] += count;
+  for (const auto &[shape, count] : from.indirectStoreCounts)
+    into.indirectStoreCounts[shape] += count;
+  for (const auto &[shape, count] : from.segmentedIndirectStoreCounts)
+    into.segmentedIndirectStoreCounts[shape] += count;
   for (const auto &[size, count] : from.continuousLoadCounts)
     into.continuousLoadCounts[size] += count;
   for (const auto &[size, count] : from.continuousStoreCounts)
@@ -689,18 +2162,52 @@ static void mergeWorkload(StageWorkload &into, StageWorkload from) {
     into.predicateCounts[size] += count;
   for (const auto &[shape, count] : from.prefixScanCounts)
     into.prefixScanCounts[shape] += count;
+  into.reductionOperations += from.reductionOperations;
   into.shuffleLaneSteps += from.shuffleLaneSteps;
+  for (const auto &[shape, count] : from.reductionGeometryCounts)
+    into.reductionGeometryCounts[shape] += count;
+  for (const auto &[combineClass, count] : from.reductionCombineClassCounts)
+    into.reductionCombineClassCounts[combineClass] += count;
+  for (const auto &[shape, count] : from.scalarizedMultiResultReductionCounts)
+    into.scalarizedMultiResultReductionCounts[shape] += count;
+  for (const auto &[shape, count] : from.sortCounts)
+    into.sortCounts[shape] += count;
+  for (const auto &[shape, count] :
+       from.oneTripMaskedAccumulatorReductionExtents)
+    into.oneTripMaskedAccumulatorReductionExtents[shape] += count;
   into.dotOperations += from.dotOperations;
   for (const auto &[flops, count] : from.dotFlopCounts)
     into.dotFlopCounts[flops] += count;
+  for (const auto &[key, entry] : from.dotOperandPaths) {
+    into.dotOperandPaths[key].first = entry.first;
+    into.dotOperandPaths[key].second += entry.second;
+  }
   into.dotFlops += from.dotFlops;
   into.loopBackedges += from.loopBackedges;
   into.conditionalBranches += from.conditionalBranches;
   into.divergentBranches += from.divergentBranches;
   into.synchronizations += from.synchronizations;
+  into.scalarLoadCount += from.scalarLoadCount;
+  into.scalarStoreCount += from.scalarStoreCount;
   for (const auto &[name, counts] : from.operationCounts)
     for (const auto &[size, count] : counts)
       into.operationCounts[name][size] += count;
+  for (TensorOperationWorkload &source : from.tensorOperationWorkloads) {
+    auto destination =
+        llvm::find_if(into.tensorOperationWorkloads,
+                      [&](const TensorOperationWorkload &item) {
+                        return item.operation == source.operation &&
+                               item.elementBitWidth == source.elementBitWidth &&
+                               item.contiguousElementsPerSegment ==
+                                   source.contiguousElementsPerSegment;
+                      });
+    if (destination == into.tensorOperationWorkloads.end()) {
+      into.tensorOperationWorkloads.push_back(std::move(source));
+      continue;
+    }
+    destination->logicalElements += source.logicalElements;
+    destination->segmentCount += source.segmentCount;
+  }
   recomputeIssueElements(into);
 }
 
@@ -874,6 +2381,10 @@ static bool operationTreeHasTrueLoopCarriedDependency(Operation *root) {
     if ((name != "scf.for" && name != "scf.while") ||
         operation->getNumRegions() == 0 || operation->getRegion(0).empty())
       return;
+    // A statically known zero/one-trip loop has no dynamic backedge, so its
+    // iter_arg is ordinary straight-line state rather than a recurrence.
+    if (hasKnownAtMostOneIteration(operation))
+      return;
     Block &body = operation->getRegion(0).front();
     const unsigned firstCarriedArgument = name == "scf.for" ? 1 : 0;
     for (unsigned index = firstCarriedArgument; index < body.getNumArguments();
@@ -896,6 +2407,34 @@ static bool operationTreeHasAnyName(Operation *root,
   });
 }
 
+/// A scalar GM access has a non-shaped value/result; tile accesses are shaped.
+static bool isScalarLoadOperation(Operation *operation) {
+  return operation && operation->getName().getStringRef() == "tt.load" &&
+         operation->getNumResults() > 0 &&
+         !isa<ShapedType>(operation->getResult(0).getType());
+}
+
+static bool isScalarStoreOperation(Operation *operation) {
+  return operation && operation->getName().getStringRef() == "tt.store" &&
+         operation->getNumOperands() > 1 &&
+         !isa<ShapedType>(operation->getOperand(1).getType());
+}
+
+static bool operationTreeHasScalarMemory(Operation *root, bool wantStore) {
+  auto matches = [&](Operation *operation) {
+    return wantStore ? isScalarStoreOperation(operation)
+                     : isScalarLoadOperation(operation);
+  };
+  bool found = matches(root);
+  if (found || !root)
+    return found;
+  root->walk([&](Operation *nested) {
+    if (!found)
+      found = matches(nested);
+  });
+  return found;
+}
+
 static bool operationTreeHasVectorCompute(Operation *root) {
   bool found = false;
   root->walk([&](Operation *operation) {
@@ -907,6 +2446,197 @@ static bool operationTreeHasVectorCompute(Operation *root) {
              !operation->hasTrait<OpTrait::ConstantLike>();
   });
   return found;
+}
+
+/// Operand index of the optional mask predicate of a memory operation.
+static std::optional<unsigned> getMemoryMaskOperandIndex(Operation *operation) {
+  const llvm::StringRef name = operation->getName().getStringRef();
+  if (name == "tt.load")
+    return 1u;
+  if (name == "tt.store" || name.starts_with("tt.atomic"))
+    return 2u;
+  return std::nullopt;
+}
+
+/// True when every use of `value` is a memory mask, allowing forwarding
+/// through shape helpers and predicate boolean algebra.
+static bool isMemoryMaskOnlyValue(Value value) {
+  llvm::SmallVector<Value, 8> worklist{value};
+  llvm::DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    for (OpOperand &use : current.getUses()) {
+      Operation *user = use.getOwner();
+      const std::optional<unsigned> maskOperand =
+          getMemoryMaskOperandIndex(user);
+      if (maskOperand && use.getOperandNumber() == *maskOperand)
+        continue;
+      const llvm::StringRef name = user->getName().getStringRef();
+      const bool maskForwarding =
+          name == "tt.splat" || name == "tt.broadcast" ||
+          name == "tt.expand_dims" || name == "arith.andi" ||
+          name == "arith.ori" || name == "arith.xori";
+      if (!maskForwarding)
+        return false;
+      llvm::append_range(worklist, user->getResults());
+    }
+  }
+  return true;
+}
+
+/// A structured algorithmic loop with no true loop-carried dependency.
+static bool isIndependentStructuredLoop(Operation *operation) {
+  if (!operation || operation->hasAttr("ta.auto_blockify_v1.loop"))
+    return false;
+  const llvm::StringRef name = operation->getName().getStringRef();
+  if ((name != "scf.for" && name != "scf.while") ||
+      operation->getNumRegions() == 0 || operation->getRegion(0).empty())
+    return false;
+  return !operationTreeHasTrueLoopCarriedDependency(operation);
+}
+
+/// Follow scalar cast/shape helpers to a Triton launch builtin.  Grid-stride
+/// loops normally use the builtin values directly, while index casts appear
+/// after a few canonicalization pipelines.
+static bool valueComesFrom(Value value, llvm::StringRef operationName) {
+  llvm::SmallVector<Value, 8> worklist{value};
+  llvm::DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    Operation *definition = current.getDefiningOp();
+    if (!definition)
+      continue;
+    if (definition->getName().getStringRef() == operationName)
+      return true;
+    const llvm::StringRef name = definition->getName().getStringRef();
+    if (name == "arith.index_cast" || name == "arith.bitcast" ||
+        name == "arith.extsi" || name == "arith.extui" ||
+        name == "arith.trunci" || name == "arith.addi" ||
+        name == "arith.subi" || name == "arith.muli" || name == "arith.divsi" ||
+        name == "arith.divui" || name == "arith.remsi" || name == "arith.remui")
+      llvm::append_range(worklist, definition->getOperands());
+  }
+  return false;
+}
+
+static bool isGridStrideLoop(Operation *operation) {
+  if (!operation || operation->getName().getStringRef() != "scf.for" ||
+      operation->getNumOperands() < 3 ||
+      operation->hasAttr("ta.auto_blockify_v1.loop"))
+    return false;
+  Value lower = operation->getOperand(0);
+  const bool directProgramId = valueComesFrom(lower, "tt.get_program_id");
+  // AutoBlockify rewrites the resident program id to a remainder modulo the
+  // original program count.  The outer loop induction then arrives as a
+  // block argument, so the original get_program_id is no longer reachable;
+  // remui(..., get_num_programs) is its canonical structural replacement.
+  Operation *lowerDefinition = lower.getDefiningOp();
+  const bool remappedProgramId =
+      lowerDefinition &&
+      (lowerDefinition->getName().getStringRef() == "arith.remui" ||
+       lowerDefinition->getName().getStringRef() == "arith.remsi") &&
+      valueComesFrom(lower, "tt.get_num_programs");
+  // AutoBlockify V1 can also replace the source loop's program-id lower bound
+  // directly with the scheduling loop induction argument.  A block argument
+  // has no defining operation, so the two provenance checks above cannot see
+  // it.  Accept only an induction argument owned by the explicitly tagged V1
+  // scheduling loop; the num-programs step below still proves grid-stride
+  // semantics and avoids classifying arbitrary nested loops this way.
+  bool autoBlockifyProgramId = false;
+  if (auto blockArgument = llvm::dyn_cast<BlockArgument>(lower)) {
+    Block *owner = blockArgument.getOwner();
+    Operation *blockOwner = owner ? owner->getParentOp() : nullptr;
+    autoBlockifyProgramId =
+        blockOwner && blockOwner->hasAttr("ta.auto_blockify_v1.loop");
+  }
+  return (directProgramId || remappedProgramId || autoBlockifyProgramId) &&
+         valueComesFrom(operation->getOperand(2), "tt.get_num_programs");
+}
+
+static bool isInsideGridStrideLoop(Operation *operation) {
+  for (Operation *parent = operation ? operation->getParentOp() : nullptr;
+       parent; parent = parent->getParentOp())
+    if (isGridStrideLoop(parent))
+      return true;
+  return false;
+}
+
+static bool shouldSplitLoopBodyIntoStages(Operation *operation) {
+  return isIndependentStructuredLoop(operation) &&
+         hasSimtAnchorInBody(operation);
+}
+
+static Operation *getPartitionSemanticRoot(Operation *operation) {
+  Operation *topLevelRoot = getTopLevelSemanticRoot(operation);
+  if (!topLevelRoot)
+    return topLevelRoot;
+
+  Operation *root = operation;
+  while (root != topLevelRoot) {
+    Operation *parent = root->getParentOp();
+    if (shouldSplitLoopBodyIntoStages(parent))
+      return root;
+    root = parent;
+  }
+  return topLevelRoot;
+}
+
+static void appendIndependentLoopBodyRoots(Operation *operation,
+                                           std::vector<Operation *> &roots) {
+  if (!shouldSplitLoopBodyIntoStages(operation) ||
+      operation->hasAttr("ta.auto_blockify_v1.loop"))
+    return;
+
+  for (Region &region : operation->getRegions()) {
+    for (Block &block : region) {
+      for (Operation &nested : block.getOperations()) {
+        if (nested.hasTrait<OpTrait::IsTerminator>())
+          continue;
+        roots.push_back(&nested);
+        appendIndependentLoopBodyRoots(&nested, roots);
+      }
+    }
+  }
+}
+
+static std::vector<Operation *> collectPartitionSemanticRoots(ModuleOp module) {
+  std::vector<Operation *> roots = collectTopLevelSemanticRoots(module);
+  std::vector<Operation *> expandedRoots;
+  for (Operation *root : roots) {
+    expandedRoots.push_back(root);
+    appendIndependentLoopBodyRoots(root, expandedRoots);
+  }
+  return expandedRoots;
+}
+
+/// Trip count of split independent structured loops enclosing `root`.
+static int64_t enclosingSplitLoopTripCount(Operation *root) {
+  int64_t trips = 1;
+  if (!root)
+    return trips;
+  for (Operation *parent = root->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (!shouldSplitLoopBodyIntoStages(parent))
+      continue;
+    const int64_t factor = std::max<int64_t>(1, getLoopTripCount(parent, 1));
+    if (trips > std::numeric_limits<int64_t>::max() / factor)
+      return std::numeric_limits<int64_t>::max();
+    trips *= factor;
+  }
+  return trips;
+}
+
+/// Entry multiplicity for one root when accumulating dynamic Stage work.
+static double semanticRootEntryMultiplicity(Operation *root) {
+  if (!root)
+    return 1.0;
+  if (shouldSplitLoopBodyIntoStages(root))
+    return static_cast<double>(getLoopTripCount(root, 1));
+  return static_cast<double>(enclosingSplitLoopTripCount(root));
 }
 
 /// Classify one transitive semantic ownership unit.  This function consumes
@@ -923,10 +2653,12 @@ static StageCostModelKind classifySemanticRoot(Operation *root) {
     return StageCostModelKind::PrefixScan;
   if (operationTreeHasAnyName(root, {"tt.reduce", "linalg.reduce"}))
     return StageCostModelKind::RowwiseReduction;
-  if (operationTreeHasAnyName(root, {"tt.dot"}))
+  if (operationTreeHasAnyName(root, {"tt.dot", "tt.dot_scaled"}))
     return StageCostModelKind::CubeRoofline;
   if (operationTreeHasAnyName(root, {"tt.atomic_rmw", "tt.atomic_cas"}))
     return StageCostModelKind::AtomicMemory;
+  if (operationTreeHasAnyName(root, {"tt.histogram"}))
+    return StageCostModelKind::VectorIssue;
   if (operationTreeContainsLoadedIndexMemory(root) ||
       operationTreeHasAnyName(root, {"tt.gather"}))
     return StageCostModelKind::IndirectGatherMemory;
@@ -983,8 +2715,7 @@ static int64_t semanticRootIterationCount(Operation *root) {
     if (!operation->hasAttr("ta.auto_blockify_v1.loop"))
       iterations = std::max(iterations, getLoopTripCount(operation, 1));
   });
-  // Loop-body body roots execute once per enclosing iteration: inherit the
-  // enclosing independent loop's trip count so per-Stage cost stays exact.
+  // Body roots inherit the enclosing split loop's trip count.
   iterations = std::max(iterations, enclosingSplitLoopTripCount(root));
   return iterations;
 }
@@ -1014,8 +2745,7 @@ static void collectOwnedOperationTree(Operation *root,
   owned.insert(root);
   // The AutoBlockify loop is intentionally split into a scheduling shell and
   // direct semantic body roots.  Treating the shell as the owner of its body
-  // would double-own every algorithm operation.  Independent algorithmic
-  // loops follow the same rule.
+  // would double-own every algorithm operation.
   if (root->hasAttr("ta.auto_blockify_v1.loop") ||
       shouldSplitLoopBodyIntoStages(root))
     return;
@@ -1099,6 +2829,20 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
   for (LogicalStage &stage : partition.stages) {
     stage.scopeInputTensorBytes = 0;
     stage.scopeOutputTensorBytes = 0;
+    // The current scope.scope -> HIVM conversion cannot legalize a locally
+    // wrapped atomic result/captured tensor contract: the outlined function
+    // retains MemRef block arguments and Stage2 fails.  Whole-kernel SIMT
+    // lowers the same atomic correctly, so reject only the local Mixed
+    // implementation before it can win route selection.  This is a backend
+    // materialization capability boundary for every AtomicMemory Stage, not
+    // an operator or address-shape policy.
+    if (stage.costModelKind == StageCostModelKind::AtomicMemory) {
+      stage.localSimtMaterializable = false;
+      stage.localSuperblockMaterializable = false;
+      stage.localSimtFactors.clear();
+      stage.simtAnchorIndices.clear();
+      continue;
+    }
     auto merged = mergeSimtStageAnchors(anchorPlan, stage.simtAnchorIndices);
     if (!merged) {
       // The selector materializes exactly the same merged descriptor.  A
@@ -1253,6 +2997,9 @@ static int semanticKindPriority(StageCostModelKind kind) {
     return 50;
   case StageCostModelKind::ConversionPack:
     return 40;
+  case StageCostModelKind::ScalarLoad:
+  case StageCostModelKind::ScalarStore:
+    return 35;
   case StageCostModelKind::ContinuousTileMemory:
   case StageCostModelKind::ContinuousTileStore:
   case StageCostModelKind::ContinuousShortLoad:
@@ -1263,9 +3010,6 @@ static int semanticKindPriority(StageCostModelKind kind) {
   case StageCostModelKind::PredicateMask:
   case StageCostModelKind::LoopPredicate:
     return 20;
-  case StageCostModelKind::ScalarLoad:
-  case StageCostModelKind::ScalarStore:
-    return 35;
   case StageCostModelKind::IndexGeneration:
     return 10;
   default:
@@ -1273,11 +3017,11 @@ static int semanticKindPriority(StageCostModelKind kind) {
   }
 }
 
-/// Scalar/vector/index/predicate work is a supporting resource of a Stage, rather
-/// than necessarily a Stage boundary of its own.  StageCostModel accounts for
-/// those resources inside every dominant model.  Keeping this distinction
-/// here prevents one Triton statement such as a masked load from being split
-/// into artificial index, predicate and memory Stages.
+/// Scalar/vector/index/predicate work is a supporting resource of a Stage,
+/// rather than necessarily a Stage boundary of its own.  StageCostModel
+/// accounts for those resources inside every dominant model.  Keeping this
+/// distinction here prevents one Triton statement such as a masked load from
+/// being split into artificial index, predicate and memory Stages.
 static bool isSupportingSemanticKind(StageCostModelKind kind) {
   switch (kind) {
   case StageCostModelKind::ScalarIssue:
@@ -1401,9 +3145,8 @@ StageBoundaryAnalysis::analyze(const ProgramStructure &structure,
 
     const int64_t anchorGroup = (*anchorGroups)[index];
     StageCostModelKind kind = classifySemanticRoot(root);
-    // A split loop's shell owns only control overhead; classification must
-    // not reach into the body it no longer owns (e.g. a scan inside the body
-    // must not relabel the backedge Stage as a reduction).
+    // A split loop shell owns control overhead only; do not classify it from
+    // anchors or reductions in its separately-owned body.
     if (shouldSplitLoopBodyIntoStages(root))
       kind = StageCostModelKind::IndependentPipelinedLoop;
     StageScheduleKind schedule = scheduleForSemanticRoot(root, kind);
@@ -1413,6 +3156,8 @@ StageBoundaryAnalysis::analyze(const ProgramStructure &structure,
     stage.localSimtMaterializable = anchorGroup >= 0;
     if (stage.localSimtMaterializable)
       stage.localSimtFactors = {1};
+    const bool startsWithSupportingKind = isSupportingSemanticKind(kind);
+    bool absorbedDominantWithoutSource = false;
 
     size_t next = index + 1;
     while (next < structure.rootOperations.size()) {
@@ -1423,12 +3168,26 @@ StageBoundaryAnalysis::analyze(const ProgramStructure &structure,
           scheduleForSemanticRoot(candidate, candidateKind);
       const bool sameCompoundAnchor =
           anchorGroup >= 0 && candidateAnchorGroup == anchorGroup;
+      const bool sourceLocationsUnavailable =
+          !getSourceStatement(stage.operations.back()->getLoc()) &&
+          !getSourceStatement(candidate->getLoc());
+      // TRITON_DISABLE_LINE_INFO deliberately replaces source locations with
+      // unknown.  Preserve the same structural partition in that mode: a
+      // straight-line prefix of address/index/predicate resources belongs to
+      // the first dominant operation it prepares.  Stop after that dominant
+      // operation so a following compute/store statement remains a boundary.
+      const bool mergeLocationlessSupportingPrefix =
+          startsWithSupportingKind && !absorbedDominantWithoutSource &&
+          sourceLocationsUnavailable &&
+          schedule == StageScheduleKind::StraightLine &&
+          candidateSchedule == StageScheduleKind::StraightLine;
       const bool mergePlainStage =
           anchorGroup < 0 && candidateAnchorGroup < 0 &&
           ((candidateKind == kind && candidateSchedule == schedule) ||
            (haveSameSourceStatement(stage.operations.back(), candidate) &&
             (isSupportingSemanticKind(kind) ||
-             isSupportingSemanticKind(candidateKind)))) &&
+             isSupportingSemanticKind(candidateKind))) ||
+           mergeLocationlessSupportingPrefix) &&
           !hasOrderedStageBoundary(stage.operations.back()) &&
           !hasOrderedStageBoundary(candidate);
       if (!sameCompoundAnchor && !mergePlainStage)
@@ -1444,6 +3203,9 @@ StageBoundaryAnalysis::analyze(const ProgramStructure &structure,
         kind = candidateKind;
         schedule = candidateSchedule;
       }
+      if (mergeLocationlessSupportingPrefix &&
+          !isSupportingSemanticKind(candidateKind))
+        absorbedDominantWithoutSource = true;
       ++next;
     }
     stage.costModelKind = kind;
@@ -1468,14 +3230,22 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
   for (LogicalStage &stage : partition.stages) {
     StageModelFeatures &facts = stage.features;
     const double activeLaneRatio = facts.activeLaneRatio;
+    const int64_t upperBoundLoopCount = facts.upperBoundLoopCount;
+    const int64_t unknownTripCountLoopCount = facts.unknownTripCountLoopCount;
     facts = StageModelFeatures{};
     facts.activeLaneRatio = activeLaneRatio;
+    facts.upperBoundLoopCount = upperBoundLoopCount;
+    facts.unknownTripCountLoopCount = unknownTripCountLoopCount;
     llvm::DenseSet<Operation *> owned;
     for (Operation *root : stage.operations)
       collectOwnedOperationTree(root, owned);
     bool hasMemory = false;
-    for (Operation *root : stage.operations)
+    bool hasContiguousMemory = false;
+    for (Operation *root : stage.operations) {
       facts.insideAutoBlockifyV1Loop |= isInsideAutoBlockifyV1Loop(root);
+      facts.isGridStrideLoopShell |= isGridStrideLoop(root);
+      facts.insideGridStrideLoopBody |= isInsideGridStrideLoop(root);
+    }
     for (Operation *operation : owned) {
       const llvm::StringRef name = operation->getName().getStringRef();
       if (name == "scf.for" || name == "scf.while") {
@@ -1483,7 +3253,8 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
         ++facts.loopBackedgeCount;
         if (!operation->hasAttr("ta.auto_blockify_v1.loop") &&
             operation->getNumRegions() > 0 &&
-            !operation->getRegion(0).empty()) {
+            !operation->getRegion(0).empty() &&
+            !hasKnownAtMostOneIteration(operation)) {
           Block &body = operation->getRegion(0).front();
           const unsigned firstCarriedArgument = name == "scf.for" ? 1 : 0;
           for (unsigned argumentIndex = firstCarriedArgument;
@@ -1527,8 +3298,8 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
       facts.hasReduction |=
           name == "tt.reduce" || name == "tt.scan" || name == "linalg.reduce";
       facts.hasPrefixScan |= name == "tt.scan";
-      facts.hasDot |=
-          name == "tt.dot" || name.contains("matmul") || name.contains("mmad");
+      facts.hasDot |= isDotOperationName(name) || name.contains("matmul") ||
+                      name.contains("mmad");
       facts.hasConversionPack |=
           name == "arith.extf" || name == "arith.truncf" ||
           name == "arith.fptosi" || name == "arith.fptoui" ||
@@ -1536,7 +3307,7 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
           name == "tt.fp_to_fp" || name.contains("convert") ||
           name.contains("pack") || name.contains("unpack");
     }
-    facts.hasContiguousMemory = hasMemory && !facts.hasIndirectMemory;
+    facts.hasContiguousMemory = hasMemory && hasContiguousMemory;
     if (!facts.isValid())
       return llvm::createStringError(std::errc::invalid_argument,
                                      "Stage '%s' has invalid features",
@@ -1585,10 +3356,37 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
   };
   for (LogicalStage &stage : partition.stages) {
     const StageModelFeatures &facts = stage.features;
-    if (stage.costModelKind == StageCostModelKind::AutoBlockifyDispatch ||
-        stage.costModelKind == StageCostModelKind::AutoBlockifyLoop)
+    const bool autoBlockifyKind =
+        stage.costModelKind == StageCostModelKind::AutoBlockifyDispatch ||
+        stage.costModelKind == StageCostModelKind::AutoBlockifyLoop;
+    // AutoBlockify marks both the synthetic scheduling shell and region owners
+    // that can contain the complete original kernel body.  Only the former is
+    // a dispatch/loop cost model.  Treating every marked owner as a shell drops
+    // its loads, stores, dot and recurrence resources from all-SIMD routes and
+    // reduces SIMT routes to an issue-only estimate.  Classify a marked owner
+    // from its mode-independent workload whenever it owns algorithmic data
+    // work; scalar dispatch/index bookkeeping alone remains a shell.
+    const bool hasAlgorithmicPayload =
+        stage.workload.loadBytes > 0.0 || stage.workload.storeBytes > 0.0 ||
+        stage.workload.loadOperations > 0.0 ||
+        stage.workload.storeOperations > 0.0 ||
+        !stage.workload.atomicWorkloads.empty() ||
+        stage.workload.reductionOperations > 0.0 ||
+        stage.workload.dotOperations > 0.0 || stage.workload.dotFlops > 0.0 ||
+        !stage.workload.operationCounts.empty() ||
+        !stage.workload.prefixScanCounts.empty() ||
+        stage.workload.scalarLoadCount > 0.0 ||
+        stage.workload.scalarStoreCount > 0.0;
+    // collectTopLevelSemanticRoots recursively exposes execute_region bodies.
+    // Preserve the AutoBlockify-body exception for those materialized body
+    // stages instead of treating their dot + recurrence/gather payload as an
+    // invalid unsplit top-level stage.
+    const bool autoBlockifyBody =
+        (autoBlockifyKind || facts.insideAutoBlockifyV1Loop) &&
+        hasAlgorithmicPayload;
+    if (autoBlockifyKind && !autoBlockifyBody)
       continue;
-    if (facts.hasDot &&
+    if (!autoBlockifyBody && facts.hasDot &&
         (facts.hasReduction || facts.hasIndirectMemory ||
          facts.hasAtomicMemory || facts.hasLoopCarriedDataDependency))
       return llvm::createStringError(
@@ -1665,7 +3463,8 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
       return stage.workload.dotFlops * stage.iterationCount <=
              static_cast<double>(tinyLimit);
     }();
-    if (!compatible(stage.costModelKind, facts) || !tinyDotShapeValid)
+    if (!compatible(stage.costModelKind, facts, stage.workload) ||
+        !tinyDotShapeValid)
       return llvm::createStringError(
           std::errc::invalid_argument,
           "Stage '%s' operation graph does not match StageCostModelKind '%s'",
@@ -1682,7 +3481,9 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
   return llvm::Error::success();
 }
 
-llvm::Error StageWorkloadAnalysis::analyze(StagePartition &partition) const {
+llvm::Error
+StageWorkloadAnalysis::analyze(StagePartition &partition,
+                               int64_t logicalProgramCountHint) const {
   if (!partition.operationOwnershipComplete)
     return llvm::createStringError(
         std::errc::invalid_argument,
@@ -1690,6 +3491,9 @@ llvm::Error StageWorkloadAnalysis::analyze(StagePartition &partition) const {
   for (LogicalStage &stage : partition.stages) {
     StageWorkload work;
     work.paysKernelSetup = stage.workload.paysKernelSetup;
+    stage.iterationCount = std::max(
+        stage.iterationCount,
+        inferRuntimeGridStrideIterations(stage, logicalProgramCountHint));
     const int64_t loopCount = countAlgorithmLoops(stage);
     const int64_t fallbackLoopTripCount =
         loopCount > 0 ? std::max<int64_t>(1, stage.iterationCount / loopCount)
@@ -1697,11 +3501,16 @@ llvm::Error StageWorkloadAnalysis::analyze(StagePartition &partition) const {
     stage.features.upperBoundLoopCount = 0;
     stage.features.unknownTripCountLoopCount = 0;
     for (Operation *root : stage.operations)
-      accumulateDynamicOperationTree(root, work, 1.0, fallbackLoopTripCount,
-                                     stage.features);
+      accumulateDynamicOperationTree(
+          root, work, semanticRootEntryMultiplicity(root),
+          fallbackLoopTripCount, stage.features, logicalProgramCountHint);
     recomputeIssueElements(work);
     stage.workload = std::move(work);
     makePerIteration(stage);
+    stage.features.activeLaneRatio = 1.0;
+    for (const StageMemoryAccess &access : stage.workload.memoryAccesses)
+      stage.features.activeLaneRatio =
+          std::min(stage.features.activeLaneRatio, access.activeElementRatio);
     if (!stage.workload.isFiniteAndNonNegative())
       return llvm::createStringError(
           std::errc::invalid_argument,
@@ -1770,25 +3579,56 @@ StageModeLegalityAnalysis::analyze(StagePartition &partition,
                                    int64_t maximumSuperblockFactor,
                                    bool scopeSuperblockMaterializable,
                                    int64_t maximumScopeSuperblockFactor) const {
-  const int64_t maximum =
-      std::clamp<int64_t>(maximumSuperblockFactor, 1, kMaximumSuperBlockFactor);
+  const int64_t maximum = std::clamp<int64_t>(maximumSuperblockFactor, 1, 64);
+  // Local and whole-kernel SuperBlock candidates consume the same SIMT warp
+  // resources.  Do not regenerate F4 here after evaluateStageModel has
+  // already reduced the target maximum to F2 for num_warps=32 (or to F1 for
+  // a smaller runtime grid).
   const int64_t localMaximum =
       scopeSuperblockMaterializable
-          ? std::clamp<int64_t>(maximumScopeSuperblockFactor, 1,
-                                kMaximumSuperBlockFactor)
+          ? std::min(maximum,
+                     std::clamp<int64_t>(maximumScopeSuperblockFactor, 1, 64))
           : 1;
   for (LogicalStage &stage : partition.stages) {
     stage.simdLegal = true;
     stage.simtLegal = true;
-    stage.legalSimtFactors.clear();
+    bool requiresFactorOneLocalSimt = false;
+    // The current SIMD backend materializes the common one-result associative
+    // add, multiply, min and max scans. Reject other combine graphs unless
+    // their returned values are defined by one of those supported operations.
+    for (Operation *root : stage.operations) {
+      root->walk([&](Operation *operation) {
+        // ascend.sort lowers through the SIMD-only native vsort template.
+        // Advertising a pure or local SIMT implementation lets automatic
+        // routing select a candidate that the downstream SIMT compiler
+        // cannot parse or materialize.
+        if (operation->getName().getStringRef() == "ascend.sort")
+          stage.simtLegal = false;
+        // Histogram is supported by the outlined SIMT pipeline, but its
+        // tensor result is one complete bin vector per logical program.  The
+        // current scope ABI cannot safely batch several such results through
+        // one SuperBlock capture, so retain the materializable F1 scope only.
+        if (operation->getName().getStringRef() == "tt.histogram")
+          requiresFactorOneLocalSimt = true;
+        if (operation->getName().getStringRef() != "tt.scan")
+          return;
+        // Judge the combine by the values returned from the region. Integer
+        // overflow instrumentation may add casts, compares, boolean logic and
+        // tt.assert beside the actual add. Those side checks do not change the
+        // scan combine lowered by the SIMD backend and must not make an
+        // additive scan look like an unsupported combine.
+        if (classifyScanCombine(operation) == "other")
+          stage.simdLegal = false;
+      });
+    }
+    stage.legalSimtFactors = {1};
     // A pure-SIMT SuperBlock factor is a whole-kernel schedule, not a
     // recurrence-only annotation.  Every SIMT Stage must therefore expose
     // the same factor candidates; KernelRouteSolver keeps the chosen factor
     // uniform.  Local mixed scopes stay restricted by localSimtFactors
     // (F1 unless Scope SuperBlock materialization is explicitly available).
-    for (int64_t factor : kSupportedSuperBlockFactors)
-      if (factor <= maximum)
-        stage.legalSimtFactors.push_back(factor);
+    for (int64_t factor = 2; factor <= maximum; factor *= 2)
+      stage.legalSimtFactors.push_back(factor);
     if (stage.localSimtMaterializable) {
       // The ABI-v2 scope materializer batches complete logical programs
       // around this Stage.  F2/F4 therefore does not require multiple
@@ -1796,18 +3636,84 @@ StageModeLegalityAnalysis::analyze(StagePartition &partition,
       // interpretation was only warp widening, not a SuperBlock.
       stage.localSimtFactors = {1};
       if (scopeSuperblockMaterializable && stage.localSuperblockMaterializable)
-        for (int64_t factor : kSupportedSuperBlockFactors)
-          if (factor > 1 && factor <= localMaximum)
-            stage.localSimtFactors.push_back(factor);
+        for (int64_t factor = 2; factor <= localMaximum; factor *= 2)
+          stage.localSimtFactors.push_back(factor);
+    }
+    if (requiresFactorOneLocalSimt && stage.localSimtMaterializable) {
+      stage.localSuperblockMaterializable = false;
+      stage.localSimtFactors = {1};
     }
     if (stage.localSimtMaterializable &&
         (stage.localSimtFactors.empty() ||
          llvm::any_of(stage.localSimtFactors, [&](int64_t factor) {
-           return factor > localMaximum || !isSupportedSuperBlockFactor(factor);
+           return factor < 1 || factor > localMaximum ||
+                  (factor & (factor - 1)) != 0;
          })))
       return llvm::createStringError(
           std::errc::invalid_argument,
           "local SIMT factors are invalid for Stage '%s'", stage.id.c_str());
+  }
+  return llvm::Error::success();
+}
+
+llvm::Error StageResourceLegalityAnalysis::applySimtUbCapacity(
+    StagePartition &partition, int64_t usableUbBytes) const {
+  if (usableUbBytes < 0)
+    return llvm::createStringError(
+        std::errc::invalid_argument,
+        "SIMT usable UB capacity must be nonnegative");
+  if (usableUbBytes == 0)
+    return llvm::Error::success();
+
+  for (LogicalStage &stage : partition.stages) {
+    stage.simtUsableUbBytes = usableUbBytes;
+    stage.simtUbWorkingSetBytesPerProgram = 0;
+    stage.simtFactorsRejectedByUb.clear();
+    if (!stage.wholeSimtRegisterPressure)
+      continue;
+    const SimtRegisterPressure &facts = *stage.wholeSimtRegisterPressure;
+    if (!facts.ttirMaximumWeakDotComponentGeometryKnown)
+      continue;
+    const int64_t m = facts.ttirMaximumWeakDotComponentM;
+    const int64_t n = facts.ttirMaximumWeakDotComponentN;
+    const int64_t k = facts.ttirMaximumWeakDotComponentK;
+    const int64_t elementBits = facts.ttirMaximumWeakDotComponentElementBits;
+    if (m <= 0 || n <= 0 || k <= 0 || elementBits <= 0)
+      continue;
+
+    // lhs[M,K], rhs[K,N] and accumulator[M,N] are simultaneously visible at
+    // a dot in TTIR.  This upper bound is independent of the operator and of
+    // measured elapsed time.  It intentionally leaves backend streaming and
+    // reuse as future refinements instead of assuming capacity that lowering
+    // cannot guarantee.
+    const __int128 elements = static_cast<__int128>(m) * k +
+                              static_cast<__int128>(k) * n +
+                              static_cast<__int128>(m) * n;
+    const __int128 elementBytes = (static_cast<__int128>(elementBits) + 7) / 8;
+    const __int128 workingSet = elements * elementBytes;
+    stage.simtUbWorkingSetBytesPerProgram =
+        workingSet > std::numeric_limits<int64_t>::max()
+            ? std::numeric_limits<int64_t>::max()
+            : static_cast<int64_t>(workingSet);
+
+    auto exceedsCapacity = [&](int64_t factor) {
+      return factor <= 0 || workingSet * factor > usableUbBytes;
+    };
+    auto filter = [&](std::vector<int64_t> &factors) {
+      llvm::erase_if(factors, [&](int64_t factor) {
+        if (!exceedsCapacity(factor))
+          return false;
+        if (!llvm::is_contained(stage.simtFactorsRejectedByUb, factor))
+          stage.simtFactorsRejectedByUb.push_back(factor);
+        return true;
+      });
+    };
+    filter(stage.legalSimtFactors);
+    filter(stage.localSimtFactors);
+    llvm::sort(stage.simtFactorsRejectedByUb);
+    stage.simtLegal =
+        !stage.legalSimtFactors.empty() ||
+        (stage.localSimtMaterializable && !stage.localSimtFactors.empty());
   }
   return llvm::Error::success();
 }
@@ -1822,7 +3728,8 @@ StagePartitioner::partition(ModuleOp module, const SimtAnchorPlan &anchorPlan,
   if (!result)
     return result.takeError();
   StageWorkloadAnalysis workloadAnalysis;
-  if (llvm::Error error = workloadAnalysis.analyze(*result))
+  if (llvm::Error error =
+          workloadAnalysis.analyze(*result, options.logicalProgramCountHint))
     return std::move(error);
   StageFeatureAnalysis featureAnalysis;
   if (llvm::Error error = featureAnalysis.analyze(*result))

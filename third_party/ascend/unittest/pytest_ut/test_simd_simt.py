@@ -739,8 +739,12 @@ def test_gather_then_tldot_2d():
     BLOCK_N = 16
     BLOCK_K = 16
 
-    src_a = torch.arange(M * K_SRC, dtype=torch.float16, device='npu').reshape(M, K_SRC)
-    src_b = torch.arange(K_SRC * N, dtype=torch.float16, device='npu').reshape(K_SRC, N)
+    # Bounded values keep this test focused on gather-to-dot lowering instead
+    # of device-specific accumulation of large FP16 products.
+    host_a = (((torch.arange(M * K_SRC, dtype=torch.int32, device='cpu') * 17 + 3) % 257) - 128).to(torch.float32) / 128
+    host_b = (((torch.arange(K_SRC * N, dtype=torch.int32, device='cpu') * 29 + 5) % 251) - 125).to(torch.float32) / 128
+    src_a = host_a.to(torch.float16).reshape(M, K_SRC).npu()
+    src_b = host_b.to(torch.float16).reshape(K_SRC, N).npu()
     indices = torch.tensor(
         [10, 25, 100, 200, 5, 50, 150, 255, 1, 2, 3, 4, 6, 7, 8, 9],
         dtype=torch.int32,
@@ -768,6 +772,8 @@ def test_gather_then_tldot_2d():
         compile_mode='simd_simt',
     )
 
-    expected = torch.matmul(src_a[:, indices].to(torch.float32), src_b[indices, :].to(torch.float32))
-    torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
-    return True
+    host_indices = indices.cpu().to(torch.int64)
+    expected = torch.matmul(src_a.cpu()[:, host_indices].to(torch.float32),
+                            src_b.cpu()[host_indices, :].to(torch.float32))
+    torch.npu.synchronize()
+    torch.testing.assert_close(output.cpu(), expected, rtol=1e-2, atol=1e-2)

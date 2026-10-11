@@ -3,26 +3,32 @@
 #include <acl/acl.h>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
 #include <cstdlib>
+#include <fstream>
 #include <vector>
 
 using namespace std;
 static void check(int code, const char *name) {
-  if (code) { fprintf(stderr, "%s: %d\n", name, code); exit(1); }
+  if (code) {
+    fprintf(stderr, "%s: %d\n", name, code);
+    exit(1);
+  }
 }
 constexpr size_t GM_BYTES = 128ULL * 1024 * 1024;
 
 static char *readBin(const char *f, uint32_t *sz) {
   ifstream s(f, ios::binary);
-  if (!s) exit(1);
+  if (!s)
+    exit(1);
   s.seekg(0, ios::end);
   size_t n = s.tellg();
-  if (!n) exit(1);
+  if (!n)
+    exit(1);
   s.seekg(0);
   char *b = new char[n];
   s.read(b, n);
-  if (!s) exit(1);
+  if (!s)
+    exit(1);
   *sz = n;
   return b;
 }
@@ -58,26 +64,33 @@ static long long runK(const char *fn, rtStream_t stream, void *dout, void *gm,
   ai.argsSize = sizeof(args);
   rtTaskCfgInfo_t cfg = {};
   cfg.localMemorySize = 192 * 1024;
-  if (mode == 0) check(rtMemset(gm, GM_BYTES, 0, GM_BYTES), "initialize input");
-  check(rtKernelLaunchWithFlagV2((void *)fn, 1, &ai, 0, stream, 0, &cfg), "launch");
+  if (mode == 0)
+    check(rtMemset(gm, GM_BYTES, 0, GM_BYTES), "initialize input");
+  check(rtKernelLaunchWithFlagV2((void *)fn, 1, &ai, 0, stream, 0, &cfg),
+        "launch");
   check(rtStreamSynchronize(stream), "synchronize");
   long long cycles = 0;
   check(rtMemcpy(&cycles, sizeof(cycles), dout, sizeof(cycles),
-                 RT_MEMCPY_DEVICE_TO_HOST), "copy ticks");
+                 RT_MEMCPY_DEVICE_TO_HOST),
+        "copy ticks");
   vector<float> values(nwarp * 32);
   check(rtMemcpy(values.data(), values.size() * sizeof(float),
                  static_cast<char *>(dout) + 32, values.size() * sizeof(float),
-                 RT_MEMCPY_DEVICE_TO_HOST), "copy sink");
+                 RT_MEMCPY_DEVICE_TO_HOST),
+        "copy sink");
   for (int tid = 0; tid < nwarp * 32; ++tid)
-    if (cycles <= 0 || values[tid] != tid + 1 + (mode ? iters : 0)) exit(2);
+    if (cycles <= 0 || values[tid] != tid + 1 + (mode ? iters : 0))
+      exit(2);
   if (mode) {
     vector<float> stores(static_cast<size_t>(iters) * nwarp * 32 * 8);
     check(rtMemcpy(stores.data(), stores.size() * sizeof(float), gm,
-                   stores.size() * sizeof(float), RT_MEMCPY_DEVICE_TO_HOST), "copy stores");
+                   stores.size() * sizeof(float), RT_MEMCPY_DEVICE_TO_HOST),
+          "copy stores");
     for (int i = 0; i < iters; ++i)
       for (int j = 0; j < 8; ++j)
         for (int tid = 0; tid < nwarp * 32; ++tid)
-          if (stores[(i * 8 + j) * nwarp * 32 + tid] != tid + 1 + i + j) exit(2);
+          if (stores[(i * 8 + j) * nwarp * 32 + tid] != tid + 1 + i + j)
+            exit(2);
   }
   printf("sample,%d,%d,%d,%d,%lld,PASS\n", nwarp, mode, K, iters, cycles);
   return cycles;
@@ -115,7 +128,8 @@ int main() {
   check(rtStreamCreate(&stream, 0), "stream");
   void *dout = nullptr;
   void *gm = nullptr;
-  check(rtMalloc(&dout, 32 + 1024 * sizeof(float), RT_MEMORY_HBM, 0), "allocate output");
+  check(rtMalloc(&dout, 32 + 1024 * sizeof(float), RT_MEMORY_HBM, 0),
+        "allocate output");
   check(rtMalloc(&gm, GM_BYTES, RT_MEMORY_HBM, 0), "allocate GM");
   check(rtMemset(gm, GM_BYTES, 0, GM_BYTES), "initialize GM");
 

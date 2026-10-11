@@ -53,6 +53,12 @@
         "factor": 1.0,
         "confidence": "medium"
       },
+      "f32.relu": {
+        "description": "ReLU helper uses the measured maximum-class vector throughput as a semantic operation distinct from binary maximum.",
+        "relative_to": "f32.max",
+        "factor": 1.0,
+        "confidence": "medium"
+      },
       "f32.abs": {
         "description": "IR-audited DT measurement; four vabs instructions survive optimized LLVM IR.",
         "relative_to": "f32.add",
@@ -158,6 +164,12 @@
         "description": "IR-audited DT measurement using four independent cyclic value pairs so repeated max operations cannot be folded.",
         "relative_to": "f32.add",
         "factor": 2.687371,
+        "confidence": "medium"
+      },
+      "f32.relu": {
+        "description": "SIMT ReLU helper uses the measured maximum-class scalar throughput as a distinct semantic operation.",
+        "relative_to": "f32.max",
+        "factor": 1.0,
         "confidence": "medium"
       },
       "f32.abs": {

@@ -741,22 +741,22 @@ def make_launcher(constants, signature, metadata):
     lock_init_value = int(metadata.lock_init_value if hasattr(metadata, 'lock_init_value') else metadata.
                           lock_init_val if hasattr(metadata, 'lock_init_val') else 0)
     sync_block_lock_layout = int(getattr(metadata, "sync_block_lock_layout", 0))
-    ordered_sync_block_lock_count = sync_block_lock_layout & 0xFFFFFFFF
+    # BiShengIR packs the unordered-lock count into the high 32 bits. The low
+    # 32 bits retain the legacy ordered-lock allocation in i64 units.
+    ordered_sync_block_lock_i64_count = sync_block_lock_layout & 0xFFFFFFFF
     unordered_sync_block_lock_count = (sync_block_lock_layout >> 32) & 0xFFFFFFFF
-    has_sync_block_lock = (ordered_sync_block_lock_count + unordered_sync_block_lock_count) > 0
+    has_sync_block_lock = (ordered_sync_block_lock_i64_count + unordered_sync_block_lock_count) > 0
     unordered_sync_block_participant_factor = (2 if unordered_sync_block_lock_count > 0 and metadata.mix_mode == "mix"
                                                and getattr(metadata, "auto_tile_and_bind_subblock", False) else 1)
     sync_block_lock_layout_stmt = f"""
     constexpr uint64_t syncBlockLockCacheLineI64 = 8;
-    constexpr uint64_t syncBlockLockOrderedCount = {ordered_sync_block_lock_count};
+    constexpr uint64_t syncBlockLockOrderedI64Count = {ordered_sync_block_lock_i64_count};
     constexpr uint64_t syncBlockLockUnorderedCount = {unordered_sync_block_lock_count};
     constexpr uint64_t syncBlockLockParticipantFactor = {unordered_sync_block_participant_factor};
     const uint64_t syncBlockLockParticipantNum =
         blockNum * syncBlockLockParticipantFactor;
     const uint64_t syncBlockLockUnorderedStrideI64 =
         (1 + 2 * syncBlockLockParticipantNum) * syncBlockLockCacheLineI64;
-    const uint64_t syncBlockLockOrderedI64Count =
-        syncBlockLockOrderedCount * syncBlockLockCacheLineI64;
     const uint64_t syncBlockLockI64Count = syncBlockLockOrderedI64Count +
         syncBlockLockUnorderedCount * syncBlockLockUnorderedStrideI64;
     const uint64_t syncBlockLockSize = syncBlockLockI64Count * sizeof(int64_t);"""

@@ -9,12 +9,16 @@
 
 using namespace std;
 static void check(int code, const char *op) {
-  if (code) { fprintf(stderr, "%s: %d\n", op, code); exit(EXIT_FAILURE); }
+  if (code) {
+    fprintf(stderr, "%s: %d\n", op, code);
+    exit(EXIT_FAILURE);
+  }
 }
 
 static char *readBin(const char *f, uint32_t *sz) {
   ifstream s(f, ios::binary);
-  if (!s) exit(EXIT_FAILURE);
+  if (!s)
+    exit(EXIT_FAILURE);
   s.seekg(0, ios::end);
   size_t n = s.tellg();
   s.seekg(0);
@@ -54,21 +58,24 @@ static long long runK(const char *fn, rtStream_t stream, void *dout, int K,
   ai.argsSize = sizeof(args);
   rtTaskCfgInfo_t cfg = {};
   cfg.localMemorySize = 192 * 1024;
-  check(rtKernelLaunchWithFlagV2((void *)fn, 1, &ai, 0, stream, 0, &cfg), "rtKernelLaunchWithFlagV2");
+  check(rtKernelLaunchWithFlagV2((void *)fn, 1, &ai, 0, stream, 0, &cfg),
+        "rtKernelLaunchWithFlagV2");
   check(rtStreamSynchronize(stream), "rtStreamSynchronize");
   long long ticks = 0;
   check(rtMemcpy(&ticks, sizeof(ticks), dout, sizeof(ticks),
-                 RT_MEMCPY_DEVICE_TO_HOST), "copy results");
+                 RT_MEMCPY_DEVICE_TO_HOST),
+        "copy results");
   vector<float> values(32768 + nwarp * 32);
   check(rtMemcpy(values.data(), values.size() * sizeof(float),
                  static_cast<char *>(dout) + 32, values.size() * sizeof(float),
-                 RT_MEMCPY_DEVICE_TO_HOST), "copy UB");
+                 RT_MEMCPY_DEVICE_TO_HOST),
+        "copy UB");
   for (int tid = 0; tid < nwarp * 32; ++tid) {
     long long expected = tid + 1 + iters * (mode == 0 ? 8 : 1);
     float actual = values[32768 + tid];
     if (actual != expected) {
-      fprintf(stderr, "Incorrect result tid=%d got=%f expected=%lld\n",
-              tid, actual, expected);
+      fprintf(stderr, "Incorrect result tid=%d got=%f expected=%lld\n", tid,
+              actual, expected);
       exit(EXIT_FAILURE);
     }
   }
@@ -81,9 +88,10 @@ static long long runK(const char *fn, rtStream_t stream, void *dout, int K,
             exit(EXIT_FAILURE);
     }
   }
-  if (ticks <= 0) exit(EXIT_FAILURE);
-  printf("RAW K=%d warps=%d iters=%d mode=%d ticks=%lld PASS\n",
-         K, nwarp, iters, mode, ticks);
+  if (ticks <= 0)
+    exit(EXIT_FAILURE);
+  printf("RAW K=%d warps=%d iters=%d mode=%d ticks=%lld PASS\n", K, nwarp,
+         iters, mode, ticks);
   return ticks;
 }
 
@@ -114,11 +122,13 @@ int main() {
   char *binary = nullptr;
   void *handle = reg("simt_memory.o", &binary);
   const char *fn = "measure";
-  check(rtFunctionRegister(handle, fn, fn, (void *)fn, 0), "rtFunctionRegister");
+  check(rtFunctionRegister(handle, fn, fn, (void *)fn, 0),
+        "rtFunctionRegister");
   rtStream_t stream;
   check(rtStreamCreate(&stream, 0), "rtStreamCreate");
   void *dout = nullptr;
-  check(rtMalloc(&dout, 32 + (32768 + 1024) * sizeof(float), RT_MEMORY_HBM, 0), "rtMalloc");
+  check(rtMalloc(&dout, 32 + (32768 + 1024) * sizeof(float), RT_MEMORY_HBM, 0),
+        "rtMalloc");
 
   runK(fn, stream, dout, 2, 32, 4, 16, 0);
   printf("SIMT UB memory, eight operations/thread/iteration\n");

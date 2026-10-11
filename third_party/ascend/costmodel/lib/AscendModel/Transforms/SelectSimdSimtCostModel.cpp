@@ -17,6 +17,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseSet.h"
@@ -28,8 +29,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <system_error>
+#include <utility>
 
 namespace mlir {
 namespace ascend {
@@ -55,6 +58,45 @@ inline constexpr llvm::StringLiteral kReportJSONAttr =
     "ascend.simt_costmodel.report_json";
 inline constexpr llvm::StringLiteral kSuperblockFactorAttr =
     "ascend.simt_costmodel.superblock_factor";
+inline constexpr llvm::StringLiteral kRuntimeScalarValueAttr =
+    "ascend.costmodel.runtime_value";
+
+static LogicalResult
+attachRuntimeScalarValues(ModuleOp module,
+                          const llvm::json::Object &capability) {
+  const auto *values = capability.getArray("runtime_scalar_values");
+  if (!values)
+    return success();
+
+  llvm::SmallVector<std::pair<unsigned, int64_t>> parsed;
+  for (const llvm::json::Value &value : *values) {
+    const auto *entry = value.getAsObject();
+    if (!entry)
+      return failure();
+    auto argumentIndex = entry->getInteger("argument_index");
+    auto runtimeValue = entry->getInteger("value");
+    if (!argumentIndex || *argumentIndex < 0 || !runtimeValue)
+      return failure();
+    parsed.emplace_back(static_cast<unsigned>(*argumentIndex), *runtimeValue);
+  }
+
+  Builder builder(module.getContext());
+  bool attached = parsed.empty();
+  module.walk([&](FunctionOpInterface function) {
+    auto visibility = function->getAttrOfType<StringAttr>("sym_visibility");
+    if (visibility && visibility.getValue() != "public")
+      return;
+    if (llvm::any_of(parsed, [&](const auto &entry) {
+          return entry.first >= function.getNumArguments();
+        }))
+      return;
+    for (const auto &[argumentIndex, runtimeValue] : parsed)
+      function.setArgAttr(argumentIndex, kRuntimeScalarValueAttr,
+                          builder.getI64IntegerAttr(runtimeValue));
+    attached = true;
+  });
+  return success(attached);
+}
 
 static bool containsExplicitVectorScope(ModuleOp module) {
   bool found = false;
@@ -169,26 +211,63 @@ struct SelectSimdSimtCostModelPass
     options.numWarps =
         static_cast<unsigned>(std::max<int64_t>(1, numWarps.getValue()));
     options.includeFeaturesInJSON = true;
+    const char *detailedReport =
+        std::getenv("TRITON_ASCEND_COSTMODEL_DETAILED_REPORT");
+    const bool includeDiagnosticStageDetails =
+        !autoMode || (detailedReport && *detailedReport &&
+                      llvm::StringRef(detailedReport) != "0");
+    options.includeDiagnosticStageDetailsInJSON = includeDiagnosticStageDetails;
+    options.collectCalibrationEstimates = includeDiagnosticStageDetails;
     options.compileOn91095 = compileOn91095.getValue();
     options.wholeKernelSuperblockMaterializable =
         wholeKernelSuperblockMaterializable.getValue();
     options.scopeSuperblockMaterializable =
         scopeSuperblockMaterializable.getValue();
     options.maximumWholeKernelSuperblockFactor =
-        std::clamp<int64_t>(maximumWholeKernelSuperblockFactor.getValue(), 1,
-                            kMaximumSuperBlockFactor);
-    options.maximumScopeSuperblockFactor = std::clamp<int64_t>(
-        maximumScopeSuperblockFactor.getValue(), 1, kMaximumSuperBlockFactor);
+        std::max<int64_t>(1, maximumWholeKernelSuperblockFactor.getValue());
+    options.maximumScopeSuperblockFactor =
+        std::max<int64_t>(1, maximumScopeSuperblockFactor.getValue());
     options.logicalProgramCountHint =
         std::max<int64_t>(0, logicalProgramCountHint.getValue());
     if (auto capability =
             llvm::json::parse(routeTransformCapabilityJSON.getValue()))
       if (auto *object = capability->getAsObject()) {
+        if (failed(attachRuntimeScalarValues(analysisModule, *object))) {
+          module.emitError("invalid runtime scalar values in route capability");
+          signalPassFailure();
+          return;
+        }
+        if (auto count =
+                object->getInteger("source_logical_program_count_hint"))
+          options.sourceLogicalProgramCountHint = std::max<int64_t>(0, *count);
         if (auto count = object->getInteger("physical_vector_core_count_hint"))
           options.physicalVectorCoreCountHint = std::max<int64_t>(0, *count);
         if (auto count = object->getInteger("physical_aicore_count_hint"))
           options.physicalAiCoreCountHint = std::max<int64_t>(0, *count);
-        auto readFactors = [&](StringRef key, std::vector<int64_t> &factors) {
+        if (auto count = object->getInteger("cv_aiv_subblock_count")) {
+          if (*count != 1 && *count != 2) {
+            module.emitError("invalid CV AIV subblock count");
+            signalPassFailure();
+            return;
+          }
+          options.cvAivSubblocks = *count;
+        }
+        if (auto forced = object->getString("backend_forced_route_candidate")) {
+          if (*forced == kAllSimd)
+            options.backendForcedDecision = SimdSimtCandidateKind::AllSIMD;
+          else if (*forced == kAllSimtOnly)
+            options.backendForcedDecision = SimdSimtCandidateKind::AllSIMTOnly;
+          else if (*forced == kMixedSimdSimt)
+            options.backendForcedDecision =
+                SimdSimtCandidateKind::MixedSIMDSIMT;
+          else {
+            module.emitError("invalid backend-forced SIMD/SIMT route");
+            signalPassFailure();
+            return;
+          }
+        }
+        auto readFactors = [&](StringRef key, int64_t maximum,
+                               std::vector<int64_t> &factors) {
           if (!object->get(key))
             return true;
           auto *values = object->getArray(key);
@@ -197,15 +276,18 @@ struct SelectSimdSimtCostModelPass
           factors.clear();
           for (const auto &value : *values) {
             auto factor = value.getAsInteger();
-            if (!factor || (*factor != 1 && *factor != 2 && *factor != 4))
+            if (!factor || *factor < 1 || *factor > maximum ||
+                (*factor & (*factor - 1)) != 0)
               return false;
             factors.push_back(*factor);
           }
           return true;
         };
         if (!readFactors("whole_kernel_superblock_factors",
+                         options.maximumWholeKernelSuperblockFactor,
                          options.wholeKernelSuperblockFactors) ||
             !readFactors("scope_superblock_factors",
+                         options.maximumScopeSuperblockFactor,
                          options.scopeSuperblockFactors)) {
           module.emitError("invalid backend SuperBlock factor set");
           signalPassFailure();
@@ -349,30 +431,28 @@ struct SelectSimdSimtCostModelPass
         static_cast<int64_t>(mixedAnchors.size());
     reportJSON["selected_superblock_factor"] = selectedSuperblockFactor;
     reportJSON["logical_program_count_hint"] = options.logicalProgramCountHint;
+    reportJSON["source_logical_program_count_hint"] =
+        options.sourceLogicalProgramCountHint;
     const StageRoutePlan *selectedRuntimePlan =
-        recommended == kAllSimd
-            ? &report.stageModel.allSimd
-            : recommended == kAllSimtOnly ? &report.stageModel.allSimt
-                                          : &report.stageModel.mixed;
+        recommended == kAllSimd       ? &report.stageModel.allSimd
+        : recommended == kAllSimtOnly ? &report.stageModel.allSimt
+                                      : &report.stageModel.mixed;
     reportJSON["runtime_physical_program_count"] =
         selectedRuntimePlan->runtimePhysicalProgramCount;
     reportJSON["runtime_scheduling_slot_count"] =
         selectedRuntimePlan->runtimeSchedulingSlotCount;
     reportJSON["logical_programs_per_scheduling_slot"] =
         selectedRuntimePlan->runtimeLogicalProgramsPerSchedulingSlot;
-    reportJSON["full_group_count"] =
-        selectedRuntimePlan->runtimeFullGroupCount;
-    reportJSON["tail_count"] =
-        selectedRuntimePlan->runtimeTailProgramCount;
+    reportJSON["full_group_count"] = selectedRuntimePlan->runtimeFullGroupCount;
+    reportJSON["tail_count"] = selectedRuntimePlan->runtimeTailProgramCount;
     reportJSON["runtime_loop_iteration_count"] =
         selectedRuntimePlan->runtimeLoopIterationCount;
     const int64_t effectiveRuntimeFactor =
-        recommended == kAllSimd
+        recommended == kAllSimd ? 1
+        : recommended == kMixedSimdSimt &&
+                selectedRuntimePlan->runtimeFullGroupCount == 0
             ? 1
-            : recommended == kMixedSimdSimt &&
-                      selectedRuntimePlan->runtimeFullGroupCount == 0
-                  ? 1
-                  : selectedSuperblockFactor;
+            : selectedSuperblockFactor;
     reportJSON["effective_runtime_factor"] = effectiveRuntimeFactor;
     std::string json =
         llvm::formatv("{0}", llvm::json::Value(std::move(reportJSON))).str();

@@ -46,10 +46,8 @@ FAMILY_RESOURCE_KEYS = {
     # until a composite signature can be measured.
     "control": (),
     "synchronization": (),
-    "shared_local": ("shared_local_load_per_iteration",
-                      "shared_local_store_per_iteration"),
-    "private_stack": ("private_stack_load_per_iteration",
-                       "private_stack_store_per_iteration"),
+    "shared_local": ("shared_local_load_per_iteration", "shared_local_store_per_iteration"),
+    "private_stack": ("private_stack_load_per_iteration", "private_stack_store_per_iteration"),
 }
 
 
@@ -161,10 +159,8 @@ def addr2line(binary, addresses, load_bias, executable):
         stack = stacks.get(address, [])
         # Inline stacks often start in a CCE intrinsic or library helper.  The
         # Triton source frame is the evidence required by Stage provenance.
-        locations[address] = next(
-            (line for line in stack
-             if re.search(r"\.(?:py|mlir|ttir|npuir|cce):\d+", line)),
-            stack[0] if stack else "??:0")
+        locations[address] = next((line for line in stack if re.search(r"\.(?:py|mlir|ttir|npuir|cce):\d+", line)),
+                                  stack[0] if stack else "??:0")
     return locations
 
 
@@ -188,19 +184,13 @@ def read_instruction_source_attribution(path, predicted, binary, load_bias, exec
     # not PCs in the loaded kernel image and must not make addr2line attribution
     # fail for every real instruction in the trace.
     sentinel_rows = [
-        row for row in rows
-        if parse_int(row["addr"]) < load_bias
-        and float(row.get("running_time(us)") or 0.0) == 0.0
+        row for row in rows if parse_int(row["addr"]) < load_bias and float(row.get("running_time(us)") or 0.0) == 0.0
     ]
-    invalid_rows = [
-        row for row in rows
-        if parse_int(row["addr"]) < load_bias and row not in sentinel_rows
-    ]
+    invalid_rows = [row for row in rows if parse_int(row["addr"]) < load_bias and row not in sentinel_rows]
     if invalid_rows:
         names = sorted({row["instr"] for row in invalid_rows})
-        raise RuntimeError(
-            "non-sentinel CaModel instruction address is below the supplied "
-            f"load bias: {names}")
+        raise RuntimeError("non-sentinel CaModel instruction address is below the supplied "
+                           f"load bias: {names}")
     rows = [row for row in rows if row not in sentinel_rows]
     addresses = sorted({parse_int(row["addr"]) for row in rows})
     locations = addr2line(binary, addresses, load_bias, executable)
@@ -242,8 +232,7 @@ def read_instruction_source_attribution(path, predicted, binary, load_bias, exec
 
 
 def source_line_key(value):
-    match = re.search(
-        r'([^/\\"()]+\.(?:py|mlir|ttir|npuir|cce))"?:(\d+)', value)
+    match = re.search(r'([^/\\"()]+\.(?:py|mlir|ttir|npuir|cce))"?:(\d+)', value)
     if not match:
         return None
     return f"{match.group(1)}:{match.group(2)}"
@@ -342,43 +331,46 @@ def predicted_stage_rows(model, route_name):
         implementation = implementation_for(stage, selection)
         resources = implementation["resource_system_cycles"]
         rows.append({
-            "id": stage["id"],
-            "kind": stage.get("model"),
-            "source_locations": stage.get("source_locations", []),
-            "implementation": selection["implementation"],
+            "id":
+            stage["id"],
+            "kind":
+            stage.get("model"),
+            "source_locations":
+            stage.get("source_locations", []),
+            "implementation":
+            selection["implementation"],
             # Preserve the runtime-domain audit emitted by StageRoutePlan.
             # These fields are essential when a Mixed report contains both
             # the parent AIC loop and a local AIV scope; without them a
             # downstream comparison can accidentally apply one Q/F schedule
             # to every Stage.
-            "runtime_execution_domain": selection.get(
-                "runtime_execution_domain"
-            ),
-            "runtime_tail_mode": selection.get("runtime_tail_mode"),
-            "runtime_scheduling_slot_count": selection.get(
-                "runtime_scheduling_slot_count"
-            ),
-            "runtime_logical_programs_per_scheduling_slot": selection.get(
-                "runtime_logical_programs_per_scheduling_slot"
-            ),
-            "runtime_full_group_count": selection.get(
-                "runtime_full_group_count"
-            ),
-            "runtime_tail_program_count": selection.get(
-                "runtime_tail_program_count"
-            ),
-            "runtime_loop_iteration_count": selection.get(
-                "runtime_loop_iteration_count"
-            ),
-            "iteration_count": stage.get("iteration_count", 1),
-            "predicted_total_system_cycles": selection["logical_stage_system_cycles"],
-            "predicted_scope_handoff_system_cycles": selection.get("scope_handoff_system_cycles", 0.0),
+            "runtime_execution_domain":
+            selection.get("runtime_execution_domain"),
+            "runtime_tail_mode":
+            selection.get("runtime_tail_mode"),
+            "runtime_scheduling_slot_count":
+            selection.get("runtime_scheduling_slot_count"),
+            "runtime_logical_programs_per_scheduling_slot":
+            selection.get("runtime_logical_programs_per_scheduling_slot"),
+            "runtime_full_group_count":
+            selection.get("runtime_full_group_count"),
+            "runtime_tail_program_count":
+            selection.get("runtime_tail_program_count"),
+            "runtime_loop_iteration_count":
+            selection.get("runtime_loop_iteration_count"),
+            "iteration_count":
+            stage.get("iteration_count", 1),
+            "predicted_total_system_cycles":
+            selection["logical_stage_system_cycles"],
+            "predicted_scope_handoff_system_cycles":
+            selection.get("scope_handoff_system_cycles", 0.0),
             "predicted_resource_system_cycles": {key: resources.get(key, 0.0)
                                                  for key in RESOURCE_KEYS},
             # Keep the TTIR-side source facts next to the selected route.  The
             # offline fitter uses these fields; the online C++ model never
             # consumes the CaModel output itself.
-            "workload": stage.get("workload", {}),
+            "workload":
+            stage.get("workload", {}),
         })
     return rows, route
 
@@ -442,8 +434,7 @@ def _fit_source_row(stage, observed, family_name):
         "contiguous_bytes": contiguous,
         "stride_bytes": stride,
         "masked": masked,
-        "peak_live_register_units": workload.get(
-            "peak_live_register_units_per_logical_program", 0.0),
+        "peak_live_register_units": workload.get("peak_live_register_units_per_logical_program", 0.0),
         # TTIR workload fields are per Stage iteration.  CaModel attribution
         # is normally a whole-kernel dynamic sum, so normalize the target by
         # the same iteration count before fitting.  Keep raw values for audit.
@@ -457,13 +448,11 @@ def _fit_source_row(stage, observed, family_name):
 def write_fit_evidence(path, predicted, observations, family_name):
     rows = []
     for stage in predicted:
-        row = _fit_source_row(stage, observations.get(stage["id"], {}),
-                               family_name)
+        row = _fit_source_row(stage, observations.get(stage["id"], {}), family_name)
         if row is not None:
             rows.append(row)
-    fields = ("stage_id", "family", "iteration_count", "direct_instructions", "operations",
-              "segments", "contiguous_bytes", "stride_bytes", "masked",
-              "peak_live_register_units", "target_work", "target_cycles",
+    fields = ("stage_id", "family", "iteration_count", "direct_instructions", "operations", "segments",
+              "contiguous_bytes", "stride_bytes", "masked", "peak_live_register_units", "target_work", "target_cycles",
               "raw_target_work", "raw_target_cycles")
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -482,12 +471,9 @@ def main():
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--load-bias", type=parse_int)
     parser.add_argument("--addr2line", type=Path, default=Path("llvm-addr2line"))
-    parser.add_argument(
-        "--fit-evidence-output", type=Path,
-        help="write a source-to-generated-traffic CSV for fit_simt_source_memory.py")
-    parser.add_argument(
-        "--fit-family", choices=tuple(FIT_FAMILY),
-        help="family to export with --fit-evidence-output")
+    parser.add_argument("--fit-evidence-output", type=Path,
+                        help="write a source-to-generated-traffic CSV for fit_simt_source_memory.py")
+    parser.add_argument("--fit-family", choices=tuple(FIT_FAMILY), help="family to export with --fit-evidence-output")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -524,10 +510,8 @@ def main():
         elif ranges:
             fit_observations = per_stage
         else:
-            parser.error(
-                "--fit-evidence-output requires --stage-pc-map or --binary")
-        count = write_fit_evidence(args.fit_evidence_output, predicted,
-                                   fit_observations, args.fit_family)
+            parser.error("--fit-evidence-output requires --stage-pc-map or --binary")
+        count = write_fit_evidence(args.fit_evidence_output, predicted, fit_observations, args.fit_family)
     else:
         count = None
 

@@ -25,8 +25,8 @@ std::string getDavidConfigPath() {
 std::string getDavidMicrobenchmarkProfilePath() {
   namespace fs = std::filesystem;
   fs::path src = fs::path(__FILE__).parent_path().parent_path().parent_path();
-  fs::path profile = src / "costmodel" / "profiles" / "microbench" /
-                     "ascend_950pr_v1.json";
+  fs::path profile =
+      src / "costmodel" / "profiles" / "microbench" / "ascend_950pr_v1.json";
   return profile.string();
 }
 
@@ -90,14 +90,15 @@ TEST(CostModelHardwareConfigTest,
   if (!profile)
     FAIL() << llvm::toString(profile.takeError());
 
-  EXPECT_EQ(profile->getProfileVersion(),
-            "david-v100-shared-microbench-20260914-v3");
+  EXPECT_EQ(
+      profile->getProfileVersion(),
+      "ascend-950pr-shared-microbench-20261008-v29-simd-structural-completion");
   EXPECT_EQ(profile->getTarget(), "Ascend950PR/dav-c310");
   EXPECT_FALSE(profile->getContentSha256().empty());
 
   const auto *measurement = profile->getMeasurement("simd.f32.add.throughput");
   ASSERT_NE(measurement, nullptr);
-  EXPECT_DOUBLE_EQ(measurement->value, 3.30);
+  EXPECT_DOUBLE_EQ(measurement->value, 3.298629007);
   EXPECT_EQ(measurement->unit, "vector_instruction/system_cycle");
   EXPECT_EQ(measurement->cycleDomain, "SYS_CNT");
   EXPECT_EQ(measurement->scope,
@@ -106,24 +107,24 @@ TEST(CostModelHardwareConfigTest,
   EXPECT_EQ(measurement->confidence, "high");
 
   const auto *serializedSetup =
-      profile->getMeasurement("simt.setup.empty_with_barrier");
+      profile->getMeasurement("simt.setup.serialized_minimal_net.warps_4");
   ASSERT_NE(serializedSetup, nullptr);
-  EXPECT_DOUBLE_EQ(serializedSetup->value, 141.0);
+  EXPECT_DOUBLE_EQ(serializedSetup->value, 196.278571);
   EXPECT_EQ(serializedSetup->confidence, "medium");
 
   const auto *gmLoad = profile->getMeasurement("simt.gm.load.throughput");
   ASSERT_NE(gmLoad, nullptr);
-  EXPECT_DOUBLE_EQ(gmLoad->value, 0.1761917890625);
+  EXPECT_DOUBLE_EQ(gmLoad->value, 0.239204234);
   const auto *gmStore = profile->getMeasurement("simt.gm.store.throughput");
   ASSERT_NE(gmStore, nullptr);
-  EXPECT_DOUBLE_EQ(gmStore->value, 0.12914221875);
+  EXPECT_DOUBLE_EQ(gmStore->value, 0.588739138);
 
   auto converted = profile->convertRatePerCycle(
       measurement->value, "clock.sys_cnt.frequency_mhz",
       "clock.device_compute.frequency_mhz");
   if (!converted)
     FAIL() << llvm::toString(converted.takeError());
-  EXPECT_NEAR(*converted, 3.30 * 1000.0 / 1650.0, 1.0e-12);
+  EXPECT_NEAR(*converted, 3.298629007 * 1000.0 / 1650.0, 1.0e-12);
 
   auto wrongUnit =
       profile->requireValue("simd.f32.add.throughput", "byte/system_cycle");
@@ -145,11 +146,12 @@ TEST(CostModelHardwareConfigTest,
   ASSERT_NE(cfg, nullptr);
   ASSERT_NE(cfg->getMicrobenchmarkProfile(), nullptr);
   EXPECT_EQ(cfg->getTarget(), "Ascend950PR/dav-c310");
-  EXPECT_EQ(cfg->getMicrobenchmarkProfile()->getProfileVersion(),
-            "david-v100-shared-microbench-20260914-v3");
+  EXPECT_EQ(
+      cfg->getMicrobenchmarkProfile()->getProfileVersion(),
+      "ascend-950pr-shared-microbench-20261008-v29-simd-structural-completion");
   EXPECT_NEAR(
       cfg->getMicrobenchmarkRatePerDeviceCycle("simd.f32.add.throughput"),
-      3.30 * 1000.0 / 1650.0, 1.0e-12);
+      3.298629007 * 1000.0 / 1650.0, 1.0e-12);
 }
 
 TEST(CostModelHardwareConfigTest, EstimationAPIsReturnNonNegative) {
