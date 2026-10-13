@@ -138,6 +138,41 @@ def PipelineAnalysisPass : Pass<"analyze-pipeline", "ModuleOp"> {
 }
 
 //===----------------------------------------------------------------------===//
+// HIVMAnalysis
+//===----------------------------------------------------------------------===//
+
+def HIVMAnalysisPass : Pass<"analyze-hivm", "ModuleOp"> {
+  let summary = "Analyze native HIVM IR scheduling and synchronization";
+  let description = [{
+    This pass runs the HIVM-native scheduler directly on parsed HIVM IR.
+    It expects `hivm.hir.*` ops to be available as native MLIR ops, and
+    reports per-pipe utilization, sync costs, and critical-path timing.
+
+    Example:
+      inproc-costmodel --analyze-hivm input.npuir.mlir
+      inproc-costmodel --analyze-hivm="hardware-config=configs/ascend_910b.json arg-bindings=arg10=128" input.npuir.mlir
+  }];
+
+  let options = [
+    Option<"schedulerMode", "scheduler", "std::string",
+           /*default=*/"\"static\"",
+           "Scheduler backend: static or des">,
+    Option<"argBindingsStr", "arg-bindings", "std::string",
+           /*default=*/"\"\"",
+           "Bindings for dynamic HIVM values (e.g., 'arg10=128,arg11=64')">,
+    Option<"hardwareConfigPath", "hardware-config", "std::string",
+           /*default=*/"\"\"",
+           "Path to hardware configuration JSON file">,
+    Option<"reportFile", "report-file", "std::string",
+           /*default=*/"\"\"",
+           "Optional file to write the textual HIVM report to">,
+    Option<"perfettoTraceFile", "perfetto-trace-file", "std::string",
+           /*default=*/"\"\"",
+           "Optional Perfetto-compatible JSON trace output file">
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // PerfReport
 //===----------------------------------------------------------------------===//
 def PerfReportPass : Pass<"perf-report", "ModuleOp"> {
@@ -145,88 +180,6 @@ def PerfReportPass : Pass<"perf-report", "ModuleOp"> {
   let description = [{
     This pass generates a comprehensive performance report including
     roofline analysis, utilization metrics, and bottleneck identification.
-  }];
-}
-
-//===----------------------------------------------------------------------===//
-// SelectSimdSimtCostModel
-//===----------------------------------------------------------------------===//
-
-def SelectSimdSimtCostModelPass
-    : Pass<"select-simd-simt-costmodel", "ModuleOp"> {
-  let summary = "Select SIMD, SIMT-only, or mixed execution with the C++ cost model";
-  let description = [{
-    This pass runs the AscendModel C++ SIMD/SIMT candidate model directly on
-    Triton IR.  Report mode always records the complete three-candidate
-    diagnostic report.  Auto mode applies the legal candidate with the lowest
-    stage cost.  A mixed decision passes the same immutable anchor plan used
-    for scoring directly to the C++ materializer, which creates local
-    scope.scope regions without persisting per-operation selection attributes.
-
-    Mandatory mixed is intentionally not part of this pass.  Singleton
-    legality fast paths can be added in front of the model after the calibrated
-    three-candidate path is complete.
-  }];
-
-  let options = [
-    Option<"mode", "mode", "std::string",
-           /*default=*/"\"report\"",
-           "Application mode: report or auto">,
-    Option<"profilePath", "profile-path", "std::string",
-           /*default=*/"\"\"",
-           "Versioned SIMD/SIMT calibration profile JSON">,
-    Option<"actualTarget", "actual-target", "std::string",
-           /*default=*/"\"\"",
-           "Backend target used for profile compatibility checks">,
-    Option<"numWarps", "num-warps", "int64_t",
-           /*default=*/"32",
-           "Number of logical warps in the candidate execution plan">,
-    Option<"compileOn91095", "compile-on-910-95", "bool",
-           /*default=*/"false",
-           "Whether the target exposes the 910/95 SIMT lowering templates">,
-    Option<"wholeKernelSuperblockMaterializable", "whole-kernel-superblock-materializable", "bool",
-           /*default=*/"false",
-           "Whether backend integration can materialize pure-SIMT SuperBlock with AutoBlockify V1">,
-    Option<"scopeSuperblockMaterializable", "scope-superblock-materializable", "bool",
-           /*default=*/"false",
-           "Whether backend integration can materialize mixed SuperBlock with AutoBlockify V1">,
-    Option<"maximumWholeKernelSuperblockFactor", "maximum-whole-kernel-superblock-factor", "int64_t",
-           /*default=*/"64",
-           "Largest whole-kernel SuperBlock factor accepted by the backend">,
-    Option<"maximumScopeSuperblockFactor", "maximum-scope-superblock-factor", "int64_t",
-           /*default=*/"4",
-           "Largest local-scope SuperBlock factor accepted by the backend">,
-    Option<"logicalProgramCountHint", "logical-program-count-hint", "int64_t",
-           /*default=*/"0",
-           "Optional runtime logical-program count used to cost full SuperBlock groups and tails">,
-    Option<"analysisModulePath", "analysis-module-path", "std::string",
-           /*default=*/"\"\"",
-           "Optional post-layout/post-AutoBlockify TTIR used only for feature analysis and scoring">,
-    Option<"routeTransformCapabilityJSON", "route-transform-capability-json", "std::string",
-           /*default=*/"\"{}\"",
-           "Resolved layout/V1 capability shared by scoring, materialization, and reporting">,
-    Option<"reportFile", "report-file", "std::string",
-           /*default=*/"\"\"",
-           "Optional JSONL path for the C++ selection report">
-  ];
-}
-
-//===----------------------------------------------------------------------===//
-// MaterializeSimtScopes
-//===----------------------------------------------------------------------===//
-
-def MaterializeSimtScopesPass
-    : Pass<"materialize-simt-scopes", "ModuleOp"> {
-  let summary = "Validate the scope-only contract for an admitted mixed route";
-  let description = [{
-    Production materialization is performed from the immutable anchor plan in
-    the selector pass.  This compatibility pass verifies that:
-
-      ascend.simt_costmodel.effective = "mixed_simd_simt"
-      scope.scope {vector_mode = "simt"}
-
-    coexist in the IR.  It does not rediscover anchors or read/write a
-    per-operation selected marker.
   }];
 }
 

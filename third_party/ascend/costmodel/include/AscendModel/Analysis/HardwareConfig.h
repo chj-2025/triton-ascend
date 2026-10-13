@@ -20,8 +20,6 @@
 namespace mlir {
 namespace ascend {
 
-class MicrobenchmarkProfile;
-
 //===----------------------------------------------------------------------===//
 // Memory Space
 //===----------------------------------------------------------------------===//
@@ -35,10 +33,10 @@ enum class MemoryType {
 
 struct MemorySpace {
   std::string name;
-  MemoryType type = MemoryType::OnChipLocal;
-  size_t sizeBytes = 0; // Total size in bytes
-  double bandwidthBytesPerCycle = 0.0;
-  int latencyCycles = 0;
+  MemoryType type;
+  size_t sizeBytes; // Total size in bytes
+  double bandwidthBytesPerCycle;
+  int latencyCycles;
   std::string description;
 
   // Convenience methods
@@ -67,15 +65,15 @@ struct FractalSize {
 
 struct ComputeUnit {
   std::string name;
-  ComputeUnitType type = ComputeUnitType::SIMDEngine;
+  ComputeUnitType type;
 
   // Performance specs
-  double tflopsFP16 = 0.0;
-  double tflopsFP32 = 0.0;
-  double tflopsINT8 = 0.0;
+  double tflopsFP16;
+  double tflopsFP32;
+  double tflopsINT8;
 
   // Matrix engine specific - default tile size (for backward compatibility)
-  int tileM = 0, tileN = 0, tileK = 0;
+  int tileM, tileN, tileK;
 
   // Fractal sizes per data type (key: "fp16", "bf16", "fp32", "int8")
   llvm::StringMap<FractalSize> fractalSizes;
@@ -84,8 +82,8 @@ struct ComputeUnit {
   std::string outputSpace;
 
   // SIMD engine specific
-  int widthElements = 0; // Number of elements processed per cycle
-  int widthBytes = 0;
+  int widthElements; // Number of elements processed per cycle
+  int widthBytes;
   std::string computeSpace;
 
   std::vector<std::string> supportedOps;
@@ -101,11 +99,11 @@ struct DataMover {
   std::string description;
   std::string srcSpace;
   std::vector<std::string> dstSpaces;
-  double bandwidthBytesPerCycle = 0.0;
-  int maxBurstBytes = 0;
-  int alignmentBytes = 0;
-  bool supportsAccumulate = false;
-  bool supportsCast = false;
+  double bandwidthBytesPerCycle;
+  int maxBurstBytes;
+  int alignmentBytes;
+  bool supportsAccumulate;
+  bool supportsCast;
 };
 
 //===----------------------------------------------------------------------===//
@@ -184,6 +182,7 @@ struct BandwidthEntry {
 class HardwareConfig {
 public:
   HardwareConfig();
+  ~HardwareConfig();
 
   // Factory methods
   static std::unique_ptr<HardwareConfig> loadFromFile(llvm::StringRef path);
@@ -198,17 +197,6 @@ public:
   // Basic info
   llvm::StringRef getName() const { return name; }
   llvm::StringRef getVendor() const { return vendor; }
-  llvm::StringRef getTarget() const { return target; }
-
-  // Shared, model-neutral microbenchmark evidence.  The absolute cost model
-  // and route-selection model may consume different subsets of this catalog.
-  const MicrobenchmarkProfile *getMicrobenchmarkProfile() const {
-    return microbenchmarkProfile.get();
-  }
-  llvm::StringRef getMicrobenchmarkProfileReference() const {
-    return microbenchmarkProfileReference;
-  }
-  double getMicrobenchmarkRatePerDeviceCycle(llvm::StringRef key) const;
 
   // Clock
   double getClockFrequencyGHz() const { return clockFreqGHz; }
@@ -347,8 +335,6 @@ public:
 
 private:
   bool parseJSON(const llvm::json::Value &json, std::string &error);
-  bool loadReferencedMicrobenchmarkProfile(llvm::StringRef configPath,
-                                           std::string &error);
 
   /// Populate the tilesim-migrated tables with 910B1 measured values
   /// (hardcoded-fallback path; JSON is authoritative in production).
@@ -357,7 +343,6 @@ private:
   std::string name;
   std::string vendor;
   std::string version;
-  std::string target;
 
   double clockFreqGHz;
 
@@ -366,8 +351,6 @@ private:
   llvm::StringMap<DataMover> dataMovers;
   llvm::StringMap<PipelinePath> pipelinePaths;
   llvm::StringMap<int> vectorOpCyclesPerInstruction;
-  std::string microbenchmarkProfileReference;
-  std::shared_ptr<const MicrobenchmarkProfile> microbenchmarkProfile;
 
   // Parallelism info
   llvm::StringMap<bool> parallelismFlags;

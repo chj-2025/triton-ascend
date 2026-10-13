@@ -51,7 +51,7 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr,
 
 ## Cube 复杂算子开发
 
-复杂 Cube 场景通常来自 attention、batched matmul、grouped matmul 或形状不规则的矩阵乘。当前 [Ascend/triton-ascend-ops](https://github.com/Ascend/triton-ascend-ops) 主分支的复杂案例集中在 `tutorial/best_practice/`，其中 [`002-decode_grouped_attention.py`](https://github.com/Ascend/triton-ascend-ops/blob/main/tutorial/best_practice/002-decode_grouped_attention.py) 可以作为复杂 Cube 核心逻辑的参考：它包含 QK、PV 两段 `tl.dot`，并展示了 KV cache 离散索引下如何重组 K/V 访存。
+复杂 Cube 场景通常来自 attention、batched matmul、grouped matmul 或形状不规则的矩阵乘。当前 [`Ascend/triton-ascend-ops`](https://github.com/Ascend/triton-ascend-ops) 主分支的复杂案例集中在 `tutorial/best_practice/`，其中 [`002-decode_grouped_attention.py`](https://github.com/Ascend/triton-ascend-ops/blob/main/tutorial/best_practice/002-decode_grouped_attention.py) 可以作为复杂 Cube 核心逻辑的参考：它包含 QK、PV 两段 `tl.dot`，并展示了 KV cache 离散索引下如何重组 K/V 访存。
 
 复杂 Cube 算子建议按以下顺序拆解：
 
@@ -61,4 +61,4 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr,
 4. **为长 K 或长序列设计内层循环**：K 维循环要控制单次 A/B tile 的片上占用；序列维循环要避免一次 load 过大的 K/V block。
 5. **用 Autotune 管理候选 tile**：为常见 shape 准备多组 `BLOCK_M/N/K` 和 `multibuffer` 配置，让运行时选择最优组合。
 
-复杂 Cube 算子的常见风险是把 GPU 上的大量 program 直接迁移到 NPU。若输出 tile 数远大于物理 Cube Core 数，可考虑让每个 program 通过内层循环处理多个 tile，或者在确认逻辑核相互独立时设置 `TRITON_ALL_BLOCKS_PARALLEL=1` 降低调度开销。
+复杂 Cube 算子的常见风险是把 GPU 上的大量 program 直接迁移到 NPU。对于逻辑核相互独立且通过 IR 安全分析的 kernel，后端会自动把逻辑 grid 映射到可用物理核；不适用的 kernel 会被自动跳过。如果 kernel 存在顺序依赖或未通过安全分析，应让每个 program 通过内层循环处理多个 tile。

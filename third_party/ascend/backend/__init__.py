@@ -17,6 +17,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
+__version__ = '3.6.0'
 
 import logging
 from triton._C.libtriton.ascend import ir as ascend_ir
@@ -89,15 +90,9 @@ def _apply_ascend_patch():
             - Warn when max_num_imprecise_acc is explicitly set, since
               Ascend NPU does not support imprecise accumulation.
             """
-            # HF32 guard: only valid for fp32 x fp32.
-            # When lhs is fp32 ret_scalar_ty is guaranteed fp32 by upstream,
-            # so checking lhs and rhs alone is sufficient.
-            # input_precision is still a string at this point (set by core.py),
-            # so we compare as strings rather than with the MLIR enum.
-            if input_precision is not None and input_precision.lower() == "hf32":
-                if not lhs.dtype.is_fp32() or not rhs.dtype.is_fp32():
-                    input_precision = self.builder.options.default_dot_input_precision
-
+            # Ascend does not support tf32, tf32 is converted to hf32. Avoid tf32 verification interception
+            if input_precision == "tf32":
+                input_precision = "hf32"
             # Ascend NPU does not support imprecise accumulation.
             # Force max_num_imprecise_acc to None so the upstream None
             # branch handles it (via max_num_imprecise_acc_default = 0),
@@ -112,41 +107,17 @@ def _apply_ascend_patch():
         TritonSemantic.dot = _patched_dot
         TritonSemantic._ascend_dot_patch_applied = True
 
-    # Keep launch-value handling in the Ascend plugin. The binder result feeds
-    # the in-memory kernel cache key, while _pack_args feeds the same values to
-    # NPUOptions and the native route model.
-    from triton.runtime import jit as _jit_module
+    # Install the unified, non-intrusive dtype interception for operators
+    # whose dtypes are unsupported on Ascend. The rules live in
+    # triton.backends.ascend.op_dtype_config, next to this backend.
+    if not getattr(CodeGenerator, "_ascend_dtype_guard_applied", False):
+        try:
+            from triton.backends.ascend.dtype_guard import install_dtype_guard
 
-    if not getattr(_jit_module, "_ascend_runtime_compile_options_patch_applied", False):
-        _original_create_function_from_signature = _jit_module.create_function_from_signature
-        _original_pack_args = _jit_module.JITFunction._pack_args
-
-        def _patched_create_function_from_signature(signature, kernel_params, backend):
-            binder = _original_create_function_from_signature(signature, kernel_params, backend)
-            runtime_option_hook = getattr(backend, "get_runtime_compile_options", None)
-            if runtime_option_hook is None:
-                return binder
-
-            def _binder_with_runtime_options(*args, **kwargs):
-                bound_args, specialization, options = binder(*args, **kwargs)
-                runtime_options = runtime_option_hook(bound_args, specialization, options)
-                if runtime_options:
-                    options.update(runtime_options)
-                return bound_args, specialization, options
-
-            return _binder_with_runtime_options
-
-        def _patched_pack_args(self, backend, kwargs, bound_args, specialization, options):
-            runtime_option_hook = getattr(backend, "get_runtime_compile_options", None)
-            if runtime_option_hook is not None:
-                runtime_options = runtime_option_hook(bound_args, specialization, options)
-                if runtime_options:
-                    kwargs = {**kwargs, **runtime_options}
-            return _original_pack_args(self, backend, kwargs, bound_args, specialization, options)
-
-        _jit_module.create_function_from_signature = _patched_create_function_from_signature
-        _jit_module.JITFunction._pack_args = _patched_pack_args
-        _jit_module._ascend_runtime_compile_options_patch_applied = True
+            install_dtype_guard()
+            CodeGenerator._ascend_dtype_guard_applied = True
+        except Exception as e:
+            logging.warning(f"[Ascend Patch] Failed to install dtype guard: {e}")
 
 
 __all__ = ["do_bench_npu"]

@@ -18,21 +18,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 #
-# Tests for the SIMT unstructured-access fast path
-# (TritonToLinalg / StridedLoadStoreRewrite).
+# Tests for SIMT IndirectLoad fast-path (TritonToLinalg / StridedLoadStoreRewrite).
 #
 # What each parameter row exercises against the V1 trigger condition
 # (compileOn91095 + forceSimtTemplate, last-axis stride statically > 1,
 #  non-permuted layout, rank <= 5, not stride==2-even-size):
 #
-#   * STRIDE > 2 / odd       -> V1 should rewrite to ascend.unstructured_load
+#   * STRIDE > 2 / odd       -> V1 should rewrite tt.load -> tt.indirect_load
 #   * STRIDE == 2, even size -> DeinterleaveStatusOptimization handles (V1 yields)
 #   * STRIDE == 2, odd size  -> V1 should rewrite (deinterleave precondition fails)
 #   * Permuted layout        -> ImplicitPermute handles (V1 must not touch)
 #   * Last-axis stride == 1  -> No rewrite (normal strided memref.copy)
 #
 # Verifies correctness only -- to confirm which path actually fired, dump IR
-# with MLIR_ENABLE_DUMP=1 and grep for ascend.unstructured_load / tt.trans.
+# with MLIR_ENABLE_DUMP=1 and grep for tt.indirect_load / tt.trans.
 
 import triton
 import triton.language as tl
@@ -44,12 +43,12 @@ try:
     from triton.backends.ascend.utils import is_compile_on_910_95
 except Exception:
 
-    def is_compile_on_910_95():
+    def is_compile_on_910_95(_arch):
         return False
 
 
 a3_known_boundary_load_issue = pytest.mark.xfail(
-    not is_compile_on_910_95(),
+    not is_compile_on_910_95(triton.runtime.driver.active.get_current_target().arch),
     reason=("Known A3 baseline issue on release/3.2.2-dev: make_block_ptr "
             "boundary_check + static power-of-two stride"),
     strict=False,
@@ -186,26 +185,26 @@ def _ref_multi_d(src_flat_cpu: torch.Tensor, blocks, strides) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("dtype,blocks,strides", [
-    # ---- V1 命中: 非 permuted, 尾轴 stride 静态 > 1, 所有 block 是 2 的幂 ----
+    # ---- V1 hit: non-permuted, last-axis stride statically > 1, all blocks power-of-2 ----
     # 2D
     ("float32", (4, 8), (8, 4)),  # stride 4
-    ("float32", (4, 8), (24, 3)),  # stride 3 (奇)
+    ("float32", (4, 8), (24, 3)),  # stride 3 (odd)
     # 3D
     ("float16", (2, 4, 8), (32, 8, 4)),  # stride 4
-    ("float32", (4, 4, 8), (96, 24, 3)),  # stride 3 (奇)
+    ("float32", (4, 4, 8), (96, 24, 3)),  # stride 3 (odd)
     # 4D
     ("float16", (2, 4, 4, 8), (128, 32, 8, 3)),  # stride 3
     # 5D
-    ("float32", (2, 2, 2, 4, 8), (256, 128, 64, 16, 5)),  # stride 5 (奇)
+    ("float32", (2, 2, 2, 4, 8), (256, 128, 64, 16, 5)),  # stride 5 (odd)
 
-    # ---- Deinterleave 接管 (stride==2 + 偶数 last block) ----
+    # ---- Deinterleave handles (stride==2 + even last block) ----
     ("float16", (4, 4, 8), (32, 8, 2)),
 
-    # ---- Permuted: ImplicitPermute 处理, V1 必须放过 ----
-    ("float32", (4, 8), (1, 4)),  # strides 升序
-    ("float32", (4, 4, 8), (1, 4, 16)),  # 严格升序
+    # ---- Permuted: ImplicitPermute handles, V1 must skip ----
+    ("float32", (4, 8), (1, 4)),  # strides ascending
+    ("float32", (4, 4, 8), (1, 4, 16)),  # strictly ascending
 
-    # ---- Normal contiguous (stride==1): 不应改写 ----
+    # ---- Normal contiguous (stride==1): no rewrite ----
     ("float32", (4, 8), (8, 1)),
     ("float32", (4, 4, 8), (32, 8, 1)),
 ])
@@ -242,7 +241,7 @@ def test_multi_d_gather(dtype, blocks, strides):
 # make_block_ptr (tt.make_tensor_ptr) strided load:
 #   Build a tl.make_block_ptr with non-default strides such that the low-dim
 #   stride is `stride_n`.  When stride_n > 1 V1 should rewrite the load to
-#   ascend.unstructured_load; when stride_n == 1 V1 should bail.
+#   tt.indirect_load; when stride_n == 1 V1 should bail.
 #
 # Sanity: this test verifies value correctness only.  For "did V1 actually
 # trigger?" see the FileCheck test under
@@ -331,7 +330,7 @@ def test_block_ptr_strided(dtype, block_m, block_n, stride_m, stride_n):
 
 
 # ---------------------------------------------------------------------------
-# V2: tt.store -> ascend.unstructured_store fast path. Mirror of the load tests
+# V2: tt.store -> tt.indirect_store fast-path. Mirror of the load tests
 # above, but the strided side is the OUTPUT (scatter) instead of the input.
 #
 #   out[i*stride] = in[i]   (1D AddPtr)
@@ -557,15 +556,15 @@ def _ref_boundary_load(src_cpu_flat, parent_m, parent_n, stride_m, stride_n, blo
 
 
 @pytest.mark.parametrize("dtype,parent_m,parent_n,stride_m,stride_n,block_m,block_n,pad_nan", [
-    # V1.5 命中: PAD_ZERO, stride_n=4, block 超出 parent
+    # V1.5 hit: PAD_ZERO, stride_n=4, block exceeds parent
     pytest.param("float32", 5, 3, 12, 4, 8, 8, False, marks=a3_known_boundary_load_issue),
-    # V1.5 命中: PAD_ZERO, stride_n=3, block 部分越界
+    # V1.5 hit: PAD_ZERO, stride_n=3, block partially out-of-bounds
     pytest.param("float32", 7, 5, 15, 3, 8, 8, False, marks=a3_known_boundary_load_issue),
-    # V1.5 命中: PAD_NAN (float)
+    # V1.5 hit: PAD_NAN (float)
     pytest.param("float32", 5, 3, 12, 4, 8, 8, True, marks=a3_known_boundary_load_issue),
-    # V1.5 命中: float16
+    # V1.5 hit: float16
     pytest.param("float16", 5, 5, 20, 4, 8, 8, False, marks=a3_known_boundary_load_issue),
-    # 越界都在尾轴: block 完全装得下 axis 0
+    # OOB only on last axis: block fully fits axis 0
     pytest.param("float32", 8, 3, 12, 4, 8, 8, False, marks=a3_known_boundary_load_issue),
 ])
 def test_block_ptr_boundary_load(dtype, parent_m, parent_n, stride_m, stride_n, block_m, block_n, pad_nan):
