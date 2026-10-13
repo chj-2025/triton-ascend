@@ -24,10 +24,13 @@ add_lit_testsuite(check-triton-ascend-lit-tests "Running the triton regression t
 
 set_target_properties(check-triton-ascend-lit-tests PROPERTIES FOLDER "Tests")
 
-# Keep recursively generated suite targets distinct from the upstream
-# test/CMakeLists.txt targets (for example Conversion/General).
-add_lit_testsuites(TRITON-ASCEND-LIT-TESTS ${CMAKE_CURRENT_SOURCE_DIR} DEPENDS ${TRITON_TEST_DEPENDS})
+add_lit_testsuites(TRITON-LIT-TESTS ${CMAKE_CURRENT_SOURCE_DIR} DEPENDS ${TRITON_TEST_DEPENDS})
 
 if(TRITON_ASCEND_HAS_INPROC_COSTMODEL)
   add_subdirectory(costmodel_ut)
+endif()
+
+# The deallocation observer uses ELF linker wrapping.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_subdirectory(Analysis)
 endif()

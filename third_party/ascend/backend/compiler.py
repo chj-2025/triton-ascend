@@ -1,4 +1,4 @@
-﻿# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -29,10 +29,11 @@ import shlex
 import subprocess
 import tempfile
 import warnings
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
+from .debug_line_rewriter import rewrite_debug_line
 
 from triton._C.libtriton import ir, passes, ascend, buffer_ir
 from triton._C.libtriton.ascend import ir as ascend_ir
@@ -41,14 +42,14 @@ try:
 except ImportError:
     distributed = None
 from triton.backends.ascend.utils import (
+    _multibuffer_mode_to_tuple,
     _check_bishengir_api_change,
+    _check_bishengir_able_save_ir,
     _check_bishengir_is_regbased,
     _enable_print_ub_bits,
     _enable_dump_memory_info,
     _enable_msdebug,
     _get_kernel_target,
-    _get_llvm_path,
-    _get_mlir_path,
     _get_npucompiler_path,
     _get_triton_adapter_opt_path,
     _get_triton_mlir_opt_path,
@@ -57,15 +58,27 @@ from triton.backends.ascend.utils import (
     _is_ascend_sanitizer_enabled,
     _is_debug_line_info_disabled,
     _is_auto_map_parallel_blocks_enabled,
-    _get_modeled_superblock_factors,
-    _get_current_scope_superblock_factors,
     _get_auto_blockify_blacklist_reasons,
     _warn_auto_blockify_disabled,
+    _remove_deprecated_npu_options,
+    _warn_deprecated_npu_option,
+    _warn_deprecated_ascend_env_vars,
+    downgrade_llir,
     force_disable_ffts,
+    graph_ub_budget_bytes_for_arch,
+    ub_size_in_kbytes_for_arch,
     get_cann_version_file_hash,
-    is_compile_on_910_95,
+    is_cann_version_at_least,
 )
 from triton.backends.ascend.driver import (NPUUtils)
+from triton.backends.ascend.program_grid import (
+    DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
+    PROGRAM_GRID_TRANSFORMS_ATTR,
+    ProgramGridContractError,
+    get_persistent_transform,
+    normalize_graph_optimization_rule_mask,
+    normalize_program_grid_transforms,
+)
 from triton.backends.compiler import (
     BaseBackend,
     GPUTarget,
@@ -85,7 +98,10 @@ def _get_then_remove_rc(mod, attr_name: str) -> int:
 
     if get_int_attr is None:
         return -1
-    attr_value = get_int_attr(mod, attr_name)
+    try:
+        attr_value = get_int_attr(mod, attr_name)
+    except TypeError:
+        return -1
 
     if remove_attr:
         remove_attr(mod, attr_name)
@@ -96,7 +112,26 @@ def _get_then_remove_rc(mod, attr_name: str) -> int:
     return attr_value
 
 
-def _export_coalesce_metadata(mod, metadata):
+def _get_then_remove_program_grid_transforms(mod):
+    get_transforms = getattr(ascend.ir, "get_program_grid_transforms", None)
+    remove_attr = getattr(ascend.ir, "remove_attr", None)
+    if get_transforms is None:
+        if PROGRAM_GRID_TRANSFORMS_ATTR in str(mod):
+            raise RuntimeError("hacc.program_grid_transforms requires the matching Ascend C++ binding")
+        return None
+    try:
+        raw = get_transforms(mod)
+    except TypeError:
+        if PROGRAM_GRID_TRANSFORMS_ATTR in str(mod):
+            raise RuntimeError("hacc.program_grid_transforms requires an MLIR module accepted by "
+                               "the Ascend C++ binding")
+        return None
+    if raw is not None and remove_attr:
+        remove_attr(mod, PROGRAM_GRID_TRANSFORMS_ATTR)
+    return raw
+
+
+def _export_coalesce_metadata(mod, metadata, *, require_row_contract=False):
     # Tile/strided coalescing (TritonToLinalg) records the chosen coalesce factor
     # H and the grid axis it applies to as module attrs hacc.coalesce_factor /
     # hacc.coalesce_axis. In the full-TA design the *launcher* (driver.py) owns
@@ -104,16 +139,120 @@ def _export_coalesce_metadata(mod, metadata):
     # no longer interprets the attrs. Read them into metadata here and strip them
     # from the module so the hacc.* attrs never reach hivmc (which rejects
     # unknown module attrs). Absent attrs -> factor 1 (no-op) / axis -1.
+    # RowCoalescing also records whether the launcher should use ceil-div when
+    # shrinking the grid, because its runtime valid-count guard handles tails.
+    # A Row result is only valid as the complete triple.  The regular T2L
+    # Axis/Chunk ABI predates ceil-div and deliberately remains compatible with
+    # a missing ceil-div attr.
     factor = _get_then_remove_rc(mod, "hacc.coalesce_factor")
     axis = _get_then_remove_rc(mod, "hacc.coalesce_axis")
     ceil_div = _get_then_remove_rc(mod, "hacc.coalesce_grid_ceil_div")
-    metadata["coalesce_factor"] = factor if isinstance(factor, int) and factor > 1 else 1
-    metadata["coalesce_axis"] = axis if isinstance(axis, int) and axis >= 0 else -1
-    metadata["coalesce_grid_ceil_div"] = bool(isinstance(ceil_div, int) and ceil_div > 0)
+    has_any_contract_attr = any(value != -1 for value in (factor, axis, ceil_div))
+    valid_factor = isinstance(factor, int) and factor > 1
+    valid_axis = isinstance(axis, int) and axis in (0, 1, 2)
+    valid_ceil_div = isinstance(ceil_div, int) and ceil_div > 0
+    if has_any_contract_attr and (not valid_factor or not valid_axis):
+        raise RuntimeError("invalid hacc.coalesce launch contract")
+    if require_row_contract and has_any_contract_attr and not valid_ceil_div:
+        raise RuntimeError("RowCoalescing requires hacc.coalesce_grid_ceil_div")
+
+    metadata["coalesce_factor"] = factor if valid_factor else 1
+    metadata["coalesce_axis"] = axis if valid_axis else -1
+    metadata["coalesce_grid_ceil_div"] = valid_ceil_div
+    metadata["row_coalescing_applied"] = metadata["coalesce_factor"] > 1
+
+
+def _export_program_grid_metadata(mod, metadata, *, require_row_contract=False):
+    raw_transforms = _get_then_remove_program_grid_transforms(mod)
+    if raw_transforms is not None:
+        factor = _get_then_remove_rc(mod, "hacc.coalesce_factor")
+        axis = _get_then_remove_rc(mod, "hacc.coalesce_axis")
+        ceil_div = _get_then_remove_rc(mod, "hacc.coalesce_grid_ceil_div")
+        has_legacy_attrs = any(value != -1 for value in (factor, axis, ceil_div))
+        if has_legacy_attrs:
+            raise RuntimeError("hacc.program_grid_transforms conflicts with legacy hacc.coalesce_* metadata")
+        try:
+            transforms = normalize_program_grid_transforms(raw_transforms)
+        except ProgramGridContractError as error:
+            raise RuntimeError(f"invalid hacc.program_grid_transforms: {error}") from error
+        metadata["program_grid_transforms"] = transforms
+        metadata["program_grid_mapping_applied"] = True
+        metadata["coalesce_factor"] = 1
+        metadata["coalesce_axis"] = -1
+        metadata["coalesce_grid_ceil_div"] = False
+        metadata["row_coalescing_applied"] = False
+        return
+
+    metadata["program_grid_transforms"] = None
+    metadata["program_grid_mapping_applied"] = False
+    _export_coalesce_metadata(
+        mod,
+        metadata,
+        require_row_contract=require_row_contract,
+    )
+
+
+def _finalize_program_launch_policy(metadata, opt):
+    required_fields = (
+        "program_grid_transforms",
+        "program_grid_mapping_applied",
+        "row_coalescing_applied",
+        "has_auto_blockify_blacklist_op",
+        "mix_mode",
+    )
+    missing = [name for name in required_fields if name not in metadata]
+    if missing:
+        raise RuntimeError("cannot finalize program launch policy; missing metadata: " + ", ".join(missing))
+
+    raw_transforms = metadata["program_grid_transforms"]
+    mapping_applied = metadata["program_grid_mapping_applied"]
+    row_coalescing_applied = metadata["row_coalescing_applied"]
+    has_auto_blockify_blacklist_op = metadata["has_auto_blockify_blacklist_op"]
+    if not isinstance(mapping_applied, bool):
+        raise RuntimeError("program_grid_mapping_applied must be a boolean")
+    if not isinstance(row_coalescing_applied, bool):
+        raise RuntimeError("row_coalescing_applied must be a boolean")
+    if not isinstance(has_auto_blockify_blacklist_op, bool):
+        raise RuntimeError("has_auto_blockify_blacklist_op must be a boolean")
+
+    transforms = None
+    if raw_transforms is not None:
+        try:
+            transforms = normalize_program_grid_transforms(raw_transforms)
+        except ProgramGridContractError as error:
+            raise RuntimeError(f"invalid exported program_grid_transforms: {error}") from error
+    if mapping_applied != (transforms is not None):
+        raise RuntimeError("program_grid_mapping_applied disagrees with program_grid_transforms")
+    if mapping_applied and row_coalescing_applied:
+        raise RuntimeError("program-grid mapping conflicts with legacy RowCoalescing")
+
+    persistent_transform = get_persistent_transform(transforms) if transforms is not None else None
+    ptsm_cap_authorized = False
+    if persistent_transform is not None:
+        if metadata["mix_mode"] != "aiv":
+            raise RuntimeError("persistent program-grid transform requires final mix_mode=aiv")
+        if not (persistent_transform["persistent_coverage"] and persistent_transform["grid_stride_abi_verified"]):
+            raise RuntimeError("persistent program-grid transform lacks coverage/ABI verification")
+        ptsm_cap_authorized = True
+
+    if opt.is_pure_simt:
+        auto_blockify_enabled = _is_auto_map_parallel_blocks_enabled() and not row_coalescing_applied
+    else:
+        auto_blockify_enabled = (_is_auto_map_parallel_blocks_enabled() and not has_auto_blockify_blacklist_op
+                                 and not ptsm_cap_authorized)
+
+    if auto_blockify_enabled and ptsm_cap_authorized:
+        raise RuntimeError("AutoBlockify and persistent-grid cap cannot both be enabled")
+
+    metadata["auto_blockify_enabled"] = auto_blockify_enabled
+    metadata["ptsm_cap_authorized"] = ptsm_cap_authorized
 
 
 def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
     rc = _get_then_remove_rc(mod, "triton_ascend.dynamic_cv_pipeline.rc")
+    if rc == 3:
+        metadata["disable_vf_operand_substitution"] = True
+        return
     if rc != -1 and rc > 0:
         # When the option dynamic_cv_pipeline is set to False,
         # these options should also reverted.
@@ -128,6 +267,39 @@ def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
 def _get_dump_paths(hash_key: str, src_path: str, dst_path: str) -> Tuple[str, str]:
     dump_manager = get_dump_manager(hash_key)
     return (dump_manager._make_path(os.path.basename(src_path)), dump_manager._make_path(os.path.basename(dst_path)))
+
+
+def _with_debug_line(npubin_stage, options):
+    """Wrap an npubin-producing stage so the emitted kernel binary gets
+    .debug_line cleanup for msdebug stepping. No-op unless
+    LLVM_EXTRACT_DI_LOCAL_VARIABLES is set; never raises (failure returns the
+    artifact unchanged), so it cannot break a build."""
+
+    def stage(src, metadata):
+        artifact = npubin_stage(src, metadata)
+        return rewrite_debug_line(artifact, metadata=metadata, options=options)
+
+    return stage
+
+
+def _graph_optimize_kwargs(opt):
+    kwargs = {
+        "ub_capacity_bytes": graph_ub_budget_bytes_for_arch(opt.target_arch),
+        "compile_mode": opt.compile_mode,
+    }
+    rule_mask = getattr(opt, "rule_mask", DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK)
+    if rule_mask != DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK:
+        kwargs["rule_mask"] = rule_mask
+        kwargs["ub_safety_percent"] = 80
+        kwargs["reserved_ub_bytes"] = 0
+        kwargs["mapping_ub_capacity_bytes"] = (ub_size_in_kbytes_for_arch(opt.target_arch) * 1024)
+    return kwargs
+
+
+def _serialize_module(mod, opt):
+    if getattr(opt, "debug", False) or not _is_debug_line_info_disabled() or _enable_msdebug():
+        return str(mod)
+    return mod.str_nodebug()
 
 
 def make_ttir(mod, metadata, opt):
@@ -146,6 +318,8 @@ def make_ttir(mod, metadata, opt):
     passes.common.add_licm(pm)
     passes.common.add_symbol_dce(pm)
     passes.ttir.add_loop_unroll(pm)
+    if opt.enable_graph_optimize:
+        ascend.passes.ttir.add_graph_optimize(pm, **_graph_optimize_kwargs(opt))
     pm.run(mod, 'make_ttir')
     if opt.debug:
         dump_manager = get_dump_manager(metadata["hash"])
@@ -155,544 +329,95 @@ def make_ttir(mod, metadata, opt):
     return mod
 
 
-def _costmodel_profiles_dir() -> Path:
-    """Locate runtime assets without requiring backend-specific setup.py code."""
-    compiler = Path(__file__)
-
-    # Ascend CMake copies canonical profiles beside the native extension.
-    native_packaged = (compiler.resolve().parents[2] / "_C" / "ascend" / "costmodel_profiles")
-    if native_packaged.is_dir():
-        return native_packaged
-
-    # Compatibility with packages produced before the Cost Model ownership
-    # cleanup.  Check this only after the canonical native package location so
-    # incremental build directories cannot shadow freshly packaged profiles.
-    legacy_packaged = compiler.with_name("costmodel_profiles")
-    if legacy_packaged.is_dir():
-        return legacy_packaged
-
-    # Editable/source-tree builds resolve compiler.py back into
-    # third_party/ascend/backend.
-    source = Path(__file__).resolve().parent.parent / "costmodel" / "profiles"
-    return source if source.is_dir() else native_packaged
-
-
-def _apply_cpp_simd_simt_decision(metadata, effective: str, superblock_factor: int, report: str,
-                                  base_num_warps: int = 1) -> None:
-    """Translate the native decision into the backend execution contract."""
-    metadata["auto_simt_scope_report"] = report
-    metadata["auto_simt_superblock_factor"] = superblock_factor
-    metadata["auto_simt_effective_kind"] = effective
-    if effective == "all_simd":
-        # ``simd_simt`` is the user's request to run the Route Model, not the
-        # backend mode after selection.  Keeping it here makes later compiler
-        # stages add mixed-runtime flags even though no SIMT scope exists.
-        metadata["compile_mode"] = "simd"
-        metadata["parallel_mode"] = "simd"
-        # All-SIMD can still execute AutoBlockify V1 as a logical-program loop.
-        # Keep the policy resolved before the cost model instead of disabling it.
-        v1_materializable = bool(metadata.get("route_transform_v1_materializable", False))
-        metadata["auto_blockify_v1_enabled"] = v1_materializable
-        metadata["auto_blockify_v1_runtime_cap"] = v1_materializable
-    elif effective == "mixed_simd_simt":
-        metadata["auto_simt_requested_kind"] = effective
-        # Mixed execution still needs V1 at factor one: its persistent
-        # logical-program loop distributes the launch grid across physical
-        # cores and is independent of whether F2/F4 SuperBlock aggregation is
-        # profitable.  F2/F4 remain legal candidates, but must not be used as
-        # the admission condition for V1 itself.
-        scope_factor = max(1, int(superblock_factor))
-        v1_materializable = bool(metadata.get("route_transform_v1_materializable", False))
-        metadata["auto_blockify_v1_enabled"] = v1_materializable
-        metadata["auto_blockify_v1_runtime_cap"] = v1_materializable
-        metadata["auto_simt_scope_superblock_factor"] = scope_factor
-    elif effective == "all_simt_only":
-        # Auto route selection owns this decision.  When the user did not
-        # explicitly disable V1, make the selected pure-SIMT plan
-        # executable instead of depending on a separate environment switch.
-        if metadata.get("auto_simt_whole_kernel_superblock_materializable", False):
-            metadata["auto_blockify_v1_enabled"] = True
-
-
-def _selected_npuir_superblock_factor(metadata, opt) -> int:
-    """Return the factor owned by the active route.
-
-    CostModel-selected routes publish their factor in metadata. Explicit
-    manual routes do not run the CostModel and therefore must retain the
-    launch option. Reading ``auto_simt_scope_superblock_factor``
-    unconditionally made an old/default F1 value shadow explicit F2/F4.
-    """
-    effective = metadata.get("auto_simt_effective_kind")
-    if (effective in ("all_simd", "mixed_simd_simt")
-            or (effective is None and metadata.get("compile_mode") == "simd_simt")):
-        # The process-wide factor owns the surrounding SIMD/AIC scheduling
-        # graph and must stay F1. The selected F2/F4 value is carried on the
-        # scope itself and restored only in its outlined SIMT module.
-        selected = 1
-    elif effective == "all_simt_only":
-        selected = metadata.get("auto_simt_superblock_factor", opt.superblock_factor)
-    else:
-        selected = opt.superblock_factor
-    return max(1, int(selected or 1))
-
-
-def _append_pure_simt_auto_blockify_options(options, metadata, opt) -> None:
-    """Pass the executable V1 schedule contract to bishengir-compile."""
-    if (not metadata.get("auto_blockify_v1_enabled", False) or not metadata.get("auto_blockify_v1_runtime_cap", False)):
-        return
-    if not opt.enable_ta_auto_blockify_v1:
-        options.append("--enable-auto-blockify-loop")
-    selected_factor = _selected_npuir_superblock_factor(metadata, opt)
-    options.append(f"--super-block-factor={selected_factor}")
-
-
-def _can_materialize_scope_superblock(metadata, opt, whole_kernel_materializable: bool) -> bool:
-    """Whether the mixed backend can execute a selected F2/F4 plan.
-
-    The selected Stage is materialized as ``scope.scope<vector_mode=simt>``.
-    NPUIR batches F logical programs around that scope after bufferization,
-    while the process-wide V1 factor remains one.
-    """
-    del metadata
-    return bool(whole_kernel_materializable and getattr(opt, "compile_on_910_95", False)
-                and int(getattr(opt, "num_warps", 0) or 0) > 0)
-
-
-def _publish_route_transform_capability(metadata, opt) -> str:
-    """Publish the single capability fact consumed by scoring and lowering.
-
-    Layout transforms and the V1 policy have already run when this function is
-    called.  The returned JSON is passed unchanged to the native Route Model so
-    the report, candidate legality, and backend materialization describe the
-    same transformed TTIR.
-    """
-    target_supported = bool(getattr(opt, "compile_on_910_95", False))
-    num_warps = max(1, int(getattr(opt, "num_warps", 1) or 1))
-    v1_enabled = bool(metadata.get("auto_blockify_v1_enabled", False))
-    v1_materializable = target_supported and v1_enabled
-
-    disable_reasons = metadata.get("auto_blockify_v1_disable_reasons", [])
-    if not isinstance(disable_reasons, list):
-        disable_reasons = [str(disable_reasons)]
-    if not v1_enabled and not disable_reasons:
-        disable_reasons = ["not_requested_or_explicitly_disabled"]
-    if not target_supported:
-        disable_reasons.append("target_does_not_support_simt_auto_blockify_v1")
-
-    modeled_factors = _get_modeled_superblock_factors()
-    current_scope_factors = _get_current_scope_superblock_factors()
-    legal_factors = [factor for factor in modeled_factors if num_warps * factor <= 64]
-    if not legal_factors:
-        legal_factors = [1]
-    whole_kernel_factors = legal_factors if v1_materializable else [1]
-    scope_factors = ([factor for factor in legal_factors
-                      if factor in current_scope_factors] if v1_materializable else [1])
-    coalesce_factor = max(1, int(metadata.get("ttir_layout_coalesce_factor", 1) or 1))
-
-    coalesce_axis = metadata.get("ttir_layout_coalesce_axis", -1)
-    if not isinstance(coalesce_axis, int):
-        coalesce_axis = -1
-    physical_vector_cores = max(0, int(getattr(opt, "physical_vector_core_count_hint", 0) or 0))
-    if not physical_vector_cores:
-        try:
-            physical_vector_cores = int(NPUUtils().get_aivector_core_num())
-        except Exception:
-            physical_vector_cores = 0
-    source_logical_program_count = max(0, int(getattr(opt, "logical_program_count_hint", 0) or 0))
-    transformed_logical_program_count = ((source_logical_program_count + coalesce_factor - 1) //
-                                         coalesce_factor if source_logical_program_count else 0)
-    capability = {
-        "schema_version": 1,
-        "layout_merge_applied": bool(metadata.get("ttir_layout_merge_applied", False)),
-        "layout_coalescing_applied": coalesce_factor > 1,
-        "layout_coalescing_factor": coalesce_factor,
-        "layout_coalescing_axis": coalesce_axis,
-        "auto_blockify_v1_requested": bool(metadata.get("auto_blockify_v1_requested", False)),
-        "auto_blockify_v1_materializable": v1_materializable,
-        "auto_blockify_v1_disable_reasons": sorted(set(disable_reasons)),
-        "modeled_superblock_factors": list(modeled_factors),
-        "whole_kernel_superblock_factors": whole_kernel_factors,
-        "scope_superblock_factors": scope_factors,
-        "source_logical_program_count_hint": source_logical_program_count,
-        "logical_program_count_hint": transformed_logical_program_count,
-        "physical_vector_core_count_hint": physical_vector_cores,
-    }
-    logical_program_count = capability["logical_program_count_hint"]
-    if logical_program_count:
-        capability["superblock_runtime_groups"] = {
-            str(factor): {
-                "full_group_count": logical_program_count // factor,
-                "tail_count": logical_program_count % factor,
-            }
-            for factor in legal_factors
-        }
-    capability_json = json.dumps(capability, sort_keys=True, separators=(",", ":"))
-    metadata["route_transform_capability"] = capability_json
-    metadata["route_transform_v1_materializable"] = v1_materializable
-    metadata["route_transform_whole_kernel_factors"] = ",".join(map(str, whole_kernel_factors))
-    metadata["route_transform_scope_factors"] = ",".join(map(str, scope_factors))
-    return capability_json
-
-
-def _run_cpp_simd_simt_costmodel(mod, metadata, opt, analysis_ttir_code: str = "") -> str:
-    """Run native selection/materialization; Python only schedules the passes."""
-    mode = opt.auto_simt_scope_mode
-    if mode == "off" or metadata.get("compile_mode") != "simd_simt":
-        return "backend_default"
-
-    profile = opt.auto_simt_model_profile or str(
-        _costmodel_profiles_dir() / "simd_simt" / "david_v100_simd_simt_v1.json")
-    pm = ir.pass_manager(mod.context)
-    pm.enable_debug()
-    capability_json = metadata.get("route_transform_capability")
-    if not capability_json:
-        capability_json = _publish_route_transform_capability(metadata, opt)
-    capability = json.loads(capability_json)
-    whole_kernel_factors = capability.get("whole_kernel_superblock_factors", [1])
-    scope_factors = capability.get("scope_superblock_factors", [1])
-    whole_kernel_superblock_materializable = bool(metadata.get("route_transform_v1_materializable", False))
-    metadata["auto_simt_whole_kernel_superblock_materializable"] = (whole_kernel_superblock_materializable)
-    # Mixed F2/F4 requires an outer factor-one V1 loop that NPUIR can refine
-    # around the selected local scope.
-    scope_superblock_materializable = _can_materialize_scope_superblock(metadata, opt,
-                                                                        whole_kernel_superblock_materializable)
-    metadata["auto_simt_scope_superblock_materializable"] = scope_superblock_materializable
-    with tempfile.TemporaryDirectory() as tmpdir:
-        analysis_path = ""
-        if analysis_ttir_code:
-            analysis_path = os.path.join(tmpdir, "post_auto_blockify_v1.ttir.mlir")
-            Path(analysis_path).write_text(analysis_ttir_code, encoding="utf-8", newline="\n")
-        ascend.passes.ttir.add_select_simd_simt_costmodel(
-            pm,
-            mode,
-            profile,
-            str(opt.arch),
-            int(opt.num_warps),
-            bool(opt.compile_on_910_95),
-            whole_kernel_superblock_materializable,
-            scope_superblock_materializable,
-            max(whole_kernel_factors, default=1),
-            max(scope_factors, default=1),
-            int(json.loads(capability_json).get("logical_program_count_hint", 0)),
-            analysis_path,
-            capability_json,
-            str(opt.auto_simt_scope_dump),
-        )
-        ascend.passes.ttir.add_materialize_simt_scopes(pm)
-        pm.run(mod, "select_simd_simt_costmodel")
-
-    report = ascend.ir.get_string_attr(mod, "ascend.simt_costmodel.report_json")
-    effective = ascend.ir.get_string_attr(mod, "ascend.simt_costmodel.effective")
-    get_int_attr = getattr(ascend.ir, "get_int_attr", None)
-    superblock_factor = (get_int_attr(mod, "ascend.simt_costmodel.superblock_factor") if get_int_attr else 1)
-    if not isinstance(superblock_factor, int) or superblock_factor < 1:
-        superblock_factor = 1
-    if not report or effective not in {"all_simd", "all_simt_only", "mixed_simd_simt", "backend_default"}:
-        raise RuntimeError("invalid native SIMD/SIMT costmodel result")
-    _apply_cpp_simd_simt_decision(metadata, effective, superblock_factor, report, int(opt.num_warps))
-    return effective
-
-
-def _run_ttir_layout_merge(mod, metadata) -> None:
-    """Materialize TTIR memory-layout merges before route scoring."""
-    pm = ir.pass_manager(mod.context)
-    pm.enable_debug()
-    ascend.passes.ttir.add_ttir_layout_merge(pm)
-    pm.run(mod, "ttir_layout_merge_before_costmodel")
-    get_int_attr = getattr(ascend.ir, "get_int_attr", None)
-    factor = get_int_attr(mod, "hacc.coalesce_factor") if get_int_attr else -1
-    axis = get_int_attr(mod, "hacc.coalesce_axis") if get_int_attr else -1
-    ceil_div = get_int_attr(mod, "hacc.coalesce_grid_ceil_div") if get_int_attr else -1
-    metadata["ttir_layout_merge_applied"] = True
-    metadata["ttir_layout_coalesce_factor"] = factor if isinstance(factor, int) and factor > 1 else 1
-    metadata["ttir_layout_coalesce_axis"] = axis if isinstance(axis, int) and axis >= 0 else -1
-    metadata["ttir_layout_coalesce_grid_ceil_div"] = bool(isinstance(ceil_div, int) and ceil_div > 0)
-
-
-def _resolve_auto_blockify_v1_policy(ttir_code: str, metadata, opt) -> bool:
-    """Resolve the shared admission policy for NPUIR and TA V1.
-
-    ``enable_auto_blockify`` keeps its existing tri-state contract:
-      * ``None`` follows ``TRITON_ALL_BLOCKS_PARALLEL``;
-      * ``True`` explicitly enables V1;
-      * ``False`` explicitly disables V1.
-
-    An explicitly supplied ``has_auto_blockify_blacklist_op`` remains the
-    final blacklist override.  Otherwise the same TTIR blacklist is evaluated
-    for either implementation.  This function decides whether V1 is legal;
-    ``enable_ta_auto_blockify_v1`` only selects where the legal transform runs.
-    """
-    env_enabled = _is_auto_map_parallel_blocks_enabled()
-    requested = opt.enable_auto_blockify
-    requested_enabled = env_enabled if requested is None else bool(requested)
-    metadata["auto_blockify_v1_requested"] = requested_enabled
-
-    blacklist_reasons = []
-    has_blacklist_op = metadata.get("has_auto_blockify_blacklist_op")
-    if has_blacklist_op is None and requested_enabled:
-        blacklist_reasons = _get_auto_blockify_blacklist_reasons(ttir_code)
-        has_blacklist_op = bool(blacklist_reasons)
-    elif has_blacklist_op is None:
-        has_blacklist_op = False
-
-    metadata["has_auto_blockify_blacklist_op"] = bool(has_blacklist_op)
-    if has_blacklist_op and blacklist_reasons:
-        match = re.search(r"tt\.func\s+public\s+@(\w+)", ttir_code)
-        _warn_auto_blockify_disabled(match.group(1) if match else "<unknown>", blacklist_reasons)
-
-    enabled = requested_enabled and not has_blacklist_op
-    metadata["auto_blockify_v1_enabled"] = enabled
-    if blacklist_reasons:
-        metadata["auto_blockify_v1_disable_reasons"] = list(blacklist_reasons)
-    elif has_blacklist_op:
-        metadata["auto_blockify_v1_disable_reasons"] = ["explicit_blacklist_override"]
-    elif not requested_enabled:
-        metadata["auto_blockify_v1_disable_reasons"] = ["not_requested_or_explicitly_disabled"]
-    else:
-        metadata["auto_blockify_v1_disable_reasons"] = []
-    metadata["auto_blockify_v1_selection_source"] = ("option"
-                                                     if requested is not None else "TRITON_ALL_BLOCKS_PARALLEL")
-    return enabled
-
-
-def _run_ta_simt_auto_blockify_v1(mod, metadata, opt, *, super_block_factor=None) -> bool:
-    """Materialize the TA port of SIMT AutoBlockify V1.
-
-    V1 keeps one logical program's tile tensor shapes unchanged.  The launcher
-    is capped to the same physical vector-core count passed to this transform;
-    NPUIR's copy of V1 is disabled later to prevent applying the same schedule
-    twice.  AutoBlockify V2 remains a separate, disabled pass.
-    """
-    physical_vector_cores = int(NPUUtils().get_aivector_core_num())
-    if super_block_factor is None:
-        super_block_factor = opt.superblock_factor
-    super_block_factor = max(1, int(super_block_factor))
-    pm = ir.pass_manager(mod.context)
-    pm.enable_debug()
-    ascend.passes.ttir.add_simt_auto_blockify_v1(
-        pm,
-        physical_vector_cores,
-        super_block_factor,
-    )
-    pm.run(mod, "ta_simt_auto_blockify_v1")
-    materialized = _get_then_remove_rc(mod, "ta.auto_blockify_v1.materialized") == 1
-    metadata["ta_auto_blockify_v1_materialized"] = materialized
-    metadata["ta_auto_blockify_v1_physical_core_count"] = physical_vector_cores
-    metadata["ta_auto_blockify_v1_super_block_factor"] = super_block_factor
-    return materialized
-
-
-def _parse_ttir_text(ttir_code: str, context=None):
-    """Recreate a TTIR module in ``context`` from an immutable snapshot."""
-    if context is None:
-        context = ir.context()
-        ir.load_dialects(context)
-        buffer_ir.load_dialects(context)
-        ascend_ir.load_dialects(context)
-        ascend.load_dialects(context)
-        if distributed is not None:
-            distributed.ir.load_dialects(context)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        source = Path(tmpdir) / "route_neutral.ttir.mlir"
-        source.write_text(ttir_code, encoding="utf-8", newline="\n")
-        module = ir.parse_mlir_module(str(source), context)
-        module.context = context
-        return module
-
-
-def _build_costmodel_analysis_ttir(mod, metadata, opt) -> str:
-    """Build a disposable post-AutoBlockify V1-F1 analysis view.
-
-    The real module stays post-layout and route-neutral.  The native Route
-    Model scores this clone, then materializes its decision on the real
-    module.  Pure-SIMT and mixed lowering apply their executable V1 schedule
-    only after selection, so all-SIMD never inherits SIMT dispatch IR.
-    """
-    if not metadata.get("auto_blockify_v1_enabled", False):
-        metadata["auto_simt_costmodel_analysis_ir"] = "post_layout_ttir"
-        return ""
-
-    analysis_mod = _parse_ttir_text(str(mod), getattr(mod, "context", None))
-    analysis_metadata = {}
-    materialized = _run_ta_simt_auto_blockify_v1(
-        analysis_mod,
-        analysis_metadata,
-        opt,
-        super_block_factor=1,
-    )
-    metadata["auto_simt_costmodel_analysis_v1_materialized"] = materialized
-    metadata["auto_simt_costmodel_analysis_ir"] = ("post_auto_blockify_v1_f1_ttir"
-                                                   if materialized else "post_layout_ttir")
-    return str(analysis_mod) if materialized else ""
-
-
-def _refine_ta_simt_auto_blockify_v1_superblock(mod, metadata, super_block_factor) -> None:
-    """Apply a pure-SIMT SuperBlock factor to the factor-1 V1 schedule."""
-    super_block_factor = max(1, int(super_block_factor))
-    if super_block_factor == 1:
-        return
-    pm = ir.pass_manager(mod.context)
-    pm.enable_debug()
-    ascend.passes.ttir.add_refine_simt_auto_blockify_v1_superblock(pm, super_block_factor)
-    pm.run(mod, "refine_ta_simt_auto_blockify_v1_superblock")
-    metadata["ta_auto_blockify_v1_super_block_factor"] = super_block_factor
-
-
-def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
+def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
     # use triton_adapter to lower Triton-MLIR to linalg
-    analysis_ttir_code = ""
-    if metadata.get("compile_mode") == "simd_simt" and opt.auto_simt_scope_mode != "off":
-        if opt.enable_ttir_layout_merge:
-            _run_ttir_layout_merge(mod, metadata)
-        else:
-            metadata["ttir_layout_merge_applied"] = False
-            metadata["ttir_layout_coalesce_factor"] = 1
-            metadata["ttir_layout_coalesce_axis"] = -1
-            metadata["ttir_layout_coalesce_grid_ceil_div"] = False
-        _resolve_auto_blockify_v1_policy(str(mod), metadata, opt)
-        _publish_route_transform_capability(metadata, opt)
-        analysis_ttir_code = _build_costmodel_analysis_ttir(mod, metadata, opt)
-    cpp_decision = _run_cpp_simd_simt_costmodel(mod, metadata, opt, analysis_ttir_code)
-    cpp_all_simt = cpp_decision == "all_simt_only"
-    if metadata.get("compile_mode") == "simd_simt" and (cpp_all_simt or ascend.ir.is_whole_body_void_simt_scope(mod)):
-        metadata["scope_pure_simt_auto"] = True
-        metadata["force_simt_only"] = True
-        metadata["parallel_mode"] = "simt"
-        metadata["shared_mem_dynamic_size"] = 122880
-        ascend.ir.inline_void_simt_scopes_for_pure_simt(mod)
-        ascend.ir.clear_simd_simt_costmodel_attrs(mod)
-        auto_blockify_v1_enabled = metadata.get("auto_blockify_v1_enabled")
-        if auto_blockify_v1_enabled is None:
-            auto_blockify_v1_enabled = _resolve_auto_blockify_v1_policy(str(mod), metadata, opt)
-        selected_superblock_factor = metadata.get("auto_simt_superblock_factor", opt.superblock_factor)
-        if (opt.enable_ta_auto_blockify_v1 and auto_blockify_v1_enabled
-                and metadata.get("ta_auto_blockify_v1_materialized", False)):
-            _refine_ta_simt_auto_blockify_v1_superblock(mod, metadata, selected_superblock_factor)
-            metadata["auto_blockify_v1_runtime_cap"] = True
-        elif (opt.enable_ta_auto_blockify_v1 and auto_blockify_v1_enabled
-              and not metadata.get("ta_auto_blockify_v1_materialized", False)):
-            materialized = _run_ta_simt_auto_blockify_v1(mod, metadata, opt,
-                                                         super_block_factor=selected_superblock_factor)
-            # A TA silent-skip must not cap the launch grid.  It also must not
-            # fall through to NPUIR and hide a parity bug in the TA port.
-            metadata["auto_blockify_v1_runtime_cap"] = materialized
-        elif not metadata.get("ta_auto_blockify_v1_materialized", False):
-            metadata["auto_blockify_v1_runtime_cap"] = auto_blockify_v1_enabled
-        # The auto-selected pure-SIMT path returns TTIR directly and therefore
-        # bypasses the normal ttir-to-linalg metadata export.  Strip analysis
-        # attributes before bishengir-compile and retain their launch contract
-        # in metadata, exactly as the explicit simt_only path does.
-        _export_coalesce_metadata(mod, metadata)
-        _get_then_remove_rc(mod, "ta.ttir_layout_merge.applied")
-        return str(mod)
-
-    # A hand-written mixed kernel already owns its scope boundary, so no Route
-    # Model pass runs to attach the requested factor. Publish the same local
-    # scope ABI here; automatic routes attach it during C++ materialization.
-    if cpp_decision == "backend_default" and metadata.get("compile_mode") == "simd_simt":
-        manual_scope_factor = max(1, int(opt.superblock_factor or 1))
-        manual_scope_count = ascend.ir.set_simt_scope_superblock_factor(mod, manual_scope_factor)
-        if manual_scope_count:
-            metadata["auto_simt_scope_superblock_factor"] = manual_scope_factor
-            metadata["manual_simt_scope_count"] = manual_scope_count
-
-    # Get TTIR after C++ has materialized any selected mixed-mode scopes.
-    ttir_code = str(mod)
+    # Get Triton-MLIR as string
+    ttir_code = _serialize_module(mod, opt)
     auto_map_parallel_blocks_enabled = _is_auto_map_parallel_blocks_enabled()
-    if metadata.get("auto_simt_effective_kind") == "all_simd":
-        # All-SIMD also runs NPUIR AutoBlockify when the shared policy allows it.
-        # Preserve the values set by _apply_cpp_simd_simt_decision; do not
-        # re-enable or force-disable here.
-        metadata["auto_blockify_v1_runtime_cap"] = bool(metadata.get("auto_blockify_v1_enabled", False))
-    elif metadata.get("auto_simt_effective_kind") == "mixed_simd_simt":
-        # Preserve the mixed SuperBlock contract established above.  NPUIR V1
-        # creates the persistent logical-program loop even for F1; the
-        # selected factor independently controls logical-program aggregation.
-        metadata["auto_blockify_v1_enabled"] = True
-        metadata["auto_blockify_v1_runtime_cap"] = True
-    else:
-        _resolve_auto_blockify_v1_policy(ttir_code, metadata, opt)
-    has_auto_blockify_blacklist_op = metadata["has_auto_blockify_blacklist_op"]
+    # This is compiler-derived safety metadata, never a user compile option.
+    # Derive it even when the feature is currently disabled so a later runtime
+    # environment change cannot enable AutoBlockify for unsafe TTIR.
+    blacklist_reasons = _get_auto_blockify_blacklist_reasons(ttir_code)
+    has_auto_blockify_blacklist_op = bool(blacklist_reasons)
+    metadata["has_auto_blockify_blacklist_op"] = has_auto_blockify_blacklist_op
+    if auto_map_parallel_blocks_enabled and has_auto_blockify_blacklist_op and blacklist_reasons:
+        kernel_name = re.search(r"tt\.func\spublic\s+@(\w+)", ttir_code).group(1)
+        _warn_auto_blockify_disabled(kernel_name or "<unknown>", blacklist_reasons)
     with tempfile.TemporaryDirectory() as tmpdir:
         src_path = os.path.join(tmpdir, "kernel.ttir.mlir")
         dst_path = os.path.join(tmpdir, "kernel.ttadapter.mlir")
-        Path(src_path).write_text(ttir_code)
+        if opt.debug:
+            Path(src_path).write_text(ttir_code)
         triton_adapter_opt_path = _get_triton_adapter_opt_path()
 
-        enable_nd2nz_on_vector = metadata["enable_nd2nz_on_vector"]
-        enable_select_analysis = metadata["enable_select_analysis"]
+        # Select analysis is a fixed lowering policy, not a user compile option.
+        enable_select_analysis = True
         compile_on_910_95 = metadata["compile_on_910_95"]
-        requested_force_simt_template = metadata["force_simt_template"]
-        compile_mode = _validate_compile_mode(metadata.get("compile_mode", "simd"))
-        # Once the C++ Route Model has made an explicit decision, lowering
-        # must implement that decision rather than also applying the legacy
-        # global SIMT-template switch. A mixed decision is represented solely
-        # by the materialized scope.scope<vector_mode=simt>; an all-SIMD
-        # decision contains no such scope.  Keep the old global behavior only
-        # for backend_default/report/off compatibility paths.
-        model_owns_local_routing = cpp_decision in {
-            "all_simd",
-            "mixed_simd_simt",
-        }
-        force_simt_template = (requested_force_simt_template and not model_owns_local_routing)
-        if force_simt_template:
-            compile_mode = "simd_simt_template"
-        enable_sync_block_lock = metadata["enable_sync_block_lock"]
-        enable_mask_fallback_conversion = metadata["enable_mask_fallback_conversion"]
-        optimize_dynamic_offset = metadata["optimize_dynamic_offset"]
-        auto_blockify_size = metadata["auto_blockify_size"]
+        compile_mode = opt.compile_mode
+        metadata["compile_mode"] = compile_mode
         enable_mixed_cv = metadata.get("enable_mixed_cv")
         disable_auto_inject_block_sync = metadata.get("disable_auto_inject_block_sync")
         set_workspace_multibuffer = metadata.get("set_workspace_multibuffer")
-        if has_auto_blockify_blacklist_op or not auto_map_parallel_blocks_enabled:
-            auto_blockify_size = 1
+
+        # Inject grid tile-count hint for ChunkCoalescing. When the kernel
+        # has no boundary mask but grid[axis] is known at compile time (e.g.
+        # from constexpr nchunks), the pass uses this to safely choose H.
+        grid_num_tiles = metadata.get("grid_num_tiles")
+        if isinstance(grid_num_tiles, int) and grid_num_tiles > 0:
+            try:
+                _builder = ascend.ir.ascendnpu_ir_builder(mod.context, opt.target_arch)
+                mod.set_attr("hacc.grid_num_tiles", _builder.parse_attr(f"{grid_num_tiles} : i32"))
+            except Exception:
+                pass  # graceful fallback: pass runs without hint
+
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         if distributed is not None:
             distributed.ascend_passes.ttgpuir.add_convert_triton_distributed_to_hivm(pm)
-        # ascend.passes.ttir.add_auto_blockify(pm, auto_blockify_size)
 
         ascend.passes.ttir.add_triton_control_flow_opt(pm)
-        if (metadata["add_auto_scheduling"]):
-            ascend.passes.ttir.add_dag_sync(pm)
-            ascend.passes.ttir.add_dag_scope(pm)
-            passes.common.add_cse(pm)
-            passes.common.add_canonicalizer(pm)
-            ascend.passes.ttir.add_dag_ssbuffer(pm)
-            passes.common.add_cse(pm)
-            passes.common.add_canonicalizer(pm)
-        ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
-        ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, force_simt_template,
-                                                               enable_sync_block_lock, compile_mode)
+        ascend.passes.ttir.add_triton_to_structure(pm, False, False)
+        ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, compile_mode)
         ascend.passes.ttir.add_triton_to_annotation(pm)
-        ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, force_simt_template, compile_mode)
+        ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, compile_mode)
         ascend.passes.ttir.add_triton_to_hivm(pm)
         ascend.passes.ttir.add_triton_to_hfusion(pm, compile_on_910_95)
         ascend.passes.ttir.add_triton_to_llvm(pm)
         ascend.passes.ttir.add_bubble_up_operation(pm)
-        ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
-        ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, enable_nd2nz_on_vector, enable_select_analysis,
-                                                compile_on_910_95, compile_mode)
-        ascend.passes.ttir.set_enable_buffer_insert_optimization(
-            mod, metadata.get("enable_buffer_insert_optimization", True))
+        ascend.passes.ttir.add_triton_to_structure(pm, False, False)
+        ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, False, enable_select_analysis, compile_on_910_95,
+                                                compile_mode)
+        # Restricted to 910_95/950. The merged buffer is written by two disjoint
+        # memref.copy ops, and on 910_9362 the generated code only makes the
+        # copy next to the surviving to_tensor visible, so the other half of the
+        # tile reads back the padding value. The IR is unchanged through
+        # bishengir-opt, so the loss happens in code generation.
+        if compile_on_910_95:
+            ascend.passes.ttir.add_merge_concat_load_buffer(pm)
         if metadata["enable_dynamic_cv_pipeline"]:
             metadata["set_workspace_multibuffer"] = 0
             metadata["enable_mixed_cv"] = True
             metadata["disable_auto_inject_block_sync"] = True
-            ascend.passes.ttir.set_enable_cube_block_merge(metadata["enable_cube_block_merge"])
-            ascend.passes.ttir.set_enable_ub_refine_opt(mod, metadata["enable_ub_refine_opt"])
 
+            # Must run before add_dynamic_cv_pipeline because the driven
+            # AddMultiBufferInnerScope pass reads the module-level
+            # `ssbuffer.insertionOptimization` attribute (set here) at run time.
+            # Keep the existing default-on buffer insertion behavior.
+            ascend.passes.ttir.set_enable_buffer_insert_optimization(mod)
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
 
-        _intra_val = metadata.get("intra_cache_num")
+        if _enable_msdebug():
+            ascend.passes.ttir.add_normalize_debug_line_locations(pm)
+
+        _intra_val = metadata.get("buf_slot_num_of_veccore")
         if _intra_val is not None:
             ascend.passes.ttir.set_buffer_count(mod, "INTRA", _intra_val)
 
-        _inter_val = metadata.get("inter_cache_num")
+        _inter_val = metadata.get("buf_slot_num_of_crosscore")
         if _inter_val is not None:
             ascend.passes.ttir.set_buffer_count(mod, "INTER", _inter_val)
 
-        _load_val = metadata.get("load_cache_num")
+        _load_val = metadata.get("buf_slot_num_of_gm")
         if _load_val is not None:
             ascend.passes.ttir.set_buffer_count(mod, "LOAD", _load_val)
 
@@ -714,13 +439,13 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         _adjust_metadata_by_module_result(mod, metadata, opt, enable_mixed_cv=enable_mixed_cv,
                                           disable_auto_inject_block_sync=disable_auto_inject_block_sync,
                                           set_workspace_multibuffer=set_workspace_multibuffer)
-        _export_coalesce_metadata(mod, metadata)
+        _export_program_grid_metadata(mod, metadata)
 
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
             dump_manager.put(str(mod), "kernel.ttadapter.mlir", binary=False)
 
-        return str(mod)
+        return _serialize_module(mod, opt)
 
 
 def linalg_to_bc_by_triton_mlir_opt(linalg: str, metadata, opt):
@@ -734,13 +459,6 @@ def linalg_to_bc_by_triton_mlir_opt(linalg: str, metadata, opt):
     Returns:
         Bytecode data as bytes (not file path, to avoid temp directory cleanup issues)
     """
-    # The Stage graph is fixed before the C++ Route Model runs.  When auto
-    # selects all-SIMT, ttadapter deliberately carries TTIR forward to the
-    # pure-SIMT compiler; the optional Linalg bytecode round-trip must become
-    # an identity stage rather than trying to parse TTIR as Linalg/BishengIR.
-    if metadata.get("force_simt_only", False):
-        return linalg
-
     with tempfile.TemporaryDirectory() as tmpdir:
         ttadapter_path = os.path.join(tmpdir, "kernel.ttadapter.mlir")
         bc_path = os.path.join(tmpdir, "kernel.mlirbc")
@@ -778,9 +496,6 @@ def bc_to_linalg_by_bishengir_opt(bc_data: bytes, metadata, opt):
     Returns:
         MLIR text as string
     """
-    if metadata.get("force_simt_only", False):
-        return bc_data
-
     with tempfile.TemporaryDirectory() as tmpdir:
         bc_path = os.path.join(tmpdir, "kernel.mlirbc")
         mlir_path = os.path.join(tmpdir, "kernel.mlir")
@@ -791,13 +506,14 @@ def bc_to_linalg_by_bishengir_opt(bc_data: bytes, metadata, opt):
 
         bishengir_opt_path, env = _get_bishengir_opt_path()
 
-        subprocess.run([
+        cmd = [
             bishengir_opt_path,
             bc_path,
-            "--mlir-print-debuginfo",
-            "-o",
-            mlir_path,
-        ], env=env, capture_output=True, check=True, text=True)
+        ]
+        if opt.debug:
+            cmd += ["--mlir-print-debuginfo"]
+        cmd += ["-o", mlir_path]
+        subprocess.run(cmd, env=env, capture_output=True, check=True, text=True)
 
         # Read the generated MLIR text
         linalg_text = Path(mlir_path).read_text()
@@ -856,23 +572,31 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     # Note: Compiled Kernel requires to estimate size of shared memory to occupy
     # Currently, NPU backend does not limit on shared memory
     metadata["shared"] = 1
+    module_attrs = re.search(r'\bmodule(?:\s+@\w+)?\s+attributes\s*\{([^}]*)\}', linalg)
+    metadata["has_full_row_copy"] = bool(module_attrs and re.search(r'\btt\.full_row_copy\b', module_attrs.group(1)))
     # Force disable auto tile and bind subblock if attribute is present in module
     metadata["auto_tile_and_bind_subblock"] = not re.search(DISABLE_AUTO_TILE_AND_BIND_SUBBLOCK_REGEX, linalg)
-    # Turn off auto-blockify when sync_block_lock/unlock was inserted: the lock
-    # protects a cross-block read-modify-write and is incompatible with packing
-    # logical blocks into a sequential auto-blockify loop.
-    if re.search(SYNC_BLOCK_LOCK_REGEX, linalg):
+    # Turn off auto-blockify only for the ORDERED (token-ring) sync_block_lock:
+    if re.search(SYNC_BLOCK_LOCK_REGEX, linalg) and not re.search(r"sync_block_lock_unordered", linalg):
         metadata["has_auto_blockify_blacklist_op"] = True
+    # Mixed kernels use (block, subblock) as the unordered-lock participant
+    # identity. Pure AIV kernels keep subblock tiling disabled: they neither
+    # need it nor necessarily have the FFTS runtime resource it requires.
+    has_unordered_sync_block_lock = re.search(r"sync_block_lock_unordered", linalg) is not None
+    metadata["has_unordered_sync_block_lock"] = has_unordered_sync_block_lock
+    if has_unordered_sync_block_lock:
+        mix_mode = re.search(MIX_MODE_REGEX, linalg).group(1)
+        if mix_mode != "mix":
+            metadata["auto_tile_and_bind_subblock"] = False
+        # One metadata cache line for runtime participant_num, plus one
+        # choosing and one ticket cache line per participant. Each cache line is
+        # 8 i64. This fallback is for one lock; the bishengir callback supplies
+        # the exact total after lowering.
+        metadata["sync_block_lock_layout"] = 1 << 32
+        metadata["lock_init_val"] = 0
     # the mix mode is also encoded into metadata['name'] for runtime to distinguish
     metadata["mix_mode"] = re.search(MIX_MODE_REGEX, linalg).group(1)
     metadata["parallel_mode"] = re.search(PARALLEL_MODE_REGEX, linalg).group(1)
-    if metadata.get("auto_simt_requested_kind") == "mixed_simd_simt":
-        applied = metadata["parallel_mode"] == "mix_simd_simt"
-        metadata["auto_simt_scope_applied"] = applied
-        if not applied and os.environ.get("TRITON_ASCEND_AUTO_SIMT_STRICT_VERIFY",
-                                          "").strip().lower() in {"1", "true", "yes", "on"}:
-            raise RuntimeError("C++ costmodel selected mixed SIMD/SIMT, but lowering "
-                               f"reported {metadata['parallel_mode']!r}")
     metadata["kernel_name"] = re.search(KERNEL_NAME_REGEX, linalg).group(1)
     # Check the function load_binary in npu_driver.py.
     metadata["name"] = metadata["kernel_name"]
@@ -908,83 +632,12 @@ def _parse_ttir_metadata(ttir: str, metadata: dict):
     metadata["mix_mode"] = "aiv"
     metadata["kernel_name"] = re.search(KERNEL_NAME_REGEX, ttir).group(1)
     metadata["name"] = metadata["kernel_name"]
-    auto_map_parallel_blocks_enabled = _is_auto_map_parallel_blocks_enabled()
-    has_auto_blockify_blacklist_op = metadata.get("has_auto_blockify_blacklist_op")
-    if has_auto_blockify_blacklist_op is None and auto_map_parallel_blocks_enabled:
-        has_auto_blockify_blacklist_op = bool(_get_auto_blockify_blacklist_reasons(ttir))
-    elif has_auto_blockify_blacklist_op is None:
-        has_auto_blockify_blacklist_op = False
-    metadata["has_auto_blockify_blacklist_op"] = has_auto_blockify_blacklist_op
+    # Keep this as compiler-derived safety metadata.  In particular, do not
+    # trust a caller-provided False value to override an unsafe TTIR pattern.
+    metadata["has_auto_blockify_blacklist_op"] = bool(_get_auto_blockify_blacklist_reasons(ttir))
     # Parse all tensor kinds from arguments
     metadata["tensor_kinds"] = [int(kind) for _, kind in re.findall(TENSOR_KIND_REGEX, ttir)]
     return metadata
-
-
-def _normalize_auto_simt_scope_mode(mode: Optional[str]) -> str:
-    if mode is None:
-        return "off"
-    mode = str(mode).strip().lower()
-    if mode in ("1", "true", "on", "yes", "auto"):
-        return "auto"
-    if mode in ("report", "dry_run", "dry-run", "dump"):
-        return "report"
-    return "off"
-
-
-VALID_PARTITION_AND_BIND_SUB_BLOCK = (
-    "off",
-    "default-pin",
-    "load-balanced",
-)
-
-
-def _validate_partition_and_bind_sub_block(partition_mode: str) -> str:
-    if partition_mode not in VALID_PARTITION_AND_BIND_SUB_BLOCK:
-        valid_values = ", ".join(VALID_PARTITION_AND_BIND_SUB_BLOCK)
-        raise ValueError("Invalid enable_partition_and_bind_sub_block="
-                         f"{partition_mode!r}. Expected one of: {valid_values}.")
-    return partition_mode
-
-
-def _parse_float_env(name: str, default: float) -> float:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        return default
-
-
-def _auto_simt_asset_hash(path: str, default_name: str) -> str:
-    asset = Path(path) if path else _costmodel_profiles_dir() / default_name
-    try:
-        selection_bytes = asset.read_bytes()
-    except OSError:
-        return f"missing:{asset}"
-
-    digest = hashlib.sha256()
-    digest.update(b"selection-profile\0")
-    digest.update(selection_bytes)
-    try:
-        profile = json.loads(selection_bytes)
-        shared_ref = (profile.get("microbenchmark_profile") if isinstance(profile, dict) else None)
-    except (TypeError, ValueError, UnicodeError):
-        shared_ref = None
-    if shared_ref is not None and not isinstance(shared_ref, str):
-        digest.update(b"\0invalid-shared-microbenchmark-reference\0")
-        digest.update(repr(shared_ref).encode())
-        return digest.hexdigest()
-    if shared_ref:
-        shared_asset = Path(shared_ref)
-        if not shared_asset.is_absolute():
-            shared_asset = asset.parent / shared_asset
-        digest.update(b"\0shared-microbenchmark\0")
-        try:
-            digest.update(shared_asset.read_bytes())
-        except OSError:
-            digest.update(f"missing:{shared_asset}".encode())
-    return digest.hexdigest()
 
 
 def get_common_bishengir_compile_options(metadata):
@@ -993,21 +646,25 @@ def get_common_bishengir_compile_options(metadata):
     return [bishengir_target_opt]
 
 
-def _needs_lib_call_no_inline(metadata):
-    """Return whether the target needs the CANN 9.1 hacc.noinline workaround."""
-    arch = metadata['target'].arch
-    return arch.startswith("Ascend950")
-
-
 @functools.lru_cache()
-def _npu_compiler_supports_option(compiler_path: str, option: str) -> bool:
-    """Check an optional BiShengIR flag instead of assuming toolchain parity."""
+def _supports_full_row_copy_inlining(compiler_path):
     try:
         result = subprocess.run([compiler_path, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                 timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         return False
-    return option in result.stdout
+    return result.returncode == 0 and "--enable-lib-call-no-inline" in result.stdout
+
+
+def _full_row_copy_compile_options(metadata, compiler_path):
+    # A shared noinline load helper loses constant-width specialization when
+    # the masked tail also calls it. Scope this to compiler-versioned A5 SIMD
+    # loads; other kernels retain the NPU compiler's default inlining policy.
+    if (metadata.get("has_full_row_copy", False) and metadata["target"].arch.startswith("Ascend950")
+            and metadata.get("mix_mode") == "aiv" and metadata.get("parallel_mode") == "simd"
+            and _supports_full_row_copy_inlining(compiler_path)):
+        return ["--enable-lib-call-no-inline=false"]
+    return []
 
 
 def get_auto_bind_sub_block_option(metadata):
@@ -1030,6 +687,12 @@ def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: s
 
     dump_manager = get_dump_manager(metadata_hash)
     dump_manager.put(Path(output_path).read_text(encoding='utf-8'), "kernel.npuir.mlir", binary=False)
+
+
+def _dump_kernel_binary(metadata_hash: str, bin_path: str):
+    """Copy the compiled kernel object into the TRITON_DEBUG dump directory."""
+    dump_manager = get_dump_manager(metadata_hash)
+    dump_manager.put(Path(bin_path).read_bytes(), os.path.basename(bin_path), binary=True)
 
 
 def try_compile_with_config(linalg: str, ub_config: Dict[str, Any], metadata: dict, opt) -> Tuple[bool, str]:
@@ -1066,8 +729,9 @@ def try_compile_with_config(linalg: str, ub_config: Dict[str, Any], metadata: di
 
 def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
     linalg, metadata = _parse_linalg_metadata(linalg, metadata)
+    _finalize_program_launch_policy(metadata, opt)
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_file_name = "kernel.mlir" if opt.use_bytecode else "kernel.ttadapter.mlir"
+        tmp_file_name = "kernel.mlir"
         ttadapter_path = os.path.join(tmpdir, tmp_file_name)
         Path(ttadapter_path).write_text(linalg)
         bin_file = os.path.join(tmpdir, "kernel")
@@ -1078,6 +742,11 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         bin_path = os.path.join(tmpdir, bin_file_with_ext)
         callback_path = os.path.join(tmpdir, "libkernel.so")
         _compile_option_list = get_common_bishengir_compile_options(metadata)
+
+        multibuffer_mode = metadata.get("multibuffer_mode")
+        if multibuffer_mode is not None:
+            mode_arg = "[" + ",".join(f"({level},{count})" for level, count in multibuffer_mode) + "]"
+            _compile_option_list.append(f"--multibuffer-mode={mode_arg}")
 
         multibuffer = metadata.get("multibuffer")
         num_stages = metadata.get("num_stages")
@@ -1092,28 +761,10 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 f"--enable-auto-multi-buffer={multi_buffer_value}",
             ]
 
-        storage_align = metadata["storage_align"]
-        if storage_align is not None:
-            _compile_option_list += [
-                f"--enable-hivm-auto-storage-align={storage_align}",
-            ]
-
-        ops_reorder = metadata["ops_reorder"]
-        if ops_reorder is not None:
-            _compile_option_list += [
-                f"--enable-ops-reorder={ops_reorder}",
-            ]
-
         vf_fusion_mode = metadata["vf_fusion_mode"]
         if vf_fusion_mode is not None:
             _compile_option_list += [
                 f"--vf-fusion-mode={vf_fusion_mode}",
-            ]
-
-        code_motion = metadata["code_motion"]
-        if code_motion is not None:
-            _compile_option_list += [
-                f"--enable-code-motion={code_motion}",
             ]
 
         enable_preload = metadata["enable_preload"]
@@ -1129,6 +780,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         _compile_option_list += [
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
+
+        _compile_option_list += [f"--enable-optimized-metaop={is_cann_version_at_least(9, 2, 0)}"]
+
         npu_utils = NPUUtils()
         if npu_utils.has_device_limit():
             _compile_option_list += [
@@ -1138,17 +792,14 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 f"--custom-aiv-number={npu_utils.get_aivector_core_num()}",
             ]
 
-        # This lowering entry is selected explicitly for 910_95/950.  Do not
-        # rely only on the optional Python ``acl`` probe here: compile workers
-        # may not inherit a usable device context, while FFTS is unsupported
-        # by this target regardless of the host-side probe result.
-        if opt.compile_on_910_95 or force_disable_ffts():
+        if force_disable_ffts(opt.target_arch):
             _compile_option_list += ["--disable-ffts"]
         if _is_ascend_sanitizer_enabled():
             _compile_option_list += ["--enable-sanitizer=true"]
         if not _is_debug_line_info_disabled():
             _compile_option_list += ["--enable-debug-info=true"]
-
+        if _enable_msdebug():
+            _compile_option_list += ["--enable-debug-variables=true"]
         if _enable_print_ub_bits():
             _compile_option_list += ["--enable-print-memory-allocated-size"]
 
@@ -1202,25 +853,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--enable-mixed-cv={enable_mixed_cv}"]
 
-        enable_cce_vf_auto_sync = metadata["enable_cce_vf_auto_sync"]
-        if enable_cce_vf_auto_sync is not None:
-            _compile_option_list += \
-                [f"--append-bisheng-options=-mllvm --cce-vf-auto-sync={enable_cce_vf_auto_sync}"]
-
-        enable_cce_vf_remove_membar = metadata["enable_cce_vf_remove_membar"]
-        if enable_cce_vf_remove_membar is not None:
-            _compile_option_list += \
-                [f"--append-bisheng-options=-mllvm --cce-vf-remove-membar={enable_cce_vf_remove_membar}"]
-
-        enable_vf_fusion = metadata["enable_vf_fusion"]
-        if enable_vf_fusion is not None:
-            _compile_option_list += \
-                [f"--enable-vf-fusion={enable_vf_fusion}"]
-
-        enable_drop_unit_dims = metadata["enable_drop_unit_dims"]
-        if enable_drop_unit_dims is not None:
-            _compile_option_list += \
-                [f"--enable-drop-unit-dims={enable_drop_unit_dims}"]
+        enable_dynamic_cv_pipeline = metadata["enable_dynamic_cv_pipeline"]
+        if enable_dynamic_cv_pipeline == True and not metadata.get("disable_vf_operand_substitution", False):
+            _compile_option_list += [f"--enable-vf-operand-substitution=True"]
 
         enable_flatten = metadata["enable_flatten"]
         if enable_flatten is not None:
@@ -1251,88 +886,47 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 _compile_option_list += \
                     [f"--link-aicore-bitcode={bitcode}"]
 
-        # Honor the linalg-level blacklist (e.g. hivm.sync_block_lock) as well:
-        # the launcher disables the grid cap for blacklisted kernels, so
-        # requesting the NPUIR persistent loop without that cap would deadlock.
-        auto_blockify_npuir_v1_enabled = (metadata.get("auto_blockify_v1_enabled", False)
-                                          and not metadata.get("ta_auto_blockify_v1_materialized", False)
-                                          and not metadata.get("has_auto_blockify_blacklist_op", False))
-        if auto_blockify_npuir_v1_enabled:
+        if metadata["auto_blockify_enabled"]:
             _compile_option_list += ["--enable-auto-blockify-loop"]
-            # Only mixed/local-scope routes carry a SuperBlock factor; all-SIMD
-            # and ordinary SIMD keep the historical F1 autoblockify behavior.
-            if metadata.get("parallel_mode") == "mix_simd_simt":
-                selected_factor = _selected_npuir_superblock_factor(metadata, opt)
-                _compile_option_list += [f"--super-block-factor={selected_factor}"]
-            metadata["auto_blockify_v1_runtime_cap"] = True
-        elif not metadata.get("ta_auto_blockify_v1_materialized", False):
-            metadata["auto_blockify_v1_runtime_cap"] = False
         npu_compiler_path, env = _get_npucompiler_path()
         if npu_compiler_path.endswith("bishengir-compile"):
             _compile_option_list += [
                 "--enable-hfusion-compile=true",
                 "--enable-triton-kernel-compile=true",
             ]
-            if (_needs_lib_call_no_inline(metadata)
-                    and _npu_compiler_supports_option(npu_compiler_path, "--enable-lib-call-no-inline")):
-                _compile_option_list += ["--enable-lib-call-no-inline=false"]
-            if metadata.get("parallel_mode") == "mix_simd_simt":
-                num_warps = metadata.get("num_warps") or opt.num_warps
-                _compile_option_list += [f"--num-warps={num_warps}"]
-                warp_size = metadata.get("warp_size") or opt.warp_size
-                _compile_option_list += [f"--threads-per-warp={warp_size}"]
-            partition_mode = _validate_partition_and_bind_sub_block(
-                metadata.get(
-                    "enable_partition_and_bind_sub_block",
-                    opt.enable_partition_and_bind_sub_block,
-                ) or "off")
-            if partition_mode != "off":
-                _compile_option_list += [f"--partition-and-bind-sub-block={partition_mode}"]
+            _compile_option_list += _full_row_copy_compile_options(metadata, npu_compiler_path)
+            # Temporary until the NPU compiler enables batch matmul by default in Q4.
+            if metadata.get("enable_hivm_batch_matmul"):
+                _compile_option_list += ["--enable-hivm-batch-matmul"]
+            if metadata.get("enable_vf_stack_limit"):
+                _compile_option_list += ["--enable-vf-stack-limit"]
         bisheng_options = metadata["bisheng_options"]
         if bisheng_options is not None:
             _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
-        mix_mode = opt.mix_mode
-        if mix_mode in ["aic"]:
-            _compile_option_list += ["--disable-hfusion-vectorize=true"]
-
-        _compile_option_list += ["--mlir-print-ir-after-failure"]
-        _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
         if opt.debug:
+            _compile_option_list += ["--mlir-print-ir-after-failure"]
+            _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
-        compile_mode = _validate_compile_mode(metadata.get("compile_mode", "simd"))
-
-        if compile_mode == "simd_simt":
-            _compile_option_list += ["--enable-simd-simt-mix-compile"]
-
-        if compile_mode == "simd_simt" and metadata.get("parallel_mode") != "mix_simd_simt":
-            num_warps = metadata.get("num_warps", opt.num_warps)
-            _compile_option_list += [f"--num-warps={num_warps}"]
-            warp_size = metadata.get("warp_size", opt.warp_size)
-            _compile_option_list += [f"--threads-per-warp={warp_size}"]
-            if opt.shared_mem_dynamic_size is not None:
-                _compile_option_list += [f"--shared-mem-dynamic-size={opt.shared_mem_dynamic_size}"]
-
-        cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
         vf_merge_level = metadata["vf_merge_level"]
         if vf_merge_level is not None:
-            cmd_list += [f"--enable-vf-merge-level={vf_merge_level}"]
+            _compile_option_list += [f"--enable-vf-merge-level={vf_merge_level}"]
 
         hfusion_enable_multiple_consumer_fusion = metadata["hfusion_enable_multiple_consumer_fusion"]
-        if hfusion_enable_multiple_consumer_fusion:
-            cmd_list += [f"--hfusion-enable-multiple-consumer-fusion={hfusion_enable_multiple_consumer_fusion}"]
-
-        enable_cross_if_fusion = metadata["enable_cross_if_fusion"]
-        if enable_cross_if_fusion:
-            cmd_list += [f"--hfusion-enable-cross-if-fusion={enable_cross_if_fusion}"]
+        if hfusion_enable_multiple_consumer_fusion is not None:
+            _compile_option_list += [
+                f"--hfusion-enable-multiple-consumer-fusion={hfusion_enable_multiple_consumer_fusion}"
+            ]
 
         plan_memory_strategy = metadata["plan_memory_strategy"]
         if plan_memory_strategy is not None:
-            cmd_list += [f"--plan-memory-strategy={plan_memory_strategy}"]
+            _compile_option_list += [f"--plan-memory-strategy={plan_memory_strategy}"]
+
+        cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print_cmd_list = cmd_list.copy()
-            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
+            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_path)
             print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
 
         try:
@@ -1357,11 +951,15 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             print(f"[DEBUG] Stderr:\n{error_msg}")
             raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
 
+        if opt.debug:
+            _dump_kernel_binary(metadata["hash"], bin_path)
+
         if Path(callback_path).is_file():
             lib = ctypes.CDLL(callback_path)
             __get_metadata_attr_by_callback(lib, "_infer_task_type_function", metadata, "bs_task_type")
             __get_metadata_attr_by_callback(lib, "_infer_workspace_shape_function", metadata, "workspace_size")
-            __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata, "lock_num")
+            __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata,
+                                            "sync_block_lock_layout")
             __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_init_function", metadata, "lock_init_val")
 
         return Path(bin_path).read_bytes()
@@ -1369,8 +967,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
 
 def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
     linalg, metadata = _parse_linalg_metadata(linalg, metadata)
+    _finalize_program_launch_policy(metadata, opt)
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_file_name = "kernel.mlir" if opt.use_bytecode else "kernel.ttadapter.mlir"
+        tmp_file_name = "kernel.mlir"
         ttadapter_path = os.path.join(tmpdir, tmp_file_name)
         Path(ttadapter_path).write_text(linalg)
         bin_file = os.path.join(tmpdir, "kernel")
@@ -1387,6 +986,11 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         _compile_option_list = [
             f"--target={NPUUtils().get_arch()}",
         ]
+
+        multibuffer_mode = metadata.get("multibuffer_mode")
+        if multibuffer_mode is not None:
+            mode_arg = "[" + ",".join(f"({level},{count})" for level, count in multibuffer_mode) + "]"
+            _compile_option_list.append(f"--multibuffer-mode={mode_arg}")
 
         multibuffer = metadata.get("multibuffer")
         num_stages = metadata.get("num_stages")
@@ -1405,22 +1009,10 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
                 f"--enable-ubuf-saving={enable_ubuf_saving}",
             ]
 
-        storage_align = metadata["storage_align"]
-        if storage_align is not None:
+        disable_size_align_for_cast = metadata["disable_size_align_for_cast"]
+        if disable_size_align_for_cast is not None:
             _compile_option_list += [
-                f"--enable-hivm-auto-storage-align={storage_align}",
-            ]
-
-        ops_reorder = metadata["ops_reorder"]
-        if ops_reorder is not None:
-            _compile_option_list += [
-                f"--enable-ops-reorder={ops_reorder}",
-            ]
-
-        code_motion = metadata["code_motion"]
-        if code_motion is not None:
-            _compile_option_list += [
-                f"--enable-code-motion={code_motion}",
+                f"--disable-size-align-for-cast={disable_size_align_for_cast}",
             ]
 
         enable_preload = metadata["enable_preload"]
@@ -1432,6 +1024,8 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         _compile_option_list += [
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
+
+        _compile_option_list += [f"--enable-optimized-metaop=false"]
 
         if _is_ascend_sanitizer_enabled():
             _compile_option_list += ["--enable-sanitizer=true"]
@@ -1445,7 +1039,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _compile_option_list += ["--enable-memory-display=true"]
 
         if _enable_msdebug():
-            _compile_option_list += ["--enable-ms-debug=true"]
+            _compile_option_list += ["--enable-debug-variables=true"]
 
         enable_hivm_auto_cv_balance = metadata["enable_hivm_auto_cv_balance"]
         if enable_hivm_auto_cv_balance is not None:
@@ -1463,11 +1057,6 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         if unit_flag is not None:
             _compile_option_list += \
                 [f"--enable-hivm-unit-flag-sync={unit_flag}"]
-
-        enable_drop_unit_dims = metadata["enable_drop_unit_dims"]
-        if enable_drop_unit_dims is not None:
-            _compile_option_list += \
-                [f"--enable-drop-unit-dims={enable_drop_unit_dims}"]
 
         enable_flatten = metadata["enable_flatten"]
         if enable_flatten is not None:
@@ -1529,27 +1118,8 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         if enable_libdevice:
             _compile_option_list += [f"--link-aicore-bitcode={get_libdevice()}"]
 
-        disable_size_align_for_cast = metadata["disable_size_align_for_cast"]
-        if disable_size_align_for_cast is not None:
-            _compile_option_list += \
-                [f"--disable-size-align-for-cast={disable_size_align_for_cast}"]
-
-        # Honor the linalg-level blacklist (e.g. hivm.sync_block_lock) as well:
-        # the launcher disables the grid cap for blacklisted kernels, so
-        # requesting the NPUIR persistent loop without that cap would deadlock.
-        auto_blockify_npuir_v1_enabled = (metadata.get("auto_blockify_v1_enabled", False)
-                                          and not metadata.get("ta_auto_blockify_v1_materialized", False)
-                                          and not metadata.get("has_auto_blockify_blacklist_op", False))
-        if auto_blockify_npuir_v1_enabled:
+        if metadata["auto_blockify_enabled"]:
             _compile_option_list += ["--enable-auto-blockify-loop"]
-            # Only mixed/local-scope routes carry a SuperBlock factor; all-SIMD
-            # and ordinary SIMD keep the historical F1 autoblockify behavior.
-            if metadata.get("parallel_mode") == "mix_simd_simt":
-                selected_factor = _selected_npuir_superblock_factor(metadata, opt)
-                _compile_option_list += [f"--super-block-factor={selected_factor}"]
-            metadata["auto_blockify_v1_runtime_cap"] = True
-        elif not metadata.get("ta_auto_blockify_v1_materialized", False):
-            metadata["auto_blockify_v1_runtime_cap"] = False
         npu_compiler_path, env = _get_npucompiler_path()
         if npu_compiler_path.endswith("bishengir-compile"):
             _compile_option_list += [
@@ -1557,19 +1127,17 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
                 bishengir_hivm_opt,
                 "--enable-triton-kernel-compile=true",
             ]
-            if (_needs_lib_call_no_inline(metadata)
-                    and _npu_compiler_supports_option(npu_compiler_path, "--enable-lib-call-no-inline")):
-                _compile_option_list += ["--enable-lib-call-no-inline=false"]
-        _compile_option_list += ["--mlir-print-ir-after-failure"]
-        _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
+
         if opt.debug:
+            _compile_option_list += ["--mlir-print-ir-after-failure"]
+            _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print_cmd_list = cmd_list.copy()
-            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
+            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_path)
             print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
 
         try:
@@ -1593,11 +1161,15 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             print(f"[DEBUG] Stderr:\n{error_msg}")
             raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
 
+        if opt.debug:
+            _dump_kernel_binary(metadata["hash"], bin_path)
+
         if Path(callback_path).is_file():
             lib = ctypes.CDLL(callback_path)
             __get_metadata_attr_by_callback(lib, "_infer_task_type_function", metadata, "bs_task_type")
             __get_metadata_attr_by_callback(lib, "_infer_workspace_shape_function", metadata, "workspace_size")
-            __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata, "lock_num")
+            __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata,
+                                            "sync_block_lock_layout")
             __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_init_function", metadata, "lock_init_val")
 
         return Path(bin_path).read_bytes()
@@ -1608,62 +1180,76 @@ def get_libdevice():
     return os.path.join(current, "lib/libdevice.10.bc")
 
 
-VALID_COMPILE_MODES = (
-    "simd",
-    "simd_simt",
-    "simd_simt_template",
-    "simt_template",
-    "unstructured_in_simt",
-    "simt_only",
-)
+def _is_a5_target_arch(arch: str) -> bool:
+    return isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950"))
 
 
-def _validate_compile_mode(compile_mode):
-    if compile_mode not in VALID_COMPILE_MODES:
-        valid_modes = ", ".join(VALID_COMPILE_MODES)
-        raise ValueError(f"Invalid compile_mode={compile_mode!r}. Expected one of: {valid_modes}.")
-    return compile_mode
+def _get_libdevice_compile_state(arch: str) -> tuple[bool, bool]:
+    return (
+        bool(os.getenv("TRITON_ENABLE_LIBDEVICE", False)),
+        bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and _is_a5_target_arch(arch),
+    )
+
+
+_CANONICAL_COMPILE_MODES = ("simd", "simd_simt_template", "simt_only")
+_COMPILE_MODE_ALIASES = {
+    "unstructured_in_simt": "simd_simt_template",
+}
+
+
+def _normalize_compile_mode(compile_mode, arch: str) -> str:
+    """Validate and canonicalize the public compile-mode contract.
+
+    ``simd_simt_template`` is the portable default: it retains the ordinary
+    SIMD pipeline on A2/A3 and enables the existing template-SIMT subpaths on
+    Ascend 950.  ``unstructured_in_simt`` is an equivalent spelling of that mode.
+    Pure-SIMT remains an Ascend 950-only explicit compile mode.
+    """
+    if not isinstance(compile_mode, str):
+        raise ValueError("compile_mode must be a string; expected one of: " + ", ".join(_CANONICAL_COMPILE_MODES))
+
+    canonical_mode = _COMPILE_MODE_ALIASES.get(compile_mode, compile_mode)
+    if canonical_mode not in _CANONICAL_COMPILE_MODES:
+        raise ValueError(f"invalid compile_mode={compile_mode!r}; expected one of: " +
+                         ", ".join(_CANONICAL_COMPILE_MODES))
+
+    if canonical_mode == "simt_only" and not _is_a5_target_arch(arch):
+        raise ValueError('compile_mode="simt_only" is supported only on Ascend 950 targets.')
+    return canonical_mode
 
 
 @dataclass(frozen=True)
 class NPUOptions:
     debug: bool = False
     sanitize_overflow: bool = True
-    llvm_version: int = 15
-    kernel_name: str = "triton_"
-    arch: str = ""
+    # Backend-only construction input.  AscendBackend.parse_options injects
+    # GPUTarget.arch and never forwards a user-supplied compile option.
+    arch: InitVar[str] = ""
+    rule_mask: InitVar[int] = DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK
+    # This becomes compiler metadata, so its name must also be valid for the
+    # namedtuple constructed by CompiledKernel on Python 3.10.
+    target_arch: str = field(init=False, repr=False)
 
     cluster_dims: tuple = (1, 1, 1)
     num_warps: int = 32
     num_ctas: int = 1
-    num_stages: int = 2
-    warp_size: int = 32
+    # Keep an omitted stage count distinct from an explicit mode.
+    num_stages: Optional[int] = None
+    # Ascend threads-per-warp is a backend capability, not a compile option.
+    warp_size: int = field(default=32, init=False)
     ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttadapter|mlirbc|bcmlir|npubin})
 
-    auto_blockify_size: int = 1
-    add_auto_scheduling: bool = False
-    enable_auto_blockify: bool = None
-    # Select the TA implementation of SIMT AutoBlockify V1.  This does not
-    # enable V1 by itself: both TA and NPUIR honor enable_auto_blockify, the
-    # environment default, and the common blacklist policy.  V2 is independent.
-    # The TA port remains opt-in until its launch-grid cap is carried through
-    # the installed launcher metadata for every entry path.  NPUIR V1 is the
-    # correctness-validated production implementation meanwhile.
-    enable_ta_auto_blockify_v1: bool = False
-    compile_on_910_95: bool = None
-    optimize_dynamic_offset: bool = False
-    enable_mask_fallback_conversion: bool = False
+    # Deprecated constructor-only compatibility input.  The supplied value is
+    # ignored and replaced with the lowering selector derived from GPUTarget.arch.
+    compile_on_910_95: Optional[bool] = field(default=None, repr=False, kw_only=True)
     enable_warp_specialization: bool = False
-    enable_nd2nz_on_vector: bool = False
     enable_persistent: bool = False
     optimize_epilogue: bool = False
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
     backend_name: str = 'cann'
     instrumentation_mode: str = ""
-    allow_fp8e4nv: bool = False
-    auto_tile_and_bind_subblock: bool = True
-    vf_merge_level: int = 0
+    enable_graph_optimize: bool = True
     supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e4b15", "fp8e4nv", "fp8e4b8", "fp8e5b16")
     deprecated_fp8_dtypes: Tuple[str] = ()
     vf_merge_level: int = 1
@@ -1671,34 +1257,31 @@ class NPUOptions:
     allowed_dot_input_precisions: Tuple[str] = ("ieee", "hf32")
     max_num_imprecise_acc_default: int = 0
     extern_libs: dict = None
-    bisheng_options: str = "-cce-link-aicore-ll-module " + get_libdevice()
-
+    # Backend-managed BiSheng arguments. Keep the name discoverable so legacy
+    # launch keywords are accepted, but never forward a user-supplied value.
+    bisheng_options: str = field(default="-cce-link-aicore-ll-module " + get_libdevice(), init=False)
     multibuffer: bool = True
-    storage_align: bool = None
-    ops_reorder: bool = None
-    code_motion: bool = None
+    # Public dictionaries are stored as sorted pairs for hashing and JSON caches.
+    multibuffer_mode: Optional[Union[Dict[str, int], Tuple[Tuple[str, int], ...]]] = None
     vf_fusion_mode: str = None
     enable_ubuf_saving: bool = None
+    disable_size_align_for_cast: bool = None
     enable_preload: bool = None
     enable_auto_bind_sub_block: bool = None
-    # Experimental BiShengIR policy for assigning work to the two AIV
-    # sub-blocks. Off preserves the existing backend behavior.
-    enable_partition_and_bind_sub_block: str = "off"
     disable_tightly_coupled_buffer_reuse: bool = False
-    enable_select_analysis: bool = True
     enable_hivm_auto_cv_balance: bool = None
+    # Temporary 910_95 switch; the NPU compiler plans to make this default in Q4.
+    enable_hivm_batch_matmul: bool = False
+    # Only takes effect on the Ascend 950 non-pure-SIMT BiShengIR compilation path.
+    enable_vf_stack_limit: bool = False
     sync_solver: bool = None
     unit_flag: bool = None
-    enable_cce_vf_auto_sync: bool = None
-    enable_cce_vf_remove_membar: bool = None
-    enable_drop_unit_dims: bool = None
     enable_flatten: bool = None
     enable_auto_vectorize_v2: bool = None
     auto_vectorize_v2_max_fused_ops_num: int = None
     prevec_max_fused_ops_num: int = None
     inject_barrier_all: bool = None
     inject_block_all: bool = None
-    disable_size_align_for_cast: bool = None
     limit_auto_multi_buffer_only_for_local_buffer: bool = None
     limit_auto_multi_buffer_of_local_buffer: str = None
     limit_auto_multi_buffer_buffer: str = None
@@ -1707,108 +1290,132 @@ class NPUOptions:
     tile_mix_cube_loop: int = None
     disable_auto_inject_block_sync: bool = None
     enable_mixed_cv: bool = None
-    enable_vf_fusion: bool = None
     enable_dynamic_cv_pipeline: bool = None
-    # Gates the cube-loader penetration + cube-for block merge feature. Off by
-    # default so existing scenarios are unaffected; opt in per kernel to fuse a
-    # matmul's loader for-loop into the matmul's cube compute block.
     enable_cube_block_merge: bool = False
-    enable_ub_refine_opt: bool = False
-    # Multi-cache insertion optimization: avoid redundant tensor compute in the middle of an `if`.
-    enable_buffer_insert_optimization: bool = True
-    hfusion_enable_multiple_consumer_fusion: bool = False
-    enable_cross_if_fusion: bool = False
-    has_auto_blockify_blacklist_op: Optional[bool] = None
-    intra_cache_num: int = None
-    inter_cache_num: int = None
-    load_cache_num: int = None
+    hfusion_enable_multiple_consumer_fusion: bool = None
+    buf_slot_num_of_veccore: int = None
+    buf_slot_num_of_crosscore: int = None
+    buf_slot_num_of_gm: int = None
 
     # plan memory strategy: "default" (default) or "largest-first"
     plan_memory_strategy: str = None
-    stream: int = None
-    parallel_mode: str = "simd"
-    force_simt_only: bool = False
-    force_simt_template: bool = False
-    enable_sync_block_lock: bool = False
-    # only take effect on the simt-only & simd-simt-mix scenarios
+    # Internal launch metadata.  The mode is initially derived from
+    # compile_mode, then replaced with the mode emitted by TritonToLinalg.
+    parallel_mode: str = field(default="simd", init=False)
+    # Internal pure-SIMT state, derived from the effective lowering mode.
+    is_pure_simt: bool = field(default=False, init=False)
+    # Only takes effect on the pure-SIMT path.
     shared_mem_dynamic_size: int = None
-    # enable_bishengir_simt_optimization is passed as
-    # -enable-bishengir-simt-optimization flag to bishengir-compile.
-    enable_bishengir_simt_optimization: int = 000
-    # compile_mode: "simd", "simd_simt", "simd_simt_template", "simt_only"
-    #   - "simd":          pure SIMD path
-    #   - "simd_simt":     unstructured access -> hfusion.gather_load/scatter_store
-    #   - "simd_simt_template(default)": unstructured access -> SIMT template call
-    #   - "simt_only":     pure SIMT path
-    # "simt_template" and "unstructured_in_simt" are deprecated aliases for
-    # "simd_simt_template".
+    # Ascend 950 pure-SIMT-only option passed as -simt-optimization-mode
+    # to bishengir-compile. Its value grammar belongs to the toolchain.
+    # Individual digits are passed to various passes to control behavior,
+    # and are parsed right-to-left.
+    # For example, a value of 101 is interpreted as 0000101.
+    # If left as 0, bishengir-compile sets this to 900101
+    simt_optimization_mode: int = 0000000
+    # Canonical modes: SIMD (D), SIMD with template-SIMT (P), and pure-SIMT
+    # (T). ``unstructured_in_simt`` is an equivalent P spelling.
     compile_mode: str = "simd_simt_template"
-    mix_mode: str = ""
-    simt_stack_limit: int = None
-    # use_bytecode:
-    # If True, the compilation flow is:
-    #   Linalg IR → MLIR Bytecode (via triton-mlir-opt)
-    #            → LLIR (via bishengir-opt)
-    #            → Binary (via bishengir-compile)
-    #
-    # If False, the compilation flow is:
-    #   Linalg IR → LLIR → Binary (via bishengir-compile directly)
-    use_bytecode: bool = True
-    # take effect on the reorder instruction pattern for SIMT. The pattern is disabled by default.
-    enable_simt_reorder_instruction: bool = False
-    enable_costmodel_backend: bool = False
-    # Apply implicit-permute and row/tile/strided coalescing before Route Model
-    # analysis.  Exposed primarily for controlled compiler ablation; normal
-    # compilation should retain the default.
-    enable_ttir_layout_merge: bool = True
-    # Optional runtime launch fact used by SuperBlock costing. Zero means the
-    # frontend cannot provide a stable logical-program count for this compile.
-    logical_program_count_hint: int = 0
-    physical_vector_core_count_hint: int = 0
-    # Native AscendModel selection: Python only schedules the C++ passes.
-    auto_simt_scope_mode: str = ""
-    auto_simt_scope_dump: str = ""
-    auto_simt_model_profile: str = ""
-    # Content digest is populated in __post_init__ so profile edits invalidate
-    # the Triton compile cache even when the path itself is unchanged.
-    auto_simt_model_assets_hash: str = ""
     # disable simt fma optimization to get high precision
     disable_fma: bool = False
 
     # superblocking factor
-    superblock_factor: int = 0
+    superblock_factor: int = 1
 
-    def __post_init__(self):
+    # ChunkCoalescing: number of tiles along the outermost grid axis.
+    # Auto-injected from static grid tuples; enables safe coalescing for
+    # unmasked kernels whose grid dims are compile-time known.
+    grid_num_tiles: int = None
+
+    # Deprecated names remain visible to callers that use parse_options({})
+    # to distinguish compile options from kernel arguments. Their public
+    # values are ignored (or routed to canonical options) before construction.
+    add_auto_scheduling: bool = field(default=False, init=False)
+    allow_fp8e4nv: bool = field(default=False, init=False)
+    auto_blockify_size: int = field(default=1, init=False)
+    auto_tile_and_bind_subblock: bool = field(default=True, init=False)
+    code_motion: Optional[bool] = field(default=None, init=False)
+    enable_auto_blockify: Optional[bool] = field(default=None, init=False)
+    enable_bishengir_simt_optimization: int = field(default=0, init=False)
+    enable_buffer_insert_optimization: bool = field(default=True, init=False)
+    enable_cce_vf_auto_sync: Optional[bool] = field(default=None, init=False)
+    enable_cce_vf_remove_membar: Optional[bool] = field(default=None, init=False)
+    enable_cross_if_fusion: bool = field(default=False, init=False)
+    enable_drop_unit_dims: Optional[bool] = field(default=None, init=False)
+    enable_linearize: Optional[bool] = field(default=None, init=False)
+    enable_mask_fallback_conversion: bool = field(default=False, init=False)
+    enable_nd2nz_on_vector: bool = field(default=False, init=False)
+    enable_select_analysis: bool = field(default=True, init=False)
+    enable_simt_reorder_instruction: bool = field(default=False, init=False)
+    enable_sync_block_lock: Optional[bool] = field(default=None, init=False)
+    enable_ub_refine_opt: bool = field(default=False, init=False)
+    enable_vf_fusion: Optional[bool] = field(default=None, init=False)
+    force_simt_only: bool = field(default=False, init=False)
+    force_simt_template: bool = field(default=False, init=False)
+    graph_optimize_emit_remarks: bool = field(default=False, init=False)
+    graph_optimize_max_rewrites_per_function: int = field(default=64, init=False)
+    graph_optimize_rule_mask: int = field(default=DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK, init=False)
+    graph_optimize_ub_capacity_bytes: Optional[int] = field(default=None, init=False)
+    has_auto_blockify_blacklist_op: Optional[bool] = field(default=None, init=False)
+    inter_cache_num: Optional[int] = field(default=None, init=False)
+    intra_cache_num: Optional[int] = field(default=None, init=False)
+    kernel_name: str = field(default="triton_", init=False)
+    llvm_version: int = field(default=15, init=False)
+    load_cache_num: Optional[int] = field(default=None, init=False)
+    mix_mode: str = field(default="", init=False)
+    ops_reorder: Optional[bool] = field(default=None, init=False)
+    optimize_dynamic_offset: bool = field(default=False, init=False)
+    simt_reorder_instruction: bool = field(default=False, init=False)
+    storage_align: Optional[bool] = field(default=None, init=False)
+    stream: Optional[int] = field(default=None, init=False)
+    use_bytecode: bool = field(default=True, init=False)
+
+    def __post_init__(self, arch, rule_mask):
         from triton.backends.ascend import _apply_ascend_patch
 
-        mode = self.auto_simt_scope_mode or os.environ.get("TRITON_ASCEND_AUTO_SIMT_SCOPE", "")
-        object.__setattr__(self, "auto_simt_scope_mode", _normalize_auto_simt_scope_mode(mode))
-        dump = self.auto_simt_scope_dump or os.environ.get("TRITON_ASCEND_AUTO_SIMT_SCOPE_DUMP", "")
-        profile = self.auto_simt_model_profile or os.environ.get("TRITON_ASCEND_AUTO_SIMT_PROFILE", "")
-        if self.auto_simt_scope_mode == "off":
-            dump, profile, asset_hash = "", "", "disabled"
-        else:
-            asset_hash = _auto_simt_asset_hash(profile, "simd_simt/david_v100_simd_simt_v1.json")
-        object.__setattr__(self, "auto_simt_scope_dump", dump)
-        object.__setattr__(self, "auto_simt_model_profile", profile)
-        object.__setattr__(self, "auto_simt_model_assets_hash", asset_hash)
-
-        forced_compile_mode = os.environ.get("TRITON_ASCEND_COMPILE_MODE")
-        if forced_compile_mode:
-            object.__setattr__(self, "compile_mode", forced_compile_mode)
-
-        _validate_partition_and_bind_sub_block(self.enable_partition_and_bind_sub_block)
-
-        # Backward compatibility: legacy force options override compile_mode.
-        if self.force_simt_template:
-            warnings.warn(
-                "force_simt_template is deprecated, use compile_mode='simd_simt_template' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            object.__setattr__(self, "compile_mode", "simd_simt_template")
-
         _apply_ascend_patch()
+        object.__setattr__(self, "target_arch", arch)
+        # Plain init=False defaults live on the class. Materialize them in
+        # the instance because both Inductor and JIT inspect options.__dict__.
+        for name, option_field in self.__dataclass_fields__.items():
+            if not option_field.init and name not in self.__dict__:
+                object.__setattr__(self, name, option_field.default)
+        # Keep the legacy name discoverable while its property and all
+        # compiler decisions continue to use the injected target architecture.
+        self.__dict__["arch"] = arch
+        object.__setattr__(self, "multibuffer_mode", _multibuffer_mode_to_tuple(self.multibuffer_mode))
+        if self.multibuffer_mode is not None and self.num_stages is not None:
+            raise ValueError("num_stages and multibuffer_mode cannot be specified together")
+        if self.multibuffer_mode is None and self.num_stages is None:
+            object.__setattr__(self, "num_stages", 2)
+        if self.compile_on_910_95 is not None:
+            _warn_deprecated_npu_option("compile_on_910_95")
+        object.__setattr__(
+            self,
+            "compile_on_910_95",
+            isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950")),
+        )
+        try:
+            normalized_rule_mask = normalize_graph_optimization_rule_mask(rule_mask)
+        except ProgramGridContractError as error:
+            raise ValueError(f"invalid GraphOptimize rule_mask: {error}") from error
+        if normalized_rule_mask != DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK:
+            object.__setattr__(self, "rule_mask", normalized_rule_mask)
+
+        compile_mode = str(_normalize_compile_mode(self.compile_mode, arch))
+        object.__setattr__(self, "compile_mode", compile_mode)
+
+        if compile_mode == "simt_only":
+            object.__setattr__(self, "is_pure_simt", True)
+            object.__setattr__(self, "parallel_mode", "simt")
+        else:
+            object.__setattr__(self, "parallel_mode", "simd")
+
+        if self.is_pure_simt:
+            if self.shared_mem_dynamic_size is None:
+                object.__setattr__(self, "shared_mem_dynamic_size", 122880)
+        else:
+            object.__setattr__(self, "shared_mem_dynamic_size", 221184)
 
     def hash(self):
         key = "_".join([f"{name}-{val}" for name, val in self.__dict__.items()])
@@ -1816,42 +1423,58 @@ class NPUOptions:
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
+def _get_npu_options_arch(options: NPUOptions) -> str:
+    """Expose the injected target to the established lowering builder API.
+
+    ``arch`` is an ``InitVar`` rather than a user compile option. Its legacy
+    name is also serialized for option discovery, while this view always
+    returns the target injected by ``AscendBackend.parse_options``.
+    """
+    return options.target_arch
+
+
+NPUOptions.arch = property(_get_npu_options_arch)
+
+_INTERNAL_NPU_OPTION_MARKERS = frozenset({
+    "target_arch",
+    "compile_on_910_95",
+    "parallel_mode",
+    "is_pure_simt",
+})
+
+
+def _is_internal_npu_options(options, target_arch: str) -> bool:
+    """Recognize an NPUOptions metadata round trip by backend-only fields."""
+    return (_INTERNAL_NPU_OPTION_MARKERS <= options.keys() and options.get("target_arch") == target_arch
+            and options.get("compile_on_910_95") == _is_a5_target_arch(target_arch))
+
+
+def _normalize_bishengir_simt_optimization_for_context(options: NPUOptions, raw_options) -> None:
+    """Restrict the vendor SIMT optimization switch to its Ascend 950 pure-SIMT path."""
+    option_name = "simt_optimization_mode"
+    if option_name not in raw_options:
+        return
+
+    if _is_a5_target_arch(options.target_arch) and options.is_pure_simt:
+        # The BiShengIR toolchain owns the option's value grammar; keep the
+        # Python boundary free of numeric or range validation.
+        return
+
+    warnings.warn(
+        "simt_optimization_mode only takes effect for Ascend 950 "
+        "pure-SIMT compilation; ignoring the explicit value.",
+        UserWarning,
+        stacklevel=3,
+    )
+    object.__setattr__(options, option_name, 0)
+
+
 def ttir_to_npubin(mod, metadata, opt):
-    force_simt_only = bool(opt.force_simt_only or metadata.get("force_simt_only", False))
-    if force_simt_only:
-        metadata["force_simt_only"] = True
-        metadata["parallel_mode"] = "simt"
-        metadata.setdefault("shared_mem_dynamic_size", opt.shared_mem_dynamic_size)
-        if not isinstance(mod, str):
-            ascend.ir.inline_void_simt_scopes_for_pure_simt(mod)
-            # Pure-SIMT must observe the same post-layout TTIR as the Route
-            # Model.  In particular this restores the independent-row merge
-            # before AutoBlockify V1 creates its persistent scheduling loop.
-            if opt.enable_ttir_layout_merge:
-                _run_ttir_layout_merge(mod, metadata)
-            else:
-                metadata["ttir_layout_merge_applied"] = False
-                metadata["ttir_layout_coalesce_factor"] = 1
-                metadata["ttir_layout_coalesce_axis"] = -1
-                metadata["ttir_layout_coalesce_grid_ceil_div"] = False
-            auto_blockify_v1_enabled = _resolve_auto_blockify_v1_policy(str(mod), metadata, opt)
-            if opt.enable_ta_auto_blockify_v1 and auto_blockify_v1_enabled:
-                materialized = _run_ta_simt_auto_blockify_v1(mod, metadata, opt)
-                metadata["auto_blockify_v1_runtime_cap"] = materialized
-            else:
-                metadata["auto_blockify_v1_runtime_cap"] = auto_blockify_v1_enabled
-            _export_coalesce_metadata(mod, metadata)
-            # This analysis marker is useful to the Route Model, but it is not
-            # part of the public TTIR contract consumed by bishengir-compile.
-            _get_then_remove_rc(mod, "ta.ttir_layout_merge.applied")
-        elif not metadata.get("scope_pure_simt_auto", False):
-            auto_blockify_v1_enabled = _resolve_auto_blockify_v1_policy(mod, metadata, opt)
-            if opt.enable_ta_auto_blockify_v1 and auto_blockify_v1_enabled:
-                raise RuntimeError("TA AutoBlockify V1 requires an in-process TTIR module; "
-                                   "textual TTIR overrides must use the NPUIR V1 implementation")
-            metadata["auto_blockify_v1_runtime_cap"] = auto_blockify_v1_enabled
-    ttir_code = mod if isinstance(mod, str) else str(mod)
+    _export_program_grid_metadata(mod, metadata, require_row_contract=True)
+    ttir_code = _serialize_module(mod, opt)
     metadata = _parse_ttir_metadata(ttir_code, metadata)
+    _finalize_program_launch_policy(metadata, opt)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         # prepare input
         src_path = os.path.join(tmpdir, "kernel.ttir.mlir")
@@ -1861,37 +1484,35 @@ def ttir_to_npubin(mod, metadata, opt):
         bin_path = os.path.join(tmpdir, "kernel.o")
         # build compile options
         _compile_option_list = get_common_bishengir_compile_options(metadata)
-        if force_simt_only:
+        if opt.is_pure_simt:
             _compile_option_list += ["--enable-hivm-compile=false"]
             _compile_option_list += ["--enable-triton-ir-compile"]
             _compile_option_list += ["--pure-simt"]
             _compile_option_list += [f"--num-warps={opt.num_warps}"]
             _compile_option_list += [f"--threads-per-warp={opt.warp_size}"]
-            if opt.enable_bishengir_simt_optimization != 000:
-                _compile_option_list += [
-                    f"--enable-bishengir-simt-optimization={opt.enable_bishengir_simt_optimization}"
-                ]
-            if opt.simt_stack_limit:
-                _compile_option_list += [f"--simt-stack-limit={opt.simt_stack_limit}"]
-            shared_mem_dynamic_size = metadata.get("shared_mem_dynamic_size", opt.shared_mem_dynamic_size)
-            if shared_mem_dynamic_size is not None:
-                _compile_option_list += [f"--shared-mem-dynamic-size={shared_mem_dynamic_size}"]
-            if opt.enable_simt_reorder_instruction:
-                _compile_option_list += ["--enable-simt-reorder-instruction=true"]
+            if opt.simt_optimization_mode != 0000000:
+                _compile_option_list += [f"--simt-optimization-mode={opt.simt_optimization_mode}"]
+            _compile_option_list += [f"--simt-stack-limit={get_simt_stack_limit()}"]
+            if opt.shared_mem_dynamic_size is not None:
+                _compile_option_list += [f"--shared-mem-dynamic-size={opt.shared_mem_dynamic_size}"]
             if opt.disable_fma:
                 _compile_option_list += [f"--disable-fma"]
+            if opt.compile_on_910_95:
+                npu_utils = NPUUtils()
+                if npu_utils.has_device_limit():
+                    _compile_option_list += [
+                        f"--custom-aic-number={npu_utils.get_aicore_num()}",
+                        f"--custom-aiv-number={npu_utils.get_aivector_core_num()}",
+                    ]
 
             bisheng_options = metadata["bisheng_options"]
             if bisheng_options is not None:
                 _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
 
-            # NPUIR needs the enable flag only when it materializes V1 itself.
-            # Both implementations need the selected factor because
-            # bishengir-compile also uses it for the pure-SIMT launch contract.
-            _append_pure_simt_auto_blockify_options(_compile_option_list, metadata, opt)
-
-        if not _is_debug_line_info_disabled():
-            _compile_option_list += ["--enable-debug-info=true"]
+            if _is_auto_map_parallel_blocks_enabled() and not metadata.get("row_coalescing_applied", False):
+                _compile_option_list += ["--enable-auto-blockify-loop"]
+                if opt.superblock_factor > 1:
+                    _compile_option_list += [f"--super-block-factor={opt.superblock_factor}"]
 
         npu_compiler_path, env = _get_npucompiler_path()
         cmd_list = ([npu_compiler_path, src_path] + _compile_option_list + ["-o", bin_file])
@@ -1904,86 +1525,75 @@ def ttir_to_npubin(mod, metadata, opt):
         return Path(bin_path).read_bytes()
 
 
+def get_simt_stack_limit():
+    # simt_stack_limit resolution precedence:
+    #  1. torch_npu's acl_default.json "StackSize":{"simt_stack_size":N}.
+    #  2. The kernel-time default simt_stack_limit=1152.
+    _simt_stack_limit = 1152
+    try:
+        import torch_npu
+        torch_npu_basic_path = os.path.dirname(torch_npu.__file__)
+        _acl_cfg_path = os.path.join(torch_npu_basic_path, "acl_default.json")
+        with open(_acl_cfg_path, "r") as f:
+            _acl_cfg = json.load(f)
+        _cfg_stack = _acl_cfg.get("StackSize", {}).get("simt_stack_size", None)
+        if isinstance(_cfg_stack, int) and not isinstance(_cfg_stack, bool) and _cfg_stack > 0:
+            _simt_stack_limit = _cfg_stack
+    except Exception as e:
+        print(f"[DEBUG] read acl_default.json failed: {e}")
+    return _simt_stack_limit
+
+
 class AscendBackend(BaseBackend):
 
     @staticmethod
     def supports_target(target: GPUTarget):
         return target.backend == "npu"
 
+    @staticmethod
+    def use_alignment_specialization(options: dict) -> bool:
+        # The binder runs before parse_options. Normalize its option copy so
+        # legacy selectors affect alignment specialization and the cache key.
+        normalized = _remove_deprecated_npu_options(options, in_place=True)
+        return normalized.get("compile_mode") == "simt_only"
+
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
         if target.backend == "npu":
             self.binary_ext = "npubin"
-            # Include all binary file extensions (mlirbc is used in bytecode mode)
+            # Include all binary file extensions (mlirbc is always emitted for normal kernels).
             self.binary_extensions = {"npubin", "mlirbc"}
-
-    def compile_mode_setup(self, options: NPUOptions) -> Any:
-        # Backward compatibility: legacy force options override compile_mode.
-        if options.force_simt_template:
-            warnings.warn(
-                "force_simt_template is deprecated, use compile_mode='simd_simt_template' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            object.__setattr__(options, "compile_mode", "simd_simt_template")
-
-        if options.force_simt_only:
-            warnings.warn(
-                "force_simt_only is deprecated, use compile_mode='simt_only' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            object.__setattr__(options, "compile_mode", "simt_only")
-
-        _validate_compile_mode(options.compile_mode)
-
-        # Parse compile_mode and set related fields
-        if options.compile_mode == "simd":
-            object.__setattr__(options, "parallel_mode", "simd")
-            if options.shared_mem_dynamic_size is None:
-                object.__setattr__(options, "shared_mem_dynamic_size", 221184)
-        elif options.compile_mode == "simd_simt":
-            if not options.compile_on_910_95:
-                raise ValueError(f"compile_mode='{options.compile_mode}' is only supported on 910_95. "
-                                 "A2/A3 targets do not support SIMT mix compile.")
-            object.__setattr__(options, "parallel_mode", "mix_simd_simt")
-            if options.shared_mem_dynamic_size is None:
-                object.__setattr__(options, "shared_mem_dynamic_size", 221184)
-        elif options.compile_mode in ("simd_simt_template", "simt_template", "unstructured_in_simt"):
-            if options.compile_mode != "simd_simt_template":
-                legacy_mode = options.compile_mode
-                warnings.warn(
-                    f"compile_mode='{legacy_mode}' is deprecated, "
-                    "use compile_mode='simd_simt_template' instead.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-                object.__setattr__(options, "compile_mode", "simd_simt_template")
-            if options.shared_mem_dynamic_size is None:
-                object.__setattr__(options, "shared_mem_dynamic_size", 221184)
-        elif options.compile_mode == "simt_only":
-            object.__setattr__(options, "force_simt_only", True)
-            object.__setattr__(options, "parallel_mode", "simt")
-            if options.shared_mem_dynamic_size is None:
-                object.__setattr__(options, "shared_mem_dynamic_size", 122880)
 
     def parse_options(self, opts) -> Any:
         # TODO: get available targets when building options?
         if self.target.backend == "npu":
-            args = {k: opts[k] for k in NPUOptions.__dataclass_fields__.keys() if k in opts}
-            args.setdefault("arch", self.target.arch)
-            options = NPUOptions(**args)
-            # Lazy init compile_on_910_95 if not provided
-            if options.compile_on_910_95 is None:
-                object.__setattr__(options, "compile_on_910_95", is_compile_on_910_95())
-            # Lazy init enable_dynamic_cv_pipeline if not provided
+            _warn_deprecated_ascend_env_vars()
+            option_names = {
+                name
+                for name, option_field in NPUOptions.__dataclass_fields__.items()
+                if option_field.init and name not in {"arch", "compile_on_910_95"}
+            }
+            # Serialized NPUOptions include backend-only derived fields.  Use
+            # those provenance markers instead of depending on every public
+            # field being present, which changes whenever the dataclass evolves.
+            internal_options = _is_internal_npu_options(opts, self.target.arch)
+            # Normalize a copy, except for the legacy launch keyword below.
+            # NPUOptions retains compatibility defaults for legacy names so
+            # JIT and Inductor can still recognize them as compile options.
+            normalized_opts = opts if internal_options else _remove_deprecated_npu_options(opts)
+            args = {k: normalized_opts[k] for k in option_names if k in normalized_opts}
+            options = NPUOptions(arch=self.target.arch, **args)
+            # Lazy init enable_dynamic_cv_pipeline if not provided.
+            # compile_on_910_95 is already resolved from the requested target.
             if options.enable_dynamic_cv_pipeline is None:
-                object.__setattr__(options, "enable_dynamic_cv_pipeline", is_compile_on_910_95())
-            self.compile_mode_setup(options)
-            # Costmodel path should avoid extra BC<->MLIR conversion stages
-            # to keep compile-only autotune routing lightweight and stable.
-            if getattr(options, "enable_costmodel_backend", False):
-                object.__setattr__(options, "use_bytecode", False)
+                object.__setattr__(options, "enable_dynamic_cv_pipeline", options.compile_on_910_95)
+            if not internal_options:
+                _normalize_bishengir_simt_optimization_for_context(options, normalized_opts)
+                # Community JIT rejects the legacy launch keyword "stream"
+                # even when options.__dict__ recognizes it. Consume it at
+                # the Ascend boundary; the returned compatibility field stays
+                # None and the runtime still selects the current stream.
+                opts.pop("stream", None)
         else:
             raise NotImplementedError(f"Backend '{self.target.backend}' is not supported. "
                                       "Please ensure the target backend is set to 'npu'.")
@@ -2027,22 +1637,20 @@ class AscendBackend(BaseBackend):
     def add_stages(self, stages, options, language):
         if self.target.backend == "npu":
             stages["ttir"] = lambda src, metadata: make_ttir(src, metadata, options)
-            if options.force_simt_only:
+            if options.is_pure_simt:
                 stages["npubin"] = (lambda src, metadata: ttir_to_npubin(src, metadata, options))
                 return
-            stages["ttadapter"] = lambda src, metadata: ttir_to_linalg(src, metadata, options, named_ops=True)
-            # Support BC mode: convert Linalg IR to Bytecode format, then back to MLIR
-            if options.use_bytecode:
-                # Step 1: Convert Linalg IR to Bytecode using triton-mlir-opt
-                stages["mlirbc"] = lambda src, metadata: linalg_to_bc_by_triton_mlir_opt(src, metadata, options)
-                # Step 2: Convert Bytecode back to MLIR text using bishengir-opt
-                stages["bcmlir"] = lambda src, metadata: bc_to_linalg_by_bishengir_opt(src, metadata, options)
+            stages["ttadapter"] = lambda src, metadata: ttir_to_linalg(src, metadata, options)
+            # Normal kernels always convert Linalg IR to bytecode and back to MLIR text.
+            stages["mlirbc"] = lambda src, metadata: linalg_to_bc_by_triton_mlir_opt(src, metadata, options)
+            stages["bcmlir"] = lambda src, metadata: bc_to_linalg_by_bishengir_opt(src, metadata, options)
             if options.compile_on_910_95:
-                stages["npubin"] = (lambda src, metadata: ttir_to_npubin(src, metadata, options) if metadata.get(
-                    "force_simt_only", False) else linalg_to_bin_enable_npu_compile_910_95(src, metadata, options))
+                stages["npubin"] = (
+                    lambda src, metadata: linalg_to_bin_enable_npu_compile_910_95(src, metadata, options))
             else:
-                stages["npubin"] = (lambda src, metadata: ttir_to_npubin(src, metadata, options) if metadata.get(
-                    "force_simt_only", False) else linalg_to_bin_enable_npu_compile_A2_A3(src, metadata, options))
+                stages["npubin"] = (
+                    lambda src, metadata: linalg_to_bin_enable_npu_compile_A2_A3(src, metadata, options))
+            stages["npubin"] = _with_debug_line(stages["npubin"], options)
         else:
             raise NotImplementedError(f"Backend '{self.target.backend}' is not supported. "
                                       "Please ensure the target backend is set to 'npu'.")
@@ -2050,8 +1658,10 @@ class AscendBackend(BaseBackend):
     @functools.lru_cache()
     def hash(self):
         # TODO fetch compiler version
-        version_key = self.target
+        version_key = (self.target, _get_libdevice_compile_state(self.target.arch))
         return str(version_key)
 
     def get_module_map(self) -> Dict[str, ModuleType]:
-        return {}
+        from triton.language.extra.cann import libdevice
+
+        return {"triton.language.extra.libdevice": libdevice}

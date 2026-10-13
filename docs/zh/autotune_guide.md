@@ -13,26 +13,76 @@
 在 Triton-Ascend 上，推荐保留社区版 `@triton.autotune` 的基本写法；当希望系统自动生成并评估候选配置时，将 `configs` 设为 `[]`：
 
 ```python
+"""
+Vector Add
+=============
+"""
+
+
+import torch
+import torch_npu
 import triton
 import triton.language as tl
 import triton.backends.ascend.runtime
+from triton.backends.ascend.testing import do_bench_npu
 
 
-@triton.autotune(
-    configs=[],
-    key=["M", "N"],
-)
+@triton.autotune(configs=[], key=["n_elements"])
 @triton.jit
-def kernel(
-    x_ptr,
-    y_ptr,
-    out_ptr,
-    M,
-    N,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    ...
+def add_kernel(x_ptr,  # *Pointer* to first input vector.
+               y_ptr,  # *Pointer* to second input vector.
+               output_ptr,  # *Pointer* to output vector.
+               n_elements,  # Size of the vector.
+               BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.
+               # NOTE: `constexpr` so it can be used as a shape value.
+               ):
+    # There are multiple 'programs' processing different data. We identify which program
+    # we are here:
+    pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.
+    # This program will process inputs that are offset from the initial data.
+    # For instance, if you had a vector of length 256 and block_size of 64, the programs
+    # would each access the elements [0:64, 64:128, 128:192, 192:256].
+    # Note that offsets is a list of pointers:
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    # Create a mask to guard memory operations against out-of-bounds accesses.
+    mask = offsets < n_elements
+    # Load x and y from DRAM, masking out any extra elements in case the input is not a
+    # multiple of the block size.
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    output = x + y
+    # Write x + y back to DRAM.
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+
+def add_torch(x, y):
+    return x + y
+
+
+def add_autotune(x, y):
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    add_kernel[lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )](x, y, output, n_elements)
+    return output
+
+
+def test_add(size: int):
+    x = torch.rand(size, device="npu")
+    y = torch.rand(size, device="npu")
+
+    output_torch = add_torch(x, y)
+    output_triton = add_autotune(x, y)
+    assert torch.allclose(output_triton, output_torch)
+    print(f"Vector Add {size} PASSED!")
+    triton_us = do_bench_npu(lambda: add_autotune(x, y))
+    torch_us = do_bench_npu(lambda: add_torch(x, y))
+    print(f"Triton kernel execution time: {triton_us:.4f} ms")
+    print(f"PyTorch kernel execution time: {torch_us:.4f} ms")
+
+
+if __name__ == "__main__":
+    test_add(98432)
 ```
 
 这表示：
@@ -74,7 +124,7 @@ def kernel(...):
 如果希望某个 `tl.constexpr` 参与自动 Tiling 生成，需要同时满足下面三点：
 
 - 它本身必须是 Tiling 参数，也就是会影响每个 block（逻辑核）处理的数据规模或 tile 大小的参数；
-- 不要在 launch 时把它显式传值写死；
+- 不要在 launch 时把它显式传值硬编码；
 - 不要在 kernel 定义里给它设置默认值。
 
 例如下面这种写法，`BLOCK_M` 会参与自动调优：
@@ -198,6 +248,28 @@ def kernel(...):
 - 框架负责 benchmark、选择最优配置和缓存复用；
 - 使用习惯与社区 autotune 保持一致。
 
+### 查看调优日志
+
+设置 `TRITON_PRINT_AUTOTUNING=1`，可查看调优日志。实际完成测速后，会打印调优耗时、最佳配置和各个成功配置的测速结果。以下为示意输出（`...` 表示省略的配置参数）：
+
+```text
+Triton autotuning for function kernel finished after 0.12s; best config selected: BLOCK_M: 128, BLOCK_N: 128, ...;
+Triton autotuning benchmark results for function kernel:
+  config=BLOCK_M: 128, BLOCK_N: 128, ...; p50=0.0100 ms, p20=0.0090 ms, p80=0.0110 ms [selected]
+  config=BLOCK_M: 64, BLOCK_N: 256, ...; p50=0.0140 ms, p20=0.0130 ms, p80=0.0150 ms
+```
+
+`[selected]` 标记被选中的最佳配置。`p50`、`p20`、`p80` 分别为第 50、20、80 百分位耗时，单位为毫秒；若测速返回平均耗时，则显示 `mean=... ms`。
+
+用户配置（`configs`，包括通过 `hints` 展开的配置）发生失败，或调优因异常中断时，会打印相应配置的状态和原因。以下分别为编译失败和调优中断的示意输出：
+
+```text
+Triton autotuning: config=BLOCK_M: 128, BLOCK_N: 128, ...; compile_failed; reason=CompileTimeAssertionFailure: <错误信息>
+Triton autotuning: config=BLOCK_M: 64, BLOCK_N: 256, ...; not_evaluated; reason=No benchmark result was produced. Autotuning interrupted: RuntimeError: <错误信息>
+```
+
+其中，`compile_failed` 表示编译失败，`not_evaluated` 表示配置尚未完成评估，`reason` 给出失败或中断原因。
+
 ## 进阶用法：自动 Tiling 与其他参数联合调优
 
 以下内容属于进阶用法，只有当用户希望在自动 Tiling 模式下，继续联合调优 kernel 的非 Tiling 参数或编译参数时，再考虑使用。
@@ -278,14 +350,23 @@ def matmul_kernel(a, b, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE_M):
     ...
 
 
+grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * meta["GROUP_SIZE_M"], triton.cdiv(N, meta["BLOCK_N"]))
 matmul_kernel[grid](a, b, M, N, K)
 ```
 
 这种方式的含义是：
 
 - Tiling 相关参数仍然由 Triton-Ascend 自动生成；
-- 非 Tiling 参数或编译参数由用户通过 `hints` 显式给出候选集合；
+- 非 Tiling 参数或编译参数（如 `GROUP_SIZE_M` 和 `multibuffer`）由用户通过 `hints` 显式给出候选集合；
 - autotune 会对两部分组合后的配置空间做评估。
+
+## autotune 示例
+
+| autotune算子          | 示例 |
+|---------------------|----|
+| 向量加法 autotune       |[01-vector-add.py](https://github.com/triton-lang/triton-ascend/blob/main/third_party/ascend/unittest/autotune_ut/01-vector-add.py)|
+| 融合 Softmax autotune |[02-fused-softmax.py](https://github.com/triton-lang/triton-ascend/blob/main/third_party/ascend/unittest/autotune_ut/02-fused-softmax.py)|
+| Layer Norm autotune |[03-layer-norm.py](https://github.com/triton-lang/triton-ascend/blob/main/third_party/ascend/unittest/autotune_ut/03-layer-norm.py)|
 
 ## 小结
 

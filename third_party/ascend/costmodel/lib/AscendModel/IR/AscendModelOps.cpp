@@ -15,9 +15,6 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "llvm/ADT/STLExtras.h"
 
-#include <algorithm>
-#include <cmath>
-
 using namespace mlir;
 using namespace mlir::ascend;
 
@@ -62,32 +59,29 @@ static int getElementBitsFromType(Type type) {
 }
 
 /// Estimate vector operation cycles.
-///
-/// The vector width is a hardware fact.  A model-neutral measured throughput
-/// may override the absolute model's legacy cycles-per-instruction fallback,
-/// while startup and other calibration remain absolute-model policy.
-static int64_t
-estimateVectorCycles(int64_t numElements, int cyclesPerVectorOp,
-                     int elementBits, int startupLatency,
-                     const HardwareConfig &config,
-                     llvm::StringRef throughputMeasurement = {}) {
+/// Vector unit is 2048 bits wide = 128 FP16 = 64 FP32 elements per cycle.
+static int64_t estimateVectorCycles(int64_t numElements, int cyclesPerVectorOp,
+                                    int elementBits, int startupLatency) {
   // Vector width based on element type
-  int64_t vectorWidth =
-      std::max<int64_t>(1, config.getVectorWidthBytes() * 8 / elementBits);
+  int64_t vectorWidth = 2048 / elementBits;
 
   // Number of vector operations
   int64_t numVectorOps = (numElements + vectorWidth - 1) / vectorWidth;
 
-  if (!throughputMeasurement.empty()) {
-    double instructionsPerDeviceCycle =
-        config.getMicrobenchmarkRatePerDeviceCycle(throughputMeasurement);
-    if (instructionsPerDeviceCycle > 0.0)
-      return static_cast<int64_t>(
-                 std::ceil(numVectorOps / instructionsPerDeviceCycle)) +
-             startupLatency;
-  }
-
+  // Total cycles
   return numVectorOps * cyclesPerVectorOp + startupLatency;
+}
+
+/// Estimate memory transfer cycles.
+static int64_t estimateMemoryCycles(int64_t bytes, const HardwareConfig &config,
+                                    int startupLatency) {
+  double bandwidth_gbs = config.getHBMBandwidthGBs();
+  if (bandwidth_gbs <= 0)
+    bandwidth_gbs = 1600.0;
+
+  double time_seconds = static_cast<double>(bytes) / (bandwidth_gbs * 1e9);
+  double cycles = time_seconds * config.getClockFrequencyGHz() * 1e9;
+  return static_cast<int64_t>(cycles) + startupLatency;
 }
 
 /// tilesim-migrated vector estimate (root cause 1, vector side):
@@ -395,7 +389,7 @@ IMPL_VEC_UNARY_TABLE(SqrtOp, "VSQRT")
     int64_t n = getNumElementsFromType(getInput().getType());                  \
     int bits = getElementBitsFromType(getInput().getType());                   \
     return estimateVectorCycles(n, CyclesPerOp, bits,                          \
-                                config.getVectorStartupLatency(), config);     \
+                                config.getVectorStartupLatency());             \
   }                                                                            \
   HWUnit OpClass::getHWUnit() { return HWUnit::Vector; }                       \
   int64_t OpClass::getFlops() {                                                \
@@ -431,8 +425,7 @@ int SigmoidOp::getCyclesPerVectorOp() { return 15; }
   int64_t OpClass::estimateCycles(const HardwareConfig &config) {              \
     int64_t numElems = getNumElementsFromType(getInput().getType());           \
     int bits = getElementBitsFromType(getInput().getType());                   \
-    int64_t vectorWidth =                                                      \
-        std::max<int64_t>(1, config.getVectorWidthBytes() * 8 / bits);         \
+    int64_t vectorWidth = 2048 / bits;                                         \
     int64_t numVectors = (numElems + vectorWidth - 1) / vectorWidth;           \
     int vectorReduceCycles = 0;                                                \
     int64_t w = vectorWidth;                                                   \
@@ -478,8 +471,7 @@ HWUnit BroadcastOp::getHWUnit() { return HWUnit::Vector; }
 int64_t SelectOp::estimateCycles(const HardwareConfig &config) {
   int64_t n = getNumElementsFromType(getResult().getType());
   int bits = getElementBitsFromType(getResult().getType());
-  return estimateVectorCycles(n, 1, bits, config.getVectorStartupLatency(),
-                              config);
+  return estimateVectorCycles(n, 1, bits, config.getVectorStartupLatency());
 }
 HWUnit SelectOp::getHWUnit() { return HWUnit::Vector; }
 int64_t SelectOp::getFlops() {

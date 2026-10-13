@@ -30,16 +30,12 @@ set_property(DIRECTORY PROPERTY RULE_LAUNCH_LINK ${_saved_launch_link})
 
 include_directories(${ASCENDNPU_IR_SRC_DIR}/bishengir/include)
 include_directories(${ASCENDNPU_IR_BINARY_DIR}/bishengir/include) # Tablegen'd files
-# RouteModel exposes a small header-only execution-selection contract used by
-# backend lowerings. Make CostModel public headers visible before those targets
-# are created by add_subdirectory(lib).
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/costmodel/include)
 
 add_subdirectory(bin)
 add_subdirectory(include)
 add_subdirectory(lib)
 
-if(TRITON_BUILD_DISTRIBUTED)
+if(TRITON_BUILD_TD)
   if(NOT EXISTS "${TRITON_DISTRIBUTED_ASCEND_SRC_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "Triton-Distributed submodule is not initialized: ${TRITON_DISTRIBUTED_ASCEND_SRC_DIR}")
   endif()
@@ -118,37 +114,27 @@ else()
   set(TRITON_ASCEND_HAS_INPROC_COSTMODEL 0)
 endif()
 
+if(TRITON_ASCEND_HAS_INPROC_COSTMODEL)
+  target_include_directories(TritonToGraph PRIVATE
+    "${_costmodel_gen_include}"
+    "${CMAKE_BINARY_DIR}/third_party/ascend/costmodel_build/include_AscendModel"
+    "${TRITON_ASCEND_COSTMODEL_SOURCE_DIR}/include"
+  )
+  target_compile_definitions(TritonToGraph PRIVATE TRITON_ASCEND_HAS_INPROC_COSTMODEL=1)
+  target_link_libraries(TritonToGraph PUBLIC AscendModelAnalysis)
+else()
+  target_compile_definitions(TritonToGraph PRIVATE TRITON_ASCEND_HAS_INPROC_COSTMODEL=0)
+endif()
+
 add_triton_plugin(TritonAscend
   ${CMAKE_CURRENT_SOURCE_DIR}/triton_ascend.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/ascend_ir.cc
   LINK_LIBS
-  AutoBlockifyV1
-  TTIRLayoutMerge
+  TritonToGraph
   TritonToLinalg
   BiShengIRScopeDialect
   BiShengIRHIVMDialect
 )
-
-# Keep canonical Cost Model profiles under costmodel/profiles.  Python's
-# community-owned setup.py builds the native extension before build_py, so an
-# Ascend-owned CMake target can place the runtime copy next to that extension
-# without teaching setup.py about backend-specific resources.
-if(TRITON_BUILD_PYTHON_MODULE AND CMAKE_LIBRARY_OUTPUT_DIRECTORY)
-  set(_ascend_costmodel_profile_source
-      "${CMAKE_CURRENT_SOURCE_DIR}/costmodel/profiles")
-  set(_ascend_costmodel_profile_package
-      "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/ascend/costmodel_profiles")
-  add_custom_target(TritonAscendCostModelProfiles ALL
-    COMMAND ${CMAKE_COMMAND} -E make_directory
-            "${_ascend_costmodel_profile_package}"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${_ascend_costmodel_profile_source}"
-            "${_ascend_costmodel_profile_package}"
-    COMMENT "Copying Ascend Cost Model profiles beside the native extension"
-    VERBATIM
-  )
-  add_dependencies(TritonAscend TritonAscendCostModelProfiles)
-endif()
 
 option(TRITON_ENABLE_COVERAGE_LLVM_COV "Enable code llvm-cov coverage tool for Ascend plugin " OFF)
 if(TRITON_ENABLE_COVERAGE_LLVM_COV)
@@ -183,6 +169,9 @@ if(TRITON_BUILD_UT)
   add_subdirectory(unittest)
 endif()
 
+if(TRITON_BUILD_TD)
+  add_subdirectory(Triton-distributed-ascend/csrc)
+endif()
 
 if(TRITON_ASCEND_HAS_INPROC_COSTMODEL)
   target_compile_definitions(TritonAscend PRIVATE TRITON_ASCEND_HAS_INPROC_COSTMODEL=1)
