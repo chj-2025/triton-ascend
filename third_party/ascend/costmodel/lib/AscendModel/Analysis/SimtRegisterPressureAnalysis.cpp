@@ -158,9 +158,6 @@ static void collectNearestDotProducers(Value value,
     producers.insert(definition);
     return;
   }
-  // A result from a load/call/unknown side-effecting operation does not carry
-  // the data provenance of its address or control operands.  Stop rather than
-  // inventing a dot edge through those operands.
   if (!isMemoryEffectFree(definition))
     return;
   for (Value operand : definition->getOperands())
@@ -234,9 +231,6 @@ llvm::Error SimtRegisterPressureAnalysis::analyze(ModuleOp module,
     }
   });
   Liveness liveness(module);
-  // Build the function-wide dot DAG once so a Stage can retain dependencies
-  // whose producer belongs to an earlier Stage.  SSA definition order makes
-  // predecessor depths available when a consumer is visited.
   llvm::DenseMap<Operation *, int64_t> dotPredecessorCount;
   llvm::DenseMap<Operation *, int64_t> dotSuccessorCount;
   llvm::DenseMap<Operation *, int64_t> dotDepth;
@@ -343,11 +337,7 @@ llvm::Error SimtRegisterPressureAnalysis::analyze(ModuleOp module,
         if (owner.lookup(op) != index || !op->getBlock() ||
             !visited.insert(op).second)
           return;
-        // These are optional lowering-side labels.  TTIR itself cannot know
-        // the allocator's final register count or CCEC's unroll decision;
-        // when a debug/calibration lowering supplies them, retain the labels
-        // next to the static TTIR lower bound instead of pretending they were
-        // inferred from SSA liveness.
+        // These are optional lowering-side labels.
         if (auto attr = op->getAttrOfType<IntegerAttr>(
                 "ascend.simt.lowered_peak_live_register_units"))
           facts.loweredPeakLiveUnitsPerThread = std::max<int64_t>(
@@ -424,27 +414,16 @@ llvm::Error SimtRegisterPressureAnalysis::analyze(ModuleOp module,
               facts.loopInvariantPredicateUnitsPerThread += *units;
           }
         }
-        // Region-op liveness may include initial iter operands AND yielded
-        // results, which are not simultaneously materialized registers. Its
-        // nested leaf operations provide actual program points instead.
         if (op->getNumRegions() != 0)
           return;
         const auto *info = liveness.getLiveness(op->getBlock());
         if (!info)
           return;
         auto live = info->currentlyLiveValues(op);
-        // Values retained across an enclosing loop/if still consume storage
-        // inside it even when the region never reads them. MLIR block liveness
-        // alone does not include every such ancestor value.
         for (Operation *parent = op->getParentOp();
              parent && parent->getBlock() &&
              !parent->hasTrait<OpTrait::IsIsolatedFromAbove>();
              parent = parent->getParentOp()) {
-          // The bound and step are implicit uses of scf.for's backedge,
-          // even if neither appears in a leaf operation and both are dead
-          // after the loop. The induction value is needed by that backedge
-          // too. Constants are still filtered as rematerializable below;
-          // the initial lower bound is not retained through the body.
           if (auto loop = dyn_cast<scf::ForOp>(parent)) {
             live.insert(loop.getUpperBound());
             live.insert(loop.getStep());
@@ -569,13 +548,6 @@ llvm::Error SimtRegisterPressureAnalysis::analyze(ModuleOp module,
   llvm::sort(functionDotSites, [](const auto *lhs, const auto *rhs) {
     return lhs->ordinal < rhs->ordinal;
   });
-  // A block of unrelated operations inserted between the whole dot DAG and
-  // its observation frontier shifts every side-effect span by the same
-  // amount.  Such a uniform ordinal translation does not change dot/use
-  // structure and must not invalidate a calibrated envelope. Preserve the
-  // relative separation between dot observations by subtracting the smallest
-  // positive side-effect span. sideEffectFrontierCount still distinguishes a
-  // normalized zero from a dot with no side-effect frontier.
   int64_t minimumPositiveSideEffectSpan = 0;
   for (const SimtDotDependencySite *site : functionDotSites) {
     if (site->sideEffectFrontierCount == 0 || site->maxSideEffectUseSpan <= 0)
@@ -611,9 +583,7 @@ llvm::Error SimtRegisterPressureAnalysis::analyze(ModuleOp module,
     if (stage.wholeSimtRegisterPressure)
       stage.wholeSimtRegisterPressure->ttirFunctionDotUseSignature =
           functionDotUseSignature;
-  // The floor describes one static whole-function stream.  When the graph has
-  // a serial recurrence followed by a dot region, retain three structural
-  // owners for phase attribution. Otherwise keep one whole-function owner.
+  // The floor describes one static whole-function stream.
   auto chooseOwner = [&](size_t begin, size_t end) -> std::optional<size_t> {
     std::optional<size_t> selected;
     int64_t selectedPeak = -1;

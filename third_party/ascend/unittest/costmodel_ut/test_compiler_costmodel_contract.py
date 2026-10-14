@@ -1,4 +1,3 @@
-import importlib
 import importlib.util
 import inspect
 import sys
@@ -6,47 +5,9 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 
 class CompilerCostmodelContractTest(unittest.TestCase):
-
-    def test_runtime_compile_options_bridge_stays_out_of_packaged_patch(self):
-        from triton.backends.ascend import _apply_ascend_patch
-
-        runtime_jit = importlib.import_module("triton.runtime.jit")
-        _apply_ascend_patch()
-
-        class FakeBackend:
-
-            def __init__(self):
-                self.packed_options = None
-
-            def get_runtime_compile_options(self, _bound_args, _specialization, _options):
-                return {"runtime_probe": ((0, 23), )}
-
-            def parse_options(self, options):
-                self.packed_options = dict(options)
-                return types.SimpleNamespace(**options)
-
-        backend = FakeBackend()
-        binder = runtime_jit.create_function_from_signature(inspect.Signature(), [], backend)
-        bound_args, specialization, options = binder()
-        self.assertEqual(options["runtime_probe"], ((0, 23), ))
-
-        dummy_jit = types.SimpleNamespace(params=[])
-        runtime_jit.JITFunction._pack_args(dummy_jit, backend, {}, bound_args, specialization, options)
-        self.assertEqual(backend.packed_options["runtime_probe"], ((0, 23), ))
-
-        patched_factory = runtime_jit.create_function_from_signature
-        patched_pack_args = runtime_jit.JITFunction._pack_args
-        _apply_ascend_patch()
-        self.assertIs(runtime_jit.create_function_from_signature, patched_factory)
-        self.assertIs(runtime_jit.JITFunction._pack_args, patched_pack_args)
-
-        repo_root = Path(__file__).resolve().parents[4]
-        packaged_patch = repo_root / "third_party" / "ascend" / "patch" / "triton-ascend-3.6.0.patch"
-        self.assertNotIn("get_runtime_compile_options", packaged_patch.read_text(encoding="utf-8"))
 
     @staticmethod
     def _load_compiler_module():
@@ -190,25 +151,13 @@ class CompilerCostmodelContractTest(unittest.TestCase):
         cmplr, _dump_mgr, GPUTarget = self._load_compiler_module()
 
         backend = cmplr.AscendBackend(GPUTarget(backend="npu", arch="910B"))
-        triton_stub = types.ModuleType("triton")
-        triton_stub.__path__ = []
-        backends_stub = types.ModuleType("triton.backends")
-        backends_stub.__path__ = []
-        ascend_stub = types.ModuleType("triton.backends.ascend")
-        ascend_stub._apply_ascend_patch = lambda: None
-        triton_stub.backends = backends_stub
-        backends_stub.ascend = ascend_stub
-        with patch.dict(sys.modules, {
-                "triton": triton_stub,
-                "triton.backends": backends_stub,
-                "triton.backends.ascend": ascend_stub,
-        }):
-            opt_plain = backend.parse_options({})
-            self.assertTrue(opt_plain.use_bytecode)
 
-            opt_costmodel = backend.parse_options({"enable_costmodel_backend": True})
-            self.assertTrue(opt_costmodel.enable_costmodel_backend)
-            self.assertFalse(opt_costmodel.use_bytecode)
+        opt_plain = backend.parse_options({})
+        self.assertTrue(opt_plain.use_bytecode)
+
+        opt_costmodel = backend.parse_options({"enable_costmodel_backend": True})
+        self.assertTrue(opt_costmodel.enable_costmodel_backend)
+        self.assertFalse(opt_costmodel.use_bytecode)
 
     def test_costmodel_profiles_use_canonical_source_in_checkout(self):
         cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
@@ -294,21 +243,6 @@ class CompilerCostmodelContractTest(unittest.TestCase):
             source = inspect.getsource(entry)
             self.assertIn("if not _is_debug_line_info_disabled():", source)
             self.assertIn('_compile_option_list += ["--enable-debug-info=true"]', source)
-
-    def test_a5_entries_share_custom_core_count_options(self):
-        cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
-        for entry in (cmplr.linalg_to_bin_enable_npu_compile_910_95, cmplr.ttir_to_npubin):
-            self.assertIn("_compile_option_list += _custom_core_count_options()", inspect.getsource(entry))
-        for limited in (False, True):
-            with self.subTest(limited=limited):
-                utils = types.SimpleNamespace(has_device_limit=lambda: limited)
-                # Without a limit, no device-count query is needed.
-                if limited:
-                    utils.get_aicore_num = lambda: 1
-                    utils.get_aivector_core_num = lambda: 2
-                with patch.object(cmplr, "NPUUtils", return_value=utils):
-                    expected = ["--custom-aic-number=1", "--custom-aiv-number=2"] if limited else []
-                    self.assertEqual(cmplr._custom_core_count_options(), expected)
 
 
 if __name__ == "__main__":

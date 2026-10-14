@@ -1,9 +1,6 @@
 //===- SelectSimdSimtCostModel.cpp - C++ SIMD/SIMT selection ------------===//
 //
-// This pass is the online owner of SIMD/SIMT candidate selection.  Python
-// only schedules the pass and reacts to its machine-readable execution intent.
-// Feature extraction, stage scoring, candidate legality, and mixed-operation
-// planning stay in C++.
+// This pass is the online owner of SIMD/SIMT candidate selection.
 //
 //===----------------------------------------------------------------------===//
 
@@ -187,10 +184,6 @@ struct SelectSimdSimtCostModelPass
     clearPreviousSelection(module);
     const bool autoMode = mode.getValue() == "auto";
 
-    // Selection may inspect a transformed analysis view while materializing
-    // the chosen route on the route-neutral module owned by this pass.  This
-    // is how AutoBlockify V1 dispatch/loop cost becomes visible without
-    // forcing an all-SIMD result to retain SIMT scheduling IR.
     OwningOpRef<ModuleOp> parsedAnalysisModule;
     ModuleOp analysisModule = module;
     if (!analysisModulePath.getValue().empty()) {
@@ -344,10 +337,6 @@ struct SelectSimdSimtCostModelPass
           applicationReason = "no_materializable_mixed_anchor";
         }
       }
-      // A factor>1 mixed route needs batching of the surrounding SIMD
-      // producer/consumer Stages, not just a scope attribute.  Keep the
-      // recommendation visible but do not apply it until ScopeSuperBlockPass
-      // implements that exact materialization.
       if (selectedSuperblockFactor > 1 &&
           !options.scopeSuperblockMaterializable) {
         actionSupported = false;
@@ -359,9 +348,8 @@ struct SelectSimdSimtCostModelPass
       actionSupported = false;
       applicationReason = "explicit_scope_present";
     }
-    // Both whole-kernel and mixed-kernel V1 schedules launch
-    // numWarps * factor logical warp groups.  Treating a mixed factor as the
-    // total warp count understated the resource limit by numWarps.
+    // Both whole-kernel and mixed-kernel V1 schedules launch numWarps * factor
+    // logical warp groups.
     const int64_t selectedWarpCount =
         selectedSuperblockFactor * options.numWarps;
     if (selectedSuperblockFactor > 1 && selectedWarpCount > 64) {

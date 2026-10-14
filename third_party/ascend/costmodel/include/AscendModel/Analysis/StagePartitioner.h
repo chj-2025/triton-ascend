@@ -22,10 +22,7 @@ struct StagePartitionerOptions {
   bool scopeSuperblockMaterializable = false;
 };
 
-/// Ordered post-transform TTIR semantic roots.  AutoBlockify V1's outer loop
-/// is represented as a scheduling shell while its direct body operations
-/// remain semantic roots; this prevents double ownership.  Exact local SIMT
-/// ownership is derived separately from the immutable SimtAnchorPlan.
+/// Ordered post-transform TTIR semantic roots.
 struct ProgramStructure {
   std::vector<Operation *> rootOperations;
 };
@@ -36,9 +33,7 @@ public:
   analyze(ModuleOp module, const SimtAnchorPlan &anchorPlan) const;
 };
 
-/// Splits ordered semantic roots directly into single-kind Stages.  It does
-/// not evaluate cycles or choose SIMD/SIMT.  The anchor plan is used only as
-/// exact ownership evidence for materializable local SIMT Stages.
+/// Splits ordered semantic roots directly into single-kind Stages.
 class StageBoundaryAnalysis {
 public:
   llvm::Expected<StagePartition>
@@ -54,17 +49,12 @@ public:
 };
 
 /// Verifies/classifies the one dominant resource semantics of every Stage.
-/// Strong structures (recurrence, reduction, dot, indirect/continuous
-/// memory, conversion) are inferred from owned operations and must agree
-/// with the boundary plan.  Scalar sub-kinds remain boundary semantics.
 class StageKindClassifier {
 public:
   llvm::Error analyze(StagePartition &partition, int64_t tinyDotFlopsMax) const;
 };
 
-/// Verifies that operation/resource work is owned exactly once.  Unlike the
-/// retired implementation, this component never distributes a kernel total
-/// using per-kind weights.
+/// Verifies that operation/resource work is owned exactly once.
 class StageWorkloadAnalysis {
 public:
   llvm::Error analyze(StagePartition &partition,
@@ -81,9 +71,6 @@ public:
 };
 
 /// Applies profile-backed resource limits after the structural legality pass.
-/// Register-pressure and target-capacity facts are unavailable when the
-/// initial Stage partition is formed, so they must not be folded into
-/// StageModeLegalityAnalysis::analyze().
 class StageResourceLegalityAnalysis {
 public:
   llvm::Error applySimtUbCapacity(StagePartition &partition,
@@ -96,8 +83,7 @@ public:
 };
 
 /// Partitions post-layout/post-AutoBlockify-V1 TTIR directly into ordered,
-/// single-mode Stages.  A Stage may later be evaluated as SIMD or SIMT, but it
-/// is never internally mixed.
+/// single-mode Stages.
 class StagePartitioner {
 public:
   llvm::Expected<StagePartition>

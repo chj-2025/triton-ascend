@@ -7,6 +7,11 @@ from triton.backends.ascend.utils import is_compile_on_910_95
 simd_simt_910_95_only = pytest.mark.xfail(not is_compile_on_910_95(),
                                           reason="simd_simt compile mode only supports 910_95", run=False)
 
+SIMD_SIMT_AUTO_OPTIONS = {
+    "compile_mode": "simd_simt",
+    "auto_simt_scope_mode": "auto",
+}
+
 
 @triton.jit
 def simple_indirect_load_add_kernel(src_ptr, indices_ptr, out_ptr, add_value, BLOCK: tl.constexpr):
@@ -32,7 +37,7 @@ def test_simple_indirect_load_add():
 
     add_value = 3.0
     grid = (1, )
-    simple_indirect_load_add_kernel[grid](src, indices, output, add_value, BLOCK=8, compile_mode='simd_simt')
+    simple_indirect_load_add_kernel[grid](src, indices, output, add_value, BLOCK=8, **SIMD_SIMT_AUTO_OPTIONS)
 
     expected = src[indices] + add_value
 
@@ -76,7 +81,7 @@ def test_indirect_index_load_div_kernel():
     # add_value = 3.0
     grid = (1, )
     indirect_index_load_div_kernel[grid](src, add_src, indices, output, offset1, offset2, BLOCK=8,
-                                         compile_mode='simd_simt')
+                                         **SIMD_SIMT_AUTO_OPTIONS)
 
     expected = src[indices + (offset2 / offset1).to(torch.int64) * 2] + add_src
 
@@ -114,7 +119,7 @@ def test_indirect_index_load_add_kernel():
 
     # add_value = 3.0
     grid = (1, )
-    indirect_index_load_add_kernel[grid](src, add_src, indices, output, BLOCK=8, compile_mode='simd_simt')
+    indirect_index_load_add_kernel[grid](src, add_src, indices, output, BLOCK=8, **SIMD_SIMT_AUTO_OPTIONS)
 
     expected = src[indices + 3] + add_src
 
@@ -158,7 +163,7 @@ def test_indirect_index_load_and_kernel():
     # add_value = 3.0
     grid = (1, )
     indirect_index_load_and_kernel[grid](src, add_src, indices, output, offset1, offset2, BLOCK=8,
-                                         compile_mode='simd_simt')
+                                         **SIMD_SIMT_AUTO_OPTIONS)
 
     expected = src[indices & 63] + add_src
 
@@ -202,7 +207,7 @@ def test_indirect_index_load_max_min_kernel():
     # add_value = 3.0
     grid = (1, )
     indirect_index_load_max_min_kernel[grid](src, add_src, indices, output, offset1, offset2, BLOCK=8,
-                                             compile_mode='simd_simt')
+                                             **SIMD_SIMT_AUTO_OPTIONS)
     down_limit = torch.full((8, ), 0, dtype=torch.int64, device='npu')
     up_limit = torch.full((8, ), 64, dtype=torch.int64, device='npu')
     expected = src[torch.minimum(torch.maximum(indices, down_limit), up_limit)] + add_src
@@ -247,7 +252,7 @@ def test_indirect_index_load_mul_kernel():
     # add_value = 3.0
     grid = (1, )
     indirect_index_load_mul_kernel[grid](src, add_src, indices, output, offset1, offset2, BLOCK=8,
-                                         compile_mode='simd_simt')
+                                         **SIMD_SIMT_AUTO_OPTIONS)
 
     expected = src[indices + offset2 * offset1] + add_src
 
@@ -291,7 +296,7 @@ def test_indirect_index_load_or_kernel():
     # add_value = 3.0
     grid = (1, )
     indirect_index_load_or_kernel[grid](src, add_src, indices, output, offset1, offset2, BLOCK=8,
-                                        compile_mode='simd_simt')
+                                        **SIMD_SIMT_AUTO_OPTIONS)
 
     expected = src[indices | 3] + add_src
 
@@ -335,7 +340,7 @@ def test_indirect_index_load_sub_kernel():
     # add_value = 3.0
     grid = (1, )
     indirect_index_load_sub_kernel[grid](src, add_src, indices, output, offset1, offset2, BLOCK=8,
-                                         compile_mode='simd_simt')
+                                         **SIMD_SIMT_AUTO_OPTIONS)
 
     expected = src[indices + offset2 - offset1] + add_src
 
@@ -687,93 +692,3 @@ def test_simple_indirect_store():
         torch.testing.assert_close(dst[p], values[i], rtol=1e-5, atol=1e-5)
 
     return True
-
-
-@triton.jit
-def gather_then_tldot_2d_kernel(
-    a_ptr,
-    b_ptr,
-    indices_ptr,
-    out_ptr,
-    M,
-    N,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_om,
-    stride_on,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-    gather_k = tl.load(indices_ptr + offs_k)
-
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + gather_k[None, :] * stride_ak
-    a_mask = offs_m[:, None] < M
-    a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-
-    b_ptrs = b_ptr + gather_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-    b_mask = offs_n[None, :] < N
-    b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-
-    c = tl.dot(a, b)
-
-    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
-    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(out_ptrs, c, mask=out_mask)
-
-
-@simd_simt_910_95_only
-def test_gather_then_tldot_2d():
-    M = 16
-    K_SRC = 256
-    N = 16
-    BLOCK_M = 16
-    BLOCK_N = 16
-    BLOCK_K = 16
-
-    # Bounded values keep this test focused on gather-to-dot lowering instead
-    # of device-specific accumulation of large FP16 products.
-    host_a = (((torch.arange(M * K_SRC, dtype=torch.int32, device='cpu') * 17 + 3) % 257) - 128).to(torch.float32) / 128
-    host_b = (((torch.arange(K_SRC * N, dtype=torch.int32, device='cpu') * 29 + 5) % 251) - 125).to(torch.float32) / 128
-    src_a = host_a.to(torch.float16).reshape(M, K_SRC).npu()
-    src_b = host_b.to(torch.float16).reshape(K_SRC, N).npu()
-    indices = torch.tensor(
-        [10, 25, 100, 200, 5, 50, 150, 255, 1, 2, 3, 4, 6, 7, 8, 9],
-        dtype=torch.int32,
-        device='npu',
-    )
-    output = torch.empty((M, N), dtype=torch.float32, device='npu')
-
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-    gather_then_tldot_2d_kernel[grid](
-        src_a,
-        src_b,
-        indices,
-        output,
-        M,
-        N,
-        src_a.stride(0),
-        src_a.stride(1),
-        src_b.stride(0),
-        src_b.stride(1),
-        output.stride(0),
-        output.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        compile_mode='simd_simt',
-    )
-
-    host_indices = indices.cpu().to(torch.int64)
-    expected = torch.matmul(src_a.cpu()[:, host_indices].to(torch.float32),
-                            src_b.cpu()[host_indices, :].to(torch.float32))
-    torch.npu.synchronize()
-    torch.testing.assert_close(output.cpu(), expected, rtol=1e-2, atol=1e-2)

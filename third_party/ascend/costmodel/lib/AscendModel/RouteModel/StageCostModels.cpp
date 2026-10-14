@@ -18,6 +18,7 @@
 #include <numeric>
 #include <optional>
 #include <system_error>
+#include <type_traits>
 
 using namespace mlir;
 using namespace mlir::ascend;
@@ -28,10 +29,7 @@ static double iterations(const LogicalStage &stage) {
   return static_cast<double>(std::max<int64_t>(1, stage.iterationCount));
 }
 
-/// Resolve an operation-specific rate first. Unclassified numeric TTIR
-/// operations retain their original name under the fp32.saturated.* prefix and
-/// consume the measured saturated FP32 arithmetic rate instead of contributing
-/// only to the front-end issue floor.
+/// Resolve an operation-specific rate first.
 static const StageOperationRate *
 findOperationRate(const StageModeProfile &profile, llvm::StringRef name) {
   auto exact = profile.operationRates.find(name);
@@ -43,10 +41,7 @@ findOperationRate(const StageModeProfile &profile, llvm::StringRef name) {
   if (saturated != profile.operationRates.end())
     return &saturated->second;
   // Backward compatibility for hardware profiles created before the named
-  // saturation alias existed.  Their measured f32.add entry is the same
-  // conservative execution lower bound; falling back here keeps newly seen
-  // TTIR arithmetic non-zero without forcing every historical profile to be
-  // rewritten before it can be loaded.
+  // saturation alias existed.
   auto fp32Add = profile.operationRates.find("f32.add");
   return fp32Add == profile.operationRates.end() ? nullptr : &fp32Add->second;
 }
@@ -72,11 +67,6 @@ static double selectWarpCurveValue(const std::map<int64_t, double> &curve,
 }
 
 /// Resolve occupancy-sensitive SIMT rates for one concrete implementation.
-/// The backend materializer retains `baseWarpCount` warps for every logical
-/// program and launches F such programs in one SuperBlock, so the physical VF
-/// contains baseWarpCount * F active warps.  Selecting all candidates from the
-/// base-warp point makes F2/F4 consume an F1 profile even though the generated
-/// kernel has a different launch shape.
 static StageModeProfile
 resolveModeProfile(const HardwareProfile &hardware,
                    const StageImplementation &implementation,
@@ -110,16 +100,12 @@ resolveModeProfile(const HardwareProfile &hardware,
   resolved.storeWarpInstructionsPerCycle =
       selectWarpCurveValue(resolved.storeWarpInstructionsPerCycleByWarpCount,
                            resolved.storeWarpInstructionsPerCycle, activeWarps);
-  // The occupancy sweep executes an accumulator-feedback dot chain.  It is
-  // evidence for a loop-carried dot recurrence, not for independent or
-  // straight-line tiny-cube Stages with different scheduling envelopes.
+  // The occupancy sweep executes an accumulator-feedback dot chain.
   if (dependentDotRecurrence)
     resolved.dotFlopsPerCycle =
         selectWarpCurveValue(resolved.dotFlopsPerCycleByWarpCount,
                              resolved.dotFlopsPerCycle, activeWarps);
-  // Factor-specific group curves are measured at one explicit base warp
-  // count.  They describe a different physical launch shape when num_warps
-  // changes and must not be presented as measured evidence for that shape.
+  // Factor-specific group curves are measured at one explicit base warp count.
   if (resolved.recurrenceGroupBaseWarpCount != hardware.baseSimtWarpCount) {
     resolved.recurrenceReductionGroupCyclesByFactorAndLaneSteps.clear();
     resolved.recurrenceReductionGroupStartupCyclesByFactorAndLaneSteps.clear();
@@ -237,9 +223,8 @@ struct LayoutCoverage {
   std::map<std::pair<int64_t, int64_t>, double> storeShapes;
 };
 
-static std::optional<std::pair<int64_t, int64_t>>
-accessShape(const StageMemoryAccess &access) {
-  if (!access.hasStaticLayout() || access.elementBits % 8 != 0)
+static std::optional<int64_t> accessElements(const StageMemoryAccess &access) {
+  if (access.shape.empty())
     return std::nullopt;
   int64_t elements = 1;
   for (int64_t extent : access.shape) {
@@ -247,11 +232,21 @@ accessShape(const StageMemoryAccess &access) {
       return std::nullopt;
     elements *= extent;
   }
+  return elements;
+}
+
+static std::optional<std::pair<int64_t, int64_t>>
+accessShape(const StageMemoryAccess &access) {
+  if (!access.hasStaticLayout() || access.elementBits % 8 != 0)
+    return std::nullopt;
+  const auto elements = accessElements(access);
+  if (!elements)
+    return std::nullopt;
   const int64_t elementBytes = access.elementBits / 8;
   if (elementBytes <= 0 ||
-      elements > std::numeric_limits<int64_t>::max() / elementBytes)
+      *elements > std::numeric_limits<int64_t>::max() / elementBytes)
     return std::nullopt;
-  return std::make_pair(elements * elementBytes, elements);
+  return std::make_pair(*elements * elementBytes, *elements);
 }
 
 static void mapMaskedStridedCopyCompletion(const LogicalStage &stage,
@@ -355,9 +350,7 @@ static void mapSimdIrregularTileCompletion(const StageWorkload &work,
         tailInactiveElements, access.count * outer * (paddedInner - inner));
 
     // Full aligned row groups expose a completion bound not visible in TTIR
-    // byte counts. Partial or lane-unaligned groups stay on the analytical
-    // resource formula: fresh-process controls showed that a separate whole-
-    // tile floor double-counts their GM/reduction work.
+    // byte counts.
     const int64_t rows = access.rowCount();
     const bool smallWideTile =
         profile.irregularTileRowGroupSize > 0 &&
@@ -370,10 +363,7 @@ static void mapSimdIrregularTileCompletion(const StageWorkload &work,
       double accessFloor = 0.0;
       if (!partialRowGroup && !unalignedInner) {
         // Full aligned row groups have a completion envelope that is not
-        // visible in TTIR GM bytes.  The first group pays the VF startup and
-        // the remaining groups use the measured steady increment.  This is a
-        // structural row-group curve; it does not depend on an operator or an
-        // exact shape signature.
+        // visible in TTIR GM bytes.
         const int64_t fullGroups = rows / profile.irregularTileRowGroupSize;
         const double elementsPerGroup =
             access.count * profile.irregularTileRowGroupSize * inner;
@@ -399,13 +389,7 @@ static void mapSimdIrregularTileCompletion(const StageWorkload &work,
     resources.irregularFullPhysicalMaterialization =
         fullPhysicalMaterialization;
     // The masked-tile completion floor always owns the complete physical
-    // materialization.  In a fused rowwise Stage, however, only the portion
-    // before the second row group is additional to the measured completion
-    // envelope: the first architectural row group exposes the full cost, a
-    // partial second group exposes the uncovered fraction, and two or more
-    // groups cover it. This is a structural row-group ownership rule.  It
-    // neither overlaps source loop iterations nor depends on an operator or
-    // exact shape.
+    // materialization.
     const double groupRows =
         static_cast<double>(profile.irregularTileRowGroupSize);
     double uncoveredFraction =
@@ -430,10 +414,7 @@ static void mapSimdIrregularTileCompletion(const StageWorkload &work,
       profile.irregularTileTailCyclesPerInactiveElement * tailInactiveElements;
 }
 
-/// Only consume exact group evidence. Logical rank/row count does not prove
-/// the selected DMA or SIMT lane mapping; do not invent a setup per row or
-/// a physical LDG count by rounding TTIR elements. Unsupported layouts retain
-/// an explicitly uncalibrated analytical estimate.
+/// Only consume exact group evidence.
 static std::optional<double> mapLayoutAccess(const StageMemoryAccess &access,
                                              const StageModeProfile &profile,
                                              bool simd, int64_t factor) {
@@ -477,12 +458,6 @@ dotStoreSharedCurve(const StageMemoryAccess &access,
                                                           : &found->second;
 }
 
-/// Coverage of the logical tile is a lower bound on the sum of per-warp
-/// coverage: warps may revisit a line, never merge two disjoint lines into one.
-/// Only use the measured 8-byte/lane, full-warp domain; do not infer issued
-/// instructions for short, broadcast, indirect or unknown-layout accesses.
-/// Packed-layout issue floors did not transfer to the independent grouped
-/// probe, so retain their previous estimate instead of claiming validation.
 static double storeLayoutService(const StageWorkload &work,
                                  const StageModeProfile &profile,
                                  int64_t factor) {
@@ -540,9 +515,7 @@ static bool fullyDescribed(double described, double total) {
 }
 
 /// Count issue instructions without collapsing distinct short operations into
-/// one vector/warp. StageWorkload::issueElements remains a useful aggregate in
-/// the report, but ceil(sum(elements) / width) is not a valid instruction
-/// count when those elements belong to different operations.
+/// one vector/warp.
 static double countIssueInstructions(const StageWorkload &work,
                                      int64_t issueWidth, bool simd,
                                      int64_t vectorWidthBits) {
@@ -622,9 +595,7 @@ static double countIssueInstructions(const StageWorkload &work,
   return instructions;
 }
 
-/// Interpolate an isolated per-operation cost curve. Below the first measured
-/// point, scale from the origin; above the last point, retain the last measured
-/// local slope. This keeps workload size and dynamic occurrence count separate.
+/// Interpolate an isolated per-operation cost curve.
 static double interpolateOperationCost(const std::map<int64_t, double> &curve,
                                        int64_t workSize) {
   if (curve.empty() || workSize <= 0)
@@ -648,9 +619,7 @@ static double interpolateOperationCost(const std::map<int64_t, double> &curve,
 }
 
 /// Continuous-memory curves are only evidence inside their measured byte
-/// interval.  Extrapolating a cache/transaction curve beyond that interval
-/// silently turns a local fit into an invented bandwidth model, so unmatched
-/// shapes must retain the analytical fallback.
+/// interval.
 static std::optional<double>
 interpolateBoundedOperationCost(const std::map<int64_t, double> &curve,
                                 int64_t workSize) {
@@ -661,9 +630,7 @@ interpolateBoundedOperationCost(const std::map<int64_t, double> &curve,
 }
 
 /// SIMT row groups execute the complete backend template selected for the
-/// enclosing row bucket.  A partial group therefore pays the next measured
-/// bucket rather than a fractional share of it.  Keep this helper bounded so
-/// unmeasured row counts retain the analytical fallback.
+/// enclosing row bucket.
 static std::optional<double>
 lookupBoundedCeilingGroupCost(const std::map<int64_t, double> &curve,
                               int64_t workSize) {
@@ -755,9 +722,6 @@ rowwiseReductionGeometry(const LogicalStage &stage, const StageWorkload &work,
   return std::make_pair(input->rowCount(), input->rowBytes() / 4);
 }
 
-/// A one-time envelope is not an amount of work and must not scale from the
-/// origin or continue with the last local slope.  Interpolate only between
-/// measured shapes and retain the nearest endpoint outside that interval.
 static double interpolateEnvelopeCost(const std::map<int64_t, double> &curve,
                                       int64_t workSize) {
   if (curve.empty() || workSize <= 0)
@@ -931,15 +895,8 @@ dotOperandCurve(const std::string &path, const StageModeProfile &profile,
   if (found != profile.dotOperandPathCosts.end() && isLinear(found->second))
     return &found->second;
 
-  // The measured dot composite describes a 16x16 operand tile and its
-  // producer topology.  A tensor's outer program pitch changes with the
-  // surrounding head/batch shape, but does not change that physical tile.
-  // Requiring the literal pitch made an otherwise identical path fall back
-  // to a cheaper partial-composite formula at stride 12288/16384.  Match a
-  // unique calibrated topology after erasing only the outer pitch; retain
-  // row bytes, row count, element type, masking, tile shape, base warps and
-  // SuperBlock factor.  If more than one curve has the same topology, refuse
-  // to guess rather than selecting a shape-specific value.
+  // The measured dot composite describes a 16x16 operand tile and its producer
+  // topology.
   const auto eraseOuterPitch = [](std::string value) {
     for (llvm::StringRef marker :
          {llvm::StringRef("stride="), llvm::StringRef("strides=")}) {
@@ -978,8 +935,6 @@ dotOperandCurve(const std::string &path, const StageModeProfile &profile,
 }
 
 /// Transfer ownership, never add a composite dot cost on top of its inputs.
-/// This evidence is for whole-SIMT only: local scopes and CV partitioning have
-/// different operand transfers and must retain their independent estimates.
 static void mapCompositeDotPaths(StageWorkload &work,
                                  const StageModeProfile &profile,
                                  int64_t factor,
@@ -995,11 +950,6 @@ static void mapCompositeDotPaths(StageWorkload &work,
     work.dotOperations = std::max(0.0, work.dotOperations - entry.second);
     work.dotFlops = std::max(0.0, work.dotFlops - entry.first * entry.second);
   }
-  // A partially matched Stage contains a measured physical operand path plus
-  // a structurally different residual path.  Fresh direct phase traces show
-  // that this residual has a smaller completion envelope than a wholly
-  // generic Stage.  Scale only the still-unowned work; the exact composite
-  // above remains immutable and a fully generic Stage never enters here.
   if (matchedOperandPath && (work.dotOperations > 0.0 || work.dotFlops > 0.0)) {
     work.dotOperations *= profile.dotPartialCompositeResidualRelativeScale;
     work.dotFlops *= profile.dotPartialCompositeResidualRelativeScale;
@@ -1221,9 +1171,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
       continue;
     }
 
-    // One SIMT warp follows one independent sequence. Each log2(R) level
-    // issues one warp shuffle. Only lanes [offset, R) add the shuffled value,
-    // while all R lanes evaluate the level predicate.
+    // One SIMT warp follows one independent sequence.
     int64_t depth = 0;
     int64_t activeAddsPerSequence = 0;
     for (int64_t offset = 1; offset < extent;) {
@@ -1244,21 +1192,13 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
         warpSteps * profile.issueWidth / profile.shuffleLanesPerCycle;
     resources.shuffle += scanShuffleCycles;
     resources.scanShuffle += scanShuffleCycles;
-    // Preserve operation boundaries at every scan level.  A masked add and
-    // its predicate are each one issued warp instruction even when fewer
-    // than 32 lanes are active; lanes from different levels or independent
-    // sequences cannot be packed into one instruction by taking
-    // ceil(sum(active lanes) / 32).  Each level therefore issues one shuffle,
-    // one predicate and one add per sequence.
+    // Preserve operation boundaries at every scan level.
     constexpr double instructionsPerWarpStep = 3.0;
     prefixScanIssuedInstructions += instructionsPerWarpStep * warpSteps;
     resources.prefixScanCriticalPath +=
         count * depth * profile.prefixScanStepLatencyCycles;
   }
   // Unclassified scalar operations have no execution-throughput evidence.
-  // They still contribute distinct instructions to the measured issue floor
-  // below, but assigning a second arbitrary scalar rate would fabricate a
-  // mode-dependent cost and double-count the same instruction stream.
   if (stage.features.hasIndirectMemory) {
     const double loads = work.loadWarpInstructions;
     const double stores = work.storeWarpInstructions;
@@ -1356,11 +1296,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
       const int64_t elements = shape.second;
       const int64_t warpInstructions = llvm::divideCeil(elements, int64_t(32));
       // SIMD lowers a non-uniform loaded-index tensor to discrete element
-      // accesses.  The measured curve is therefore indexed by the number of
-      // logical lane transactions.  FP16 and FP32 share that transaction-count
-      // model; wider elements retain the analytical fallback.  SIMT keeps the
-      // original FP16-only curve because its coalesced warp service is
-      // sensitive to element width.
+      // accesses.
       const bool useElementLoadCurve =
           !dynamicGridStride &&
           !profile.indirectLoadSystemCyclesByElements.empty() &&
@@ -1393,10 +1329,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
       } else
         resources.indirectLoadGroupStartup = loadStartup;
     }
-    // Loaded-index stores are indexed by distinct destination segments.  This
-    // keeps a lane-wise scatter separate from an index_put-style store whose
-    // inner dimension is proven contiguous, while using one structural curve
-    // for both.  Only exact FP32 shapes consume the measured curve.
+    // Loaded-index stores are indexed by distinct destination segments.
     if (!profile.indirectStoreSystemCyclesBySegments.empty()) {
       auto priceStore = [&](int64_t bytes, int64_t elements,
                             int64_t contiguousElements, double count) {
@@ -1419,11 +1352,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
     }
 
     // Exact dtype/shape curves are stronger evidence, but they are not an
-    // admission policy. Price every uncovered indirect access with the same
-    // mode-specific measured resource rates used by ordinary memory: SIMD
-    // pays one operation startup plus bytes/bandwidth, while SIMT pays issued
-    // warp instructions/rate. This gives every kernel one formula and keeps
-    // the report explicit when a composite curve is absent.
+    // admission policy.
     constexpr double coverageTolerance = 1.0e-9;
     const double uncoveredLoadBytes =
         std::max(0.0, work.loadBytes - curvedLoadBytes);
@@ -1451,10 +1380,6 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
       resources.load +=
           uncoveredLoadOperations * profile.loadOperationSetupCycles +
           uncoveredLoadBytes / profile.loadBytesPerCycle;
-      // A loaded outer index with a proven unit-stride inner run lowers to
-      // one transfer per contiguous segment. The generic fallback above has
-      // already charged one startup per semantic TTIR load; add the remaining
-      // segment startups without applying the scalar element-gather curve.
       for (const auto &[shape, count] : work.segmentedIndirectLoadCounts) {
         const int64_t elements = std::get<1>(shape);
         const int64_t contiguousElements = std::get<2>(shape);
@@ -1535,17 +1460,8 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
           operationsPerGroup >= profile.independentLoadGroupMinimumOperations &&
           operationsPerGroup <= profile.independentLoadGroupMaximumOperations &&
           // The one-stream evidence is a flat rank-one grid-stride transfer.
-          // A rank-two masked tile lowers to row transactions even when its
-          // logical strides are globally contiguous; applying the rank-one
-          // startup envelope there overprices short masked loops. Multi-stream
-          // groups retain their existing structural admission rule.
           (operationsPerGroup != 1 || allLoadsRankOne);
       if (groupCovered) {
-        // Price the uninterrupted flat prefix even when a following strided
-        // or indirect load remains on the analytical path.  The occurrence
-        // GCD recovers repeated source groups after surrounding loop
-        // normalization (for example two [load, load, strided-load] groups),
-        // without treating all repeated accesses as one larger DMA group.
         resources.setup += profile.independentLoadGroupKernelStartupCycles;
         resources.continuousLoadGroup +=
             groupOccurrences *
@@ -1613,9 +1529,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
         }
       }
     }
-    // GM count curves contain no FMA-to-store shared-memory exchange. Its
-    // measured mapping also proves a synchronization boundary, across which
-    // the uninterrupted GM sequence must not reuse its incremental latency.
+    // GM count curves contain no FMA-to-store shared-memory exchange.
     std::map<const StageMemoryLayoutCost *, double> exchanges;
     if (!simd && isContinuousMemoryStage(stage.costModelKind))
       for (const auto &access : work.memoryAccesses)
@@ -1632,10 +1546,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
       return curve && exchanges.count(curve) &&
              curve->evaluate(exchanges.at(curve)).has_value();
     };
-    // A count curve describes one uninterrupted sequence. Do not merge two
-    // matching layouts across a different access, or apply its overlap across
-    // explicit synchronization/control flow. Lowering-only barriers require
-    // separate evidence before a profile entry can be enabled.
+    // A count curve describes one uninterrupted sequence.
     std::vector<StageMemoryAccess> accessGroups;
     for (const StageMemoryAccess &access : work.memoryAccesses) {
       if (!accessGroups.empty() && accessGroups.back().store == access.store &&
@@ -1651,9 +1562,6 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
           stage.features.conditionalBranchCount != 0)
         break;
       auto measuredAccess = access;
-      // Repeated stores that each require an exchange are separate GM batches,
-      // even if the workload representation has combined their occurrence
-      // count.
       if (hasExchange(access))
         measuredAccess.count = 1;
       auto groupCost =
@@ -1681,107 +1589,66 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
         layout.loadShapes[*shape] += access.count;
       }
     }
-    double curvedLoadOperations = 0.0;
-    double curvedStoreOperations = 0.0;
-    double curvedLoadBytes = 0.0;
-    double curvedStoreBytes = 0.0;
-    double curvedLoadWarpInstructions = 0.0;
-    double curvedStoreWarpInstructions = 0.0;
-    double curvedLoadStartup = 0.0;
-    double curvedStoreStartup = 0.0;
-    auto loadCurve = profile.continuousLoadGroupCyclesByFactorAndBytes.find(
-        superblockFactor);
-    auto storeCurve = profile.continuousStoreGroupCyclesByFactorAndBytes.find(
-        superblockFactor);
-    auto loadStartupCurve =
-        profile.continuousLoadGroupStartupCyclesByFactorAndBytes.find(
-            superblockFactor);
-    auto storeStartupCurve =
-        profile.continuousStoreGroupStartupCyclesByFactorAndBytes.find(
-            superblockFactor);
-    // These are complete contiguous-memory group envelopes. Other Stage
-    // formulas do not consume continuousLoad/StoreGroup, so removing covered
-    // bytes from their analytical resources would silently drop that work.
-    // Keep their memory on the analytical path until a compatible composite
-    // envelope is modeled explicitly.
-    if (isContinuousMemoryStage(stage.costModelKind) &&
-        loadCurve != profile.continuousLoadGroupCyclesByFactorAndBytes.end()) {
-      for (const auto &[shape, count] : work.continuousLoadCounts) {
+    struct CurvedMemoryCoverage {
+      double operations = 0.0;
+      double bytes = 0.0;
+      double warpInstructions = 0.0;
+      double startup = 0.0;
+    } curvedLoad, curvedStore;
+    auto mapContinuousCurves = [&](const auto &counts, const auto &curves,
+                                   const auto &startupCurves,
+                                   const auto &coveredShapes, double &resource,
+                                   CurvedMemoryCoverage &coverage) {
+      const auto curve = curves.find(superblockFactor);
+      if (!isContinuousMemoryStage(stage.costModelKind) ||
+          curve == curves.end())
+        return;
+      const auto startupCurve = startupCurves.find(superblockFactor);
+      for (const auto &[shape, count] : counts) {
         const auto [bytes, elements] = shape;
-        const auto covered = layout.loadShapes.find(shape);
-        const double availableCount =
-            std::max(0.0, count - (covered == layout.loadShapes.end()
-                                       ? 0.0
-                                       : covered->second));
-        if (availableCount <= 0.0)
-          continue;
-        const int64_t warpInstructions =
-            llvm::divideCeil(elements, int64_t(32));
-        // The checked-in curve is an FP32 probe. Keep dtype/element-count
-        // sensitivity explicit before rounding short operations to warps.
-        if (bytes != elements * 4)
+        const auto covered = coveredShapes.find(shape);
+        const double availableCount = std::max(
+            0.0,
+            count - (covered == coveredShapes.end() ? 0.0 : covered->second));
+        if (availableCount <= 0.0 || bytes != elements * 4)
           continue;
         auto operationCost =
-            interpolateBoundedOperationCost(loadCurve->second, bytes);
+            interpolateBoundedOperationCost(curve->second, bytes);
         if (!operationCost)
           continue;
-        resources.continuousLoadGroup += availableCount * *operationCost;
-        if (loadStartupCurve !=
-            profile.continuousLoadGroupStartupCyclesByFactorAndBytes.end()) {
+        resource += availableCount * *operationCost;
+        if (startupCurve != startupCurves.end()) {
           auto startupCost =
-              interpolateBoundedOperationCost(loadStartupCurve->second, bytes);
+              interpolateBoundedOperationCost(startupCurve->second, bytes);
           if (startupCost)
-            curvedLoadStartup = std::max(curvedLoadStartup, *startupCost);
+            coverage.startup = std::max(coverage.startup, *startupCost);
         }
-        curvedLoadOperations += availableCount;
-        curvedLoadBytes += availableCount * bytes;
-        curvedLoadWarpInstructions += availableCount * warpInstructions;
+        coverage.operations += availableCount;
+        coverage.bytes += availableCount * bytes;
+        coverage.warpInstructions +=
+            availableCount * llvm::divideCeil(elements, int64_t(32));
       }
-    }
-    if (isContinuousMemoryStage(stage.costModelKind) &&
-        storeCurve !=
-            profile.continuousStoreGroupCyclesByFactorAndBytes.end()) {
-      for (const auto &[shape, count] : work.continuousStoreCounts) {
-        const auto [bytes, elements] = shape;
-        const auto covered = layout.storeShapes.find(shape);
-        const double availableCount =
-            std::max(0.0, count - (covered == layout.storeShapes.end()
-                                       ? 0.0
-                                       : covered->second));
-        if (availableCount <= 0.0)
-          continue;
-        const int64_t warpInstructions =
-            llvm::divideCeil(elements, int64_t(32));
-        if (bytes != elements * 4)
-          continue;
-        auto operationCost =
-            interpolateBoundedOperationCost(storeCurve->second, bytes);
-        if (!operationCost)
-          continue;
-        resources.continuousStoreGroup += availableCount * *operationCost;
-        if (storeStartupCurve !=
-            profile.continuousStoreGroupStartupCyclesByFactorAndBytes.end()) {
-          auto startupCost =
-              interpolateBoundedOperationCost(storeStartupCurve->second, bytes);
-          if (startupCost)
-            curvedStoreStartup = std::max(curvedStoreStartup, *startupCost);
-        }
-        curvedStoreOperations += availableCount;
-        curvedStoreBytes += availableCount * bytes;
-        curvedStoreWarpInstructions += availableCount * warpInstructions;
-      }
-    }
-    if (curvedLoadOperations > 0.0)
-      resources.continuousLoadGroup += curvedLoadStartup;
-    if (curvedStoreOperations > 0.0)
-      resources.continuousStoreGroup += curvedStoreStartup;
+      if (coverage.operations > 0.0)
+        resource += coverage.startup;
+    };
+    // These curves are complete FP32 contiguous-memory group envelopes.
+    mapContinuousCurves(
+        work.continuousLoadCounts,
+        profile.continuousLoadGroupCyclesByFactorAndBytes,
+        profile.continuousLoadGroupStartupCyclesByFactorAndBytes,
+        layout.loadShapes, resources.continuousLoadGroup, curvedLoad);
+    mapContinuousCurves(
+        work.continuousStoreCounts,
+        profile.continuousStoreGroupCyclesByFactorAndBytes,
+        profile.continuousStoreGroupStartupCyclesByFactorAndBytes,
+        layout.storeShapes, resources.continuousStoreGroup, curvedStore);
     if (simd) {
       const double uncoveredLoadOperations =
           std::max(0.0, work.loadOperations - layout.loadOperations -
-                            curvedLoadOperations);
+                            curvedLoad.operations);
       const double uncoveredStoreOperations =
           std::max(0.0, work.storeOperations - layout.storeOperations -
-                            curvedStoreOperations);
+                            curvedStore.operations);
       const double loadSetup =
           uncoveredLoadOperations * profile.loadOperationSetupCycles;
       const double storeSetup =
@@ -1809,25 +1676,12 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
         return commonLayout &&
                std::abs(matchingOperations - uncoveredLoadOperations) <= 1.0e-9;
       }();
-      // A recurrence reissues the transfer body while retaining the MTE
-      // program on one resident logical program.  The measured operation
-      // startup is paid once when the loop is established; only byte service
-      // repeats.  Charging it in every iteration made the cost grow by
-      // k * operation_count * startup even though the generated loop contains
-      // one static transfer sequence.  Indirect-memory curves stay on their
-      // separate path above because their per-iteration address service is
-      // part of the measured envelope.
       const bool amortizeLoopTransferSetup =
           stage.costModelKind == StageCostModelKind::LoopCarriedRecurrence &&
           stage.iterationCount > 1;
       if (amortizeLoopTransferSetup)
         resources.setup += loadSetup + storeSetup;
       else if (amortizeAdditionalRowwiseLoadSetups) {
-        // Consecutive same-layout rowwise input streams share the resident
-        // address program after the primary stream is established.  Keep one
-        // load startup in every source iteration and pay each additional
-        // stream's setup once.  Byte service and every source iteration remain
-        // serialized; this is setup ownership, not loop-pipeline overlap.
         resources.setup +=
             (uncoveredLoadOperations - 1.0) * profile.loadOperationSetupCycles;
         resources.load += profile.loadOperationSetupCycles;
@@ -1838,10 +1692,10 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
         resources.store += storeSetup;
       }
       resources.load +=
-          std::max(0.0, work.loadBytes - layout.loadBytes - curvedLoadBytes) /
+          std::max(0.0, work.loadBytes - layout.loadBytes - curvedLoad.bytes) /
           profile.loadBytesPerCycle;
       resources.store += std::max(0.0, work.storeBytes - layout.storeBytes -
-                                           curvedStoreBytes) /
+                                           curvedStore.bytes) /
                          profile.storeBytesPerCycle;
       if (profile.computedAddressScalarizedLoadCyclesPerElement > 0.0) {
         for (const StageMemoryAccess &access : work.memoryAccesses) {
@@ -1852,23 +1706,15 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
               access.effectiveRank() != 1 ||
               access.provenContiguousElements() != 1)
             continue;
-          int64_t elements = 1;
-          bool validShape = !access.shape.empty();
-          for (int64_t extent : access.shape) {
-            if (extent <= 0 ||
-                elements > std::numeric_limits<int64_t>::max() / extent) {
-              validShape = false;
-              break;
-            }
-            elements *= extent;
-          }
-          if (!validShape)
+          const auto elements = accessElements(access);
+          if (!elements)
             continue;
-          if (elements < profile.computedAddressScalarizedLoadMinimumElements ||
-              elements > profile.computedAddressScalarizedLoadMaximumElements)
+          if (*elements <
+                  profile.computedAddressScalarizedLoadMinimumElements ||
+              *elements > profile.computedAddressScalarizedLoadMaximumElements)
             continue;
           const double completion =
-              access.count * elements *
+              access.count * *elements *
               profile.computedAddressScalarizedLoadCyclesPerElement;
           resources.computedAddressScalarizedLoad += completion;
           resources.load += completion;
@@ -1884,21 +1730,12 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
               access.effectiveRank() != 1 ||
               access.provenContiguousElements() != 1)
             continue;
-          int64_t elements = 1;
-          bool validShape = !access.shape.empty();
-          for (int64_t extent : access.shape) {
-            if (extent <= 0 ||
-                elements > std::numeric_limits<int64_t>::max() / extent) {
-              validShape = false;
-              break;
-            }
-            elements *= extent;
-          }
-          if (!validShape)
+          const auto elements = accessElements(access);
+          if (!elements)
             continue;
           auto completion = interpolateBoundedOperationCost(
               profile.controlFlowAddressScalarizedLoadResidualCyclesByElements,
-              elements);
+              *elements);
           if (!completion)
             continue;
           const double total = access.count * *completion;
@@ -1944,19 +1781,16 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
     } else {
       resources.load += std::max(0.0, work.loadWarpInstructions -
                                           layout.loadWarpInstructions -
-                                          curvedLoadWarpInstructions) /
+                                          curvedLoad.warpInstructions) /
                         profile.loadWarpInstructionsPerCycle;
       resources.store += std::max(0.0, work.storeWarpInstructions -
                                            layout.storeWarpInstructions -
-                                           curvedStoreWarpInstructions) /
+                                           curvedStore.warpInstructions) /
                          profile.storeWarpInstructionsPerCycle;
     }
   }
   if (!simd) {
     // Generated LDS/STS/LDK/STK streams are not semantic TTIR operations.
-    // Prefer exact lowering-provided counts; otherwise use an explicitly
-    // promoted source fit.  A missing fit remains zero rather than silently
-    // turning stack bytes into guessed instructions.
     const double fallbackLoadRate = profile.loadWarpInstructionsPerCycle;
     const double fallbackStoreRate = profile.storeWarpInstructionsPerCycle;
     if (work.sharedLocalLoadInstructions == 0.0)
@@ -1968,8 +1802,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
           sourceFitInstructions(profile.sharedStoreSourceFit, work, stage,
                                 profile, true, 0.0, wholeSimt);
     // The register-pressure observation describes the prospective whole-SIMT
-    // function.  It has no ownership correspondence to a local Mixed scope;
-    // only explicit lowering-provided private counts may be priced there.
+    // function.
     if (wholeSimt && work.privateStackLoadInstructions == 0.0)
       work.privateStackLoadInstructions = sourceFitInstructions(
           profile.privateLoadSourceFit, work, stage, profile, false, 0.0, true);
@@ -1988,31 +1821,28 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
         profile.privateStackLoadInstructionsPerCycle, fallbackLoadRate);
     const double privateStoreRate = generatedRate(
         profile.privateStackStoreInstructionsPerCycle, fallbackStoreRate);
-    if (sharedLoadInstructions > 0.0 && sharedLoadRate > 0.0) {
-      resources.sharedLocalLoad = sharedLoadInstructions / sharedLoadRate;
-      resources.load += resources.sharedLocalLoad;
-    }
-    if (sharedStoreInstructions > 0.0 && sharedStoreRate > 0.0) {
-      resources.sharedLocalStore = sharedStoreInstructions / sharedStoreRate;
-      resources.store += resources.sharedLocalStore;
-    }
-    if (privateLoadInstructions > 0.0 && privateLoadRate > 0.0) {
-      resources.privateStackLoad = privateLoadInstructions / privateLoadRate *
-                                   profile.spillTransactionCoverage;
-      resources.load += resources.privateStackLoad;
-    }
-    if (privateStoreInstructions > 0.0 && privateStoreRate > 0.0) {
-      resources.privateStackStore = privateStoreInstructions /
-                                    privateStoreRate *
-                                    profile.spillTransactionCoverage;
-      resources.store += resources.privateStackStore;
-    }
+    auto chargeGeneratedTraffic = [](double instructions, double rate,
+                                     double scale, double &component,
+                                     double &total) {
+      if (instructions <= 0.0 || rate <= 0.0)
+        return;
+      component = instructions / rate * scale;
+      total += component;
+    };
+    chargeGeneratedTraffic(sharedLoadInstructions, sharedLoadRate, 1.0,
+                           resources.sharedLocalLoad, resources.load);
+    chargeGeneratedTraffic(sharedStoreInstructions, sharedStoreRate, 1.0,
+                           resources.sharedLocalStore, resources.store);
+    chargeGeneratedTraffic(privateLoadInstructions, privateLoadRate,
+                           profile.spillTransactionCoverage,
+                           resources.privateStackLoad, resources.load);
+    chargeGeneratedTraffic(privateStoreInstructions, privateStoreRate,
+                           profile.spillTransactionCoverage,
+                           resources.privateStackStore, resources.store);
     if (const auto *floor = matchingDotComponentPrivateStackFloor(
             stage, profile, superblockFactor, wholeSimt)) {
       // Each entry prices the combined private load/store stream for one
-      // complete measured warp group. Resource fields are per logical
-      // program, and applySuperBlock multiplies a straight-line body by F
-      // exactly once.
+      // complete measured warp group.
       const double fraction =
           privateStackFloorFraction(*stage.wholeSimtRegisterPressure, *floor);
       const double combined =
@@ -2024,15 +1854,6 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
       resources.dotComponentPrivateStackFloorApplied = true;
     }
 
-    // Whole-SIMT register pressure is observed before final private-stack
-    // lowering, so a missing explicit LDK/STK count cannot mean that excess
-    // live state is free.  For a loop-carried recurrence, every excess
-    // 32-bit live unit must cross an iteration boundary.  Price one
-    // conservative private-store transaction per excess unit with the
-    // independently measured private-stack transaction rate.  Exact
-    // lowering counts and stronger dot-component floors retain ownership;
-    // this term supplies only their uncovered remainder.  Local Mixed scopes
-    // deliberately do not consume whole-function pressure facts.
     if (wholeSimt &&
         stage.costModelKind == StageCostModelKind::LoopCarriedRecurrence &&
         profile.spillTransactionsPerCycle > 0.0) {
@@ -2046,9 +1867,6 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
                                  std::max(0.0, pressureFloor - alreadyOwned));
     }
 
-    // A promoted global source fit replaces the aggregate semantic-rate
-    // portion only for an otherwise unclassified Stage.  Do not overwrite a
-    // measured layout/indirect envelope, which has stronger evidence.
     if (work.indirectLoadCounts.empty() &&
         work.segmentedIndirectLoadCounts.empty() &&
         work.continuousLoadCounts.empty() &&
@@ -2093,16 +1911,6 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
           count * instructions / profile.predicateOperationsPerCycle;
     }
   }
-  // A SIMD row reduction is a source-level operation with its own measured
-  // startup and asymptotic lane-step rate.  Equating it to vectorWidth lanes
-  // per cycle overprices the compiler's reduction pipeline.  SIMT retains the
-  // measured warp-shuffle fallback until it has a separate reduction fit.
-  // The measured SIMD fixed term initializes the reduction machinery for one
-  // dynamic Stage invocation.  Multiple reductions fused into the same Stage
-  // (for example max and sum in a rowwise normalization body) share that
-  // initialization; their lane-step work remains fully additive.  Preserve a
-  // fractional owner produced by workload normalization without charging more
-  // than one fixed startup per invocation.
   const double simdReductionStartupOwners =
       std::min(1.0, std::max(0.0, work.reductionOperations));
   resources.reduction =
@@ -2132,9 +1940,8 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
                    static_cast<double>(rows) * extent * resultScale /
                        profile.scalarizedMultiResultReductionElementsPerCycle);
     }
-    // The scalar loop is the concrete lowering of the same semantic
-    // reduction already priced above.  It replaces that optimistic vector
-    // envelope rather than adding a second copy of the reduction.
+    // The scalar loop is the concrete lowering of the same semantic reduction
+    // already priced above.
     resources.reduction =
         std::max(resources.reduction, resources.scalarizedMultiResultReduction);
   }
@@ -2184,8 +1991,6 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
           count * (profile.sortSetupCycles + rows / profile.sortRowsPerCycle);
     }
     // ascend.sort previously contributed only to the generic issue floor.
-    // Native vsort service is additional execution work, while its front-end
-    // issue remains a competing bound in serialBody().
     resources.compute += resources.sort;
   }
   if (simd && !work.oneTripMaskedAccumulatorReductionExtents.empty()) {
@@ -2230,18 +2035,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
   if (!simd && stage.costModelKind == StageCostModelKind::RowwiseReduction &&
       resources.rowwiseReductionGroupBody == 0.0) {
     // The generic shuffleLaneSteps workload counts source lanes at every
-    // reduction level.  That is the right logical-work quantity for SIMD,
-    // but applying it directly to SIMT makes an extent-1024 row look like
-    // 1024 lanes execute every one of the ten tree levels.  A SIMT warp first
-    // accumulates ceil(extent / 32) elements per lane and then performs only
-    // log2(min(extent, 32)) cross-lane steps.  Use this analytical lowering
-    // outside the bounded measured row/extent surface.  Independent rows add
-    // issue work; they do not multiply the dependent shuffle depth.
-    // Superblock partitioning may scale the per-iteration reduction count to
-    // a fraction (for example 1/2 at F2) while retaining the same row/extent
-    // geometry.  Geometry is structural, so read it directly when the TTIR
-    // workload contains one unambiguous FP32 reduction shape.  The operation
-    // count below still scales the work charged to this iteration.
+    // reduction level.
     std::optional<std::pair<int64_t, int64_t>> geometry;
     if (work.reductionGeometryCounts.size() == 1) {
       const auto &[shape, count] = *work.reductionGeometryCounts.begin();
@@ -2304,12 +2098,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
           static_cast<int64_t>(std::ceil(work.shuffleLaneSteps)));
   }
   if (work.dotFlops > 0.0) {
-    // A Stage can own multiple tiny dots. Their setup/dependency cost is not
-    // amortized merely because Stage partitioning grouped them together.
-    // This is the cost of one Stage body on one logical-program iteration;
-    // it is deliberately not a CV-pipeline overlap model.  Cross-Stage
-    // overlap must be proven by the lowered schedule before route composition
-    // can replace a sum with a critical-path bound (see the calibration gate).
+    // A Stage can own multiple tiny dots.
     resources.dot = work.dotOperations * profile.dotSetupCycles +
                     work.dotFlops / profile.dotFlopsPerCycle;
     if (stage.features.isGridStrideLoopShell ||
@@ -2375,19 +2164,14 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
   return materializeControlFlow(stage, mode, resources, profile.controlFlow);
 }
 
-/// Balanced CV tensor partition on one AIV. Keep program/control counts and
-/// serial iteration depth intact: CV1:2 partitions payload, not the parent
-/// loop. This is an analytical partition, not proof of a particular lowered
-/// instruction sequence. Unknown memory geometry is conservatively replicated.
+/// Balanced CV tensor partition on one AIV.
 static LogicalStage perAivStage(const LogicalStage &logical, int64_t parts) {
   LogicalStage stage = logical;
   if (parts == 1)
     return stage;
   auto extent = [parts](int64_t n) { return llvm::divideCeil(n, parts); };
   StageWorkload &work = stage.workload;
-  // The TTIR segment projection describes the unsliced tensor. Until the
-  // concrete CV axis mapping is available, fall back to the existing
-  // per-operation estimate for analytically partitioned local scopes.
+  // The TTIR segment projection describes the unsliced tensor.
   work.tensorOperationWorkloads.clear();
   for (auto &entry : work.operationCounts) {
     std::map<int64_t, double> counts;
@@ -2421,10 +2205,6 @@ static LogicalStage perAivStage(const LogicalStage &logical, int64_t parts) {
   work.dotFlopCounts = std::move(dots);
 
   // Remap a one-dimensional, independent access BEFORE selecting size curves.
-  // For rank>1, TTIR geometry alone does not tell us which axis NPUIR binds
-  // to sub-blocks. Retain full access cost instead of inventing a row/column
-  // split and using a measured curve for the wrong layout. Operation startup
-  // remains one invocation on each AIV; strides are unchanged by slicing.
   for (auto &access : work.memoryAccesses) {
     const auto originalShape = accessShape(access);
     if (!originalShape || access.shape.size() != 1 ||
@@ -2489,21 +2269,14 @@ static double applySuperBlock(const LogicalStage &stage,
       resources.rowwiseReductionGroupBody > 0.0)
     return stageCycles;
   // SuperBlock creates `factor` independent logical-program groups on one
-  // physical core.  It can hide latency across those groups, but it cannot
-  // divide dependent arithmetic. Loop/branch/synchronization instructions are
-  // already part of the shared issue lower bound; their independent latency is
-  // deliberately not invented from an unidentifiable additive tuple.
+  // physical core.
   const double fixed = resources.setup;
   const double issueFloor =
       fixed + factor * iterations(stage) * resources.issue;
   if (stage.costModelKind == StageCostModelKind::ScalarStore &&
       stage.workload.scalarStoreCount > 0.0) {
     // One uniform scalar store from each resident warp is a single physical
-    // SuperBlock latency envelope.  The warps are independent and the target
-    // can keep their MTE3 waits resident together; multiplying the measured
-    // first-store fill latency by F charged serialized waits that lowering
-    // does not create.  Preserve the aggregate front-end lower bound so F
-    // stores cannot become free.
+    // SuperBlock latency envelope.
     const double oneGroupLatency =
         iterations(stage) *
         std::max(resources.scalar + resources.store, resources.issue);
@@ -2512,14 +2285,6 @@ static double applySuperBlock(const LogicalStage &stage,
   }
   if (stage.costModelKind == StageCostModelKind::RowwiseReduction &&
       resources.rowwiseReductionGroupBody == 0.0) {
-    // A reduction dependency chain is serial inside one warp and independent
-    // across the F resident warp groups.  Occupancy can cover one lane chunk
-    // per base-warp group.  Longer reduction axes require multiple serial
-    // chunks per lane.  The complete resident group covers
-    // baseWarps*F*32 lanes before another dependency envelope must be paid, so
-    // only min(F, ceil(extent/(baseWarps*F*32))) copies remain serial.  Shared
-    // issue bandwidth always scales with F.  A measured physical group
-    // surface, handled above, remains authoritative when available.
     int64_t dependencyCopies = implementation.superblockFactor;
     bool exactGeometry = !stage.workload.reductionGeometryCounts.empty();
     int64_t maximumLaneChunks = 1;
@@ -2548,29 +2313,15 @@ static double applySuperBlock(const LogicalStage &stage,
            std::max(static_cast<double>(dependencyCopies) * oneGroupDependency,
                     factor * iterations(stage) * resources.issue);
   }
-  // A recurrence is serial inside one logical program.  SuperBlock contributes
-  // F independent logical programs to the same physical program, allowing the
-  // scheduler to cover one program's dependency stalls with another program.
-  // Normalize the critical-path portion per logical program, but retain the
-  // aggregate issue floor: a larger factor cannot create additional issue
-  // bandwidth.
-  // This applies equally to whole-kernel and scope-local SuperBlock because
-  // both materializers batch complete logical programs around the Stage.
+  // A recurrence is serial inside one logical program.
   if (stage.costModelKind == StageCostModelKind::LoopCarriedRecurrence) {
-    // Resource fields describe one logical program at the aggregate rate of
-    // the selected physical active-warp count.  A physical SuperBlock group
-    // executes F such programs: occupancy can increase that aggregate rate,
-    // but it cannot erase the other F-1 programs' instructions or bytes.
     const double oneProgramExecution =
         resources.scalar + resources.load + resources.store + resources.atomic +
         resources.sharedLayout + resources.compute + resources.predicate +
         resources.reduction + resources.shuffle + resources.dot +
         controlBody(resources) + resources.spill;
-    // A measured indirect-load group replaces the corresponding analytical
-    // load instructions.  It is still memory service on the recurrence chain,
-    // so it cannot disappear merely because arithmetic criticalPath is known.
-    // Factor-specific group envelopes already describe the physical group and
-    // therefore enter once rather than being multiplied by F.
+    // A measured indirect-load group replaces the corresponding analytical load
+    // instructions.
     const double recurrenceMemoryService =
         resources.load + resources.store + resources.atomic +
         resources.continuousLoadGroup + resources.continuousStoreGroup +
@@ -2580,10 +2331,6 @@ static double applySuperBlock(const LogicalStage &stage,
             ? std::max(resources.criticalPath + recurrenceMemoryService,
                        resources.issue)
             : std::max(oneProgramExecution, resources.issue);
-    // A factor-specific recurrence curve is already the cost of the complete
-    // physical group and therefore competes once.  Analytical resource and
-    // issue bounds are per logical program and scale by F.  Private-stack
-    // traffic is an incremental stream and remains additive outside the max.
     const double groupBody = std::max(
         {oneProgramDependency, factor * oneProgramExecution,
          factor * resources.issue, resources.recurrenceGroupCriticalPath});
@@ -2600,10 +2347,7 @@ static double applySuperBlock(const LogicalStage &stage,
       (resources.continuousLoadGroup > 0.0 ||
        resources.continuousStoreGroup > 0.0 ||
        resources.indirectLoadGroup > 0.0)) {
-    // Measured envelopes already cover F programs. Uncovered transfers and
-    // other analytical resources still describe one logical program. Scale
-    // only that work, then recompute the competing bounds; scaling the final
-    // max would either multiply the envelope again or omit F-1 tails of work.
+    // Measured envelopes already cover F programs.
     auto grouped = resources;
     for (double *term :
          {&grouped.scalar, &grouped.load, &grouped.store, &grouped.sharedLayout,
@@ -2616,9 +2360,7 @@ static double applySuperBlock(const LogicalStage &stage,
   }
   const double body = std::max(0.0, stageCycles - fixed);
   // Resource rates describe aggregate throughput of the selected VF (already
-  // resolved at baseWarps * F). The group issues F programs' work at that
-  // rate. Dividing load/store/shuffle by F again double-counts the occupancy
-  // benefit. These throughput-derived terms are not dependency latencies.
+  // resolved at baseWarps * F).
   return std::max(issueFloor, fixed + factor * body);
 }
 
@@ -2629,10 +2371,6 @@ static double estimateStageBase(const LogicalStage &stage,
   const double serial = r.setup + count * serialBody(r);
   switch (stage.costModelKind) {
   case StageCostModelKind::VectorIssue:
-    // mapWorkload counts each tensor operation separately: SIMD uses
-    // ceil(elements / vectorWidth) / operation throughput, SIMT uses lane
-    // work / lane throughput. Issue is a competing bound, not scalar pricing
-    // for the vector computation, and no cross-Stage overlap is assumed.
     return serial;
   case StageCostModelKind::AutoBlockifyDispatch:
   case StageCostModelKind::AutoBlockifyLoop: {
@@ -2651,18 +2389,13 @@ static double estimateStageBase(const LogicalStage &stage,
       const double otherExecution = r.scalar + r.load + r.store + r.compute +
                                     r.predicate + r.reduction + r.shuffle +
                                     r.dot + r.sharedLayout;
-      // Covered and uncovered transfers are disjoint workloads. Neither may
-      // hide the other merely because only one shape has a measured curve.
-      // The curve already contains its address/issue/sink envelope, so retain
-      // the competing bound for non-memory operations instead of adding it.
+      // Covered and uncovered transfers are disjoint workloads.
       return r.setup + count * std::max({measuredMemory + r.load + r.store +
                                              r.sharedLayout,
                                          otherExecution, r.issue});
     }
     if (mode == StageMode::SIMD && permitsSimdOverlap(stage)) {
-      // A memory-classified Stage may still own fused TTIR arithmetic.  The
-      // DMA and vector pipes are competing resources, but the vector service
-      // cannot disappear merely because the semantic root is a load/store.
+      // A memory-classified Stage may still own fused TTIR arithmetic.
       const double vectorExecution =
           r.compute + r.dot + r.reduction + r.shuffle;
       return r.setup +
@@ -2680,9 +2413,7 @@ static double estimateStageBase(const LogicalStage &stage,
       const double loadService =
           r.load + r.continuousLoadGroup + r.indirectLoadGroup + r.sharedLayout;
       const double storeService = r.store + r.continuousStoreGroup;
-      // Model one source iteration as competing engine resources.  The source
-      // trip count remains fully serialized below; this does not divide the
-      // loop by a pipeline depth or assume overlap between iterations.
+      // Model one source iteration as competing engine resources.
       return r.setup +
              count * std::max({loadService, storeService, vectorService,
                                vectorService + r.irregularTailMaterialization,
@@ -2692,9 +2423,6 @@ static double estimateStageBase(const LogicalStage &stage,
     return serial;
   case StageCostModelKind::LoopCarriedRecurrence: {
     // Loads, stores and layout conversion feed the next recurrence value.
-    // They are serialized with the arithmetic dependency chain.  In
-    // particular, indirectLoadGroup is a replacement memory envelope, not a
-    // competing pipeline whose cost can be hidden by criticalPath.
     const double recurrenceMemoryService =
         r.load + r.store + r.continuousLoadGroup + r.continuousStoreGroup +
         r.indirectLoadGroup + r.sharedLayout;
@@ -2710,15 +2438,10 @@ static double estimateStageBase(const LogicalStage &stage,
             ? std::max(dependencyBody + recurrenceMemoryService + r.atomic,
                        r.issue)
             : serialBody(r);
-    // The calibrated curve is a lower bound for the complete reduction
-    // recurrence iteration of one physical group.  It already includes the
-    // candidate SuperBlock factor, so neither this Stage formula nor route
-    // composition may multiply it by F again.
     const double critical =
         std::max(analyticalCritical, r.recurrenceGroupCriticalPath);
     // Workload is already the aggregate work of all owned loops divided by
-    // count. A loop count is not proof of concurrent execution and cannot
-    // shorten a loop-carried chain. Any overlap needs a proven schedule.
+    // count.
     return r.setup + r.recurrenceGroupStartup + count * critical;
   }
   case StageCostModelKind::RowwiseReduction:
@@ -2729,9 +2452,7 @@ static double estimateStageBase(const LogicalStage &stage,
       return r.setup + count * std::max(r.rowwiseReductionGroupBody, r.issue);
     if (mode == StageMode::SIMD && permitsSimdOverlap(stage)) {
       // SIMD rowwise lowering exposes pointwise and reduction service as
-      // competing vector-pipe bounds.  Adding both priced the same vector
-      // issue slots twice in fused rowwise kernels.  Predicate work remains a
-      // dependency cost, and no overlap is taken across logical Stages.
+      // competing vector-pipe bounds.
       const double vectorExecution =
           r.predicate + std::max(r.compute + r.dot, r.reduction + r.shuffle) +
           r.irregularPhysicalMaterialization + r.irregularTailMaterialization;
@@ -2746,12 +2467,6 @@ static double estimateStageBase(const LogicalStage &stage,
                std::max(r.scalar + r.load + r.store + r.criticalPath, r.issue);
   case StageCostModelKind::PrefixScan: {
     if (r.gridStridePrefixScanBody > 0.0) {
-      // The SIMD Q sweep prices the complete lowered scan body, including the
-      // transfers owned by a merged PrefixScan Stage.  Adding those transfers
-      // again made the reverse-I32 control 35% too expensive.  The SIMT Q
-      // sweep was decomposed after removing those owned transfers, so it
-      // retains their serial service.  Both paths keep issue as a competing
-      // front-end floor; neither asserts pipeline overlap.
       const double ownedMemory = r.load + r.store + r.continuousLoadGroup +
                                  r.continuousStoreGroup + r.indirectLoadGroup +
                                  r.sharedLayout;
@@ -2771,10 +2486,6 @@ static double estimateStageBase(const LogicalStage &stage,
                             static_cast<double>(std::get<1>(shape)) *
                             occurrences;
       }
-      // The measured helper service is completion-inclusive: it replaces the
-      // source-level shuffle/compute/predicate/issue decomposition.  Memory
-      // that happens to be fused into this Stage remains explicit and fully
-      // serialized.
       const double ownedMemory = r.load + r.store + r.continuousLoadGroup +
                                  r.continuousStoreGroup + r.indirectLoadGroup +
                                  r.sharedLayout;
@@ -2807,10 +2518,8 @@ static double estimateStageBase(const LogicalStage &stage,
     return serial;
   default:
     if (mode == StageMode::SIMD) {
-      // Measured group envelopes replace the analytical bytes/transactions
-      // that they cover.  They must remain in the competing SIMD resource
-      // bounds; omitting them can collapse a measured indirect gather from
-      // thousands of cycles to the issue floor alone.
+      // Measured group envelopes replace the analytical bytes/transactions that
+      // they cover.
       const double loadService =
           r.load + r.continuousLoadGroup + r.indirectLoadGroup + r.sharedLayout;
       const double storeService = r.store + r.continuousStoreGroup;
@@ -2828,11 +2537,6 @@ static double estimateStageBase(const LogicalStage &stage,
 static double estimateStage(const LogicalStage &stage,
                             const HardwareProfile &profile, StageMode mode,
                             const StageResourceCycles &r) {
-  // This residual is measured by holding the complete private-stack stream
-  // out of an otherwise identical physical group.  It is therefore an
-  // incremental access/scheduling cost above the existing stage envelope,
-  // rather than another resource that can be hidden by a roofline or issue
-  // max.  Keep it outside every kind-specific early return.
   StageResourceCycles base = r;
   base.operationCompletion = 0.0;
   base.privateStackCombinedFloor = 0.0;
@@ -3167,31 +2871,80 @@ std::optional<double> StageMemoryLayoutCost::evaluate(double count) const {
   return std::isfinite(cost) ? std::optional<double>(cost) : std::nullopt;
 }
 
+namespace {
+
+static bool finitePositive(std::initializer_list<double> values) {
+  return llvm::all_of(
+      values, [](double value) { return std::isfinite(value) && value > 0.0; });
+}
+
+static bool finiteNonNegative(std::initializer_list<double> values) {
+  return llvm::all_of(values, [](double value) {
+    return std::isfinite(value) && value >= 0.0;
+  });
+}
+
+template <typename Map, typename LeafPredicate>
+static bool validPositiveKeyTree(const Map &values,
+                                 const LeafPredicate &validLeaf) {
+  return llvm::all_of(values, [&](const auto &entry) {
+    if (entry.first <= 0)
+      return false;
+    using Mapped = typename Map::mapped_type;
+    if constexpr (std::is_arithmetic_v<Mapped>) {
+      return validLeaf(entry.second);
+    } else {
+      return !entry.second.empty() &&
+             validPositiveKeyTree(entry.second, validLeaf);
+    }
+  });
+}
+
+template <typename Range>
+static bool allProfileEntriesValid(const Range &entries) {
+  return llvm::all_of(entries,
+                      [](const auto &entry) { return entry.isValid(); });
+}
+
+template <typename Curve>
+static bool sameDotDomain(const Curve &lhs, const Curve &rhs) {
+  return lhs.m == rhs.m && lhs.n == rhs.n && lhs.k == rhs.k &&
+         lhs.elementBits == rhs.elementBits &&
+         lhs.dotUseSignature == rhs.dotUseSignature;
+}
+
+template <typename Curve>
+static bool overlappingNodeRanges(const std::vector<Curve> &curves,
+                                  bool matchWarpDomain) {
+  for (auto lhs = curves.begin(); lhs != curves.end(); ++lhs)
+    for (auto rhs = std::next(lhs); rhs != curves.end(); ++rhs) {
+      if (!lhs->enabled || !rhs->enabled)
+        continue;
+      const bool sameWarpDomain =
+          !matchWarpDomain || (lhs->activeWarpCount == rhs->activeWarpCount &&
+                               lhs->superblockFactor == rhs->superblockFactor);
+      if (sameWarpDomain && sameDotDomain(*lhs, *rhs) &&
+          std::max(lhs->minimumComponentNodes, rhs->minimumComponentNodes) <=
+              std::min(lhs->maximumComponentNodes, rhs->maximumComponentNodes))
+        return true;
+    }
+  return false;
+}
+
+} // namespace
+
 bool StageModeProfile::isValid(StageMode mode) const {
-  const std::array<double, 11> common = {setupCycles,
-                                         predicateOperationsPerCycle,
-                                         shuffleLanesPerCycle,
-                                         dotSetupCycles,
-                                         dotFlopsPerCycle,
-                                         issueOperationsPerCycle,
-                                         prefixScanStepLatencyCycles,
-                                         prefixScanDependencyFactor,
-                                         static_cast<double>(vectorWidthBits),
-                                         static_cast<double>(vectorWidth),
-                                         static_cast<double>(issueWidth)};
-  if (!std::all_of(
-          common.begin(), common.end(),
-          [](double value) { return std::isfinite(value) && value > 0.0; }) ||
-      !std::isfinite(loadOperationSetupCycles) ||
-      loadOperationSetupCycles < 0.0 ||
-      !std::isfinite(storeOperationSetupCycles) ||
-      storeOperationSetupCycles < 0.0 ||
-      !std::isfinite(reductionOperationSetupCycles) ||
-      reductionOperationSetupCycles < 0.0 ||
-      !std::isfinite(reductionLaneStepsPerCycle) ||
-      reductionLaneStepsPerCycle < 0.0 ||
-      !std::isfinite(maskedAccumulatorReductionCompletionSetupCycles) ||
-      maskedAccumulatorReductionCompletionSetupCycles < 0.0 ||
+  if (!finitePositive({setupCycles, predicateOperationsPerCycle,
+                       shuffleLanesPerCycle, dotSetupCycles, dotFlopsPerCycle,
+                       issueOperationsPerCycle, prefixScanStepLatencyCycles,
+                       prefixScanDependencyFactor,
+                       static_cast<double>(vectorWidthBits),
+                       static_cast<double>(vectorWidth),
+                       static_cast<double>(issueWidth)}) ||
+      !finiteNonNegative({loadOperationSetupCycles, storeOperationSetupCycles,
+                          reductionOperationSetupCycles,
+                          reductionLaneStepsPerCycle,
+                          maskedAccumulatorReductionCompletionSetupCycles}) ||
       maximumReversePrefixScanExtent < 0)
     return false;
   const bool hasScalarizedMultiResultReduction =
@@ -3231,18 +2984,11 @@ bool StageModeProfile::isValid(StageMode mode) const {
   if (!globalLoadSourceFit.isValid() || !globalStoreSourceFit.isValid() ||
       !sharedLoadSourceFit.isValid() || !sharedStoreSourceFit.isValid() ||
       !privateLoadSourceFit.isValid() || !privateStoreSourceFit.isValid() ||
-      !std::isfinite(registerBudgetPerThread) ||
-      registerBudgetPerThread < 0.0 ||
-      !std::isfinite(spillTransactionCoverage) ||
-      spillTransactionCoverage <= 0.0 || usableUbBytes < 0 ||
-      !std::isfinite(spillTransactionsPerCycle) ||
-      spillTransactionsPerCycle < 0.0 ||
-      !std::isfinite(indirectLoadTransactionsPerCycle) ||
-      indirectLoadTransactionsPerCycle < 0.0 ||
-      !std::isfinite(indirectStoreTransactionsPerCycle) ||
-      indirectStoreTransactionsPerCycle < 0.0 ||
-      !std::isfinite(indirectDependencyLatencyCycles) ||
-      indirectDependencyLatencyCycles < 0.0 ||
+      !finiteNonNegative({registerBudgetPerThread, spillTransactionsPerCycle,
+                          indirectLoadTransactionsPerCycle,
+                          indirectStoreTransactionsPerCycle,
+                          indirectDependencyLatencyCycles}) ||
+      !finitePositive({spillTransactionCoverage}) || usableUbBytes < 0 ||
       !controlFlow.isFiniteAndNonNegative() ||
       (!atomicRates.empty() &&
        (!atomicRates.contains("default") ||
@@ -3252,12 +2998,12 @@ bool StageModeProfile::isValid(StageMode mode) const {
     return false;
   if (irregularTileCompletionEnabled &&
       (irregularTilePhysicalThresholdElements < 0 ||
-       !std::isfinite(irregularTilePhysicalExcessCyclesPerElement) ||
-       irregularTilePhysicalExcessCyclesPerElement < 0.0 ||
-       !std::isfinite(irregularTileActiveCyclesPerElement) ||
-       irregularTileActiveCyclesPerElement < 0.0 ||
-       !std::isfinite(irregularTileTailCyclesPerInactiveElement) ||
-       irregularTileTailCyclesPerInactiveElement < 0.0 ||
+       !finiteNonNegative(
+           {irregularTilePhysicalExcessCyclesPerElement,
+            irregularTileActiveCyclesPerElement,
+            irregularTileTailCyclesPerInactiveElement,
+            irregularTileAlignedFirstRowGroupCyclesPerElement,
+            irregularTileAlignedAdditionalRowGroupCyclesPerElement}) ||
        irregularTileRowGroupSize <= 0 ||
        irregularTileSmallRowMaximumRows <= 0 ||
        !std::isfinite(irregularTileLargeRowMaskedFloorScale) ||
@@ -3268,10 +3014,6 @@ bool StageModeProfile::isValid(StageMode mode) const {
        irregularTileAlignedTwoRowGroupPhysicalMaterializationScale < 0.0 ||
        irregularTileAlignedTwoRowGroupPhysicalMaterializationScale > 1.0 ||
        irregularTileLargeWorkingSetFullPhysicalMinimumBytes <= 0 ||
-       !std::isfinite(irregularTileAlignedFirstRowGroupCyclesPerElement) ||
-       irregularTileAlignedFirstRowGroupCyclesPerElement < 0.0 ||
-       !std::isfinite(irregularTileAlignedAdditionalRowGroupCyclesPerElement) ||
-       irregularTileAlignedAdditionalRowGroupCyclesPerElement < 0.0 ||
        irregularTileCompletionEvidence.empty()))
     return false;
   if (mixedParentMemoryCompletionEnabled &&
@@ -3348,61 +3090,19 @@ bool StageModeProfile::isValid(StageMode mode) const {
     return false;
   if (twoPassRowwiseOwnsSegmentedIndirectLoads && mode != StageMode::SIMT)
     return false;
-  for (const auto &floor : dotComponentPrivateStackFloors)
-    if (!floor.isValid())
-      return false;
-  for (const auto &curve : wholeSimtCompletionCurves)
-    if (!curve.isValid())
-      return false;
-  for (const auto &curve : wholeSimdCompletionCurves)
-    if (!curve.isValid())
-      return false;
-  for (auto lhs = dotComponentPrivateStackFloors.begin();
-       lhs != dotComponentPrivateStackFloors.end(); ++lhs)
-    for (auto rhs = std::next(lhs); rhs != dotComponentPrivateStackFloors.end();
-         ++rhs) {
-      if (!lhs->enabled || !rhs->enabled)
-        continue;
-      const bool sameStructuralDomain =
-          lhs->activeWarpCount == rhs->activeWarpCount &&
-          lhs->superblockFactor == rhs->superblockFactor && lhs->m == rhs->m &&
-          lhs->n == rhs->n && lhs->k == rhs->k &&
-          lhs->elementBits == rhs->elementBits &&
-          lhs->dotUseSignature == rhs->dotUseSignature;
-      const bool overlappingNodeRange =
-          std::max(lhs->minimumComponentNodes, rhs->minimumComponentNodes) <=
-          std::min(lhs->maximumComponentNodes, rhs->maximumComponentNodes);
-      if (sameStructuralDomain && overlappingNodeRange)
-        return false;
-    }
-  for (auto lhs = wholeSimtCompletionCurves.begin();
-       lhs != wholeSimtCompletionCurves.end(); ++lhs)
-    for (auto rhs = std::next(lhs); rhs != wholeSimtCompletionCurves.end();
-         ++rhs) {
-      if (!lhs->enabled || !rhs->enabled)
-        continue;
-      const bool sameStructuralDomain =
-          lhs->activeWarpCount == rhs->activeWarpCount &&
-          lhs->superblockFactor == rhs->superblockFactor && lhs->m == rhs->m &&
-          lhs->n == rhs->n && lhs->k == rhs->k &&
-          lhs->elementBits == rhs->elementBits &&
-          lhs->dotUseSignature == rhs->dotUseSignature;
-      const bool overlappingNodeRange =
-          std::max(lhs->minimumComponentNodes, rhs->minimumComponentNodes) <=
-          std::min(lhs->maximumComponentNodes, rhs->maximumComponentNodes);
-      if (sameStructuralDomain && overlappingNodeRange)
-        return false;
-    }
+  if (!allProfileEntriesValid(dotComponentPrivateStackFloors) ||
+      !allProfileEntriesValid(wholeSimtCompletionCurves) ||
+      !allProfileEntriesValid(wholeSimdCompletionCurves) ||
+      overlappingNodeRanges(dotComponentPrivateStackFloors, true) ||
+      overlappingNodeRanges(wholeSimtCompletionCurves, true))
+    return false;
   for (auto lhs = wholeSimdCompletionCurves.begin();
        lhs != wholeSimdCompletionCurves.end(); ++lhs)
     for (auto rhs = std::next(lhs); rhs != wholeSimdCompletionCurves.end();
          ++rhs) {
       if (!lhs->enabled || !rhs->enabled)
         continue;
-      const bool sameStructuralDomain =
-          lhs->m == rhs->m && lhs->n == rhs->n && lhs->k == rhs->k &&
-          lhs->elementBits == rhs->elementBits &&
-          lhs->dotUseSignature == rhs->dotUseSignature;
+      const bool sameStructuralDomain = sameDotDomain(*lhs, *rhs);
       const bool overlappingNodeRange =
           std::max(lhs->minimumComponentNodes, rhs->minimumComponentNodes) <=
           std::min(lhs->maximumComponentNodes, rhs->maximumComponentNodes);
@@ -3416,13 +3116,10 @@ bool StageModeProfile::isValid(StageMode mode) const {
           overlappingStrideRange && overlappingGroupRange)
         return false;
     }
-  const std::array<double, 4> generatedRates = {
-      sharedLocalLoadInstructionsPerCycle, sharedLocalStoreInstructionsPerCycle,
-      privateStackLoadInstructionsPerCycle,
-      privateStackStoreInstructionsPerCycle};
-  if (!std::all_of(
-          generatedRates.begin(), generatedRates.end(),
-          [](double value) { return std::isfinite(value) && value >= 0.0; }))
+  if (!finiteNonNegative({sharedLocalLoadInstructionsPerCycle,
+                          sharedLocalStoreInstructionsPerCycle,
+                          privateStackLoadInstructionsPerCycle,
+                          privateStackStoreInstructionsPerCycle}))
     return false;
   if (mode == StageMode::SIMD) {
     if (!(loadBytesPerCycle > 0.0 && storeBytesPerCycle > 0.0 &&
@@ -3556,55 +3253,27 @@ bool StageModeProfile::isValid(StageMode mode) const {
        (hasContinuousMemoryGroupCurve &&
         continuousMemoryGroupBaseWarpCount <= 0)))
     return false;
-  const bool validIndirectCurve = llvm::all_of(
-      indirectLoadSystemCyclesByWarpInstructions, [](const auto &entry) {
-        return entry.first > 0 && std::isfinite(entry.second) &&
-               entry.second > 0.0;
-      });
+  const auto positiveLeaf = [](double value) {
+    return std::isfinite(value) && value > 0.0;
+  };
+  const auto finiteLeaf = [](double value) { return std::isfinite(value); };
+  const auto validFactorCurves = [&](const auto &curves) {
+    return validPositiveKeyTree(curves, positiveLeaf);
+  };
+  const auto validFactorSurfaces = [&](const auto &surfaces) {
+    return validPositiveKeyTree(surfaces, finiteLeaf);
+  };
+  const bool validIndirectCurve = validPositiveKeyTree(
+      indirectLoadSystemCyclesByWarpInstructions, positiveLeaf);
   const bool validIndirectElementCurve =
-      llvm::all_of(indirectLoadSystemCyclesByElements, [](const auto &entry) {
-        return entry.first > 0 && std::isfinite(entry.second) &&
-               entry.second > 0.0;
-      });
+      validPositiveKeyTree(indirectLoadSystemCyclesByElements, positiveLeaf);
   const bool validIndirectStoreCurve =
-      llvm::all_of(indirectStoreSystemCyclesBySegments, [](const auto &entry) {
-        return entry.first > 0 && std::isfinite(entry.second) &&
-               entry.second > 0.0;
-      });
+      validPositiveKeyTree(indirectStoreSystemCyclesBySegments, positiveLeaf);
   const bool validDotWarpCurve =
-      llvm::all_of(dotFlopsPerCycleByWarpCount, [](const auto &entry) {
-        return entry.first > 0 && std::isfinite(entry.second) &&
-               entry.second > 0.0;
-      });
-  const bool validIndirectStartupCurve = llvm::all_of(
-      indirectLoadStartupSystemCyclesByWarpInstructions, [](const auto &entry) {
-        return entry.first > 0 && std::isfinite(entry.second) &&
-               entry.second >= 0.0;
-      });
-  auto validFactorCurves = [](const auto &curves) {
-    return llvm::all_of(curves, [](const auto &factorEntry) {
-      return factorEntry.first > 0 && !factorEntry.second.empty() &&
-             llvm::all_of(factorEntry.second, [](const auto &point) {
-               return point.first > 0 && std::isfinite(point.second) &&
-                      point.second > 0.0;
-             });
-    });
-  };
-  auto validFactorSurfaces = [](const auto &surfaces) {
-    return llvm::all_of(surfaces, [](const auto &factorEntry) {
-      return factorEntry.first > 0 && !factorEntry.second.empty() &&
-             llvm::all_of(factorEntry.second, [](const auto &firstDimension) {
-               return firstDimension.first > 0 &&
-                      !firstDimension.second.empty() &&
-                      llvm::all_of(firstDimension.second,
-                                   [](const auto &secondDimension) {
-                                     return secondDimension.first > 0 &&
-                                            std::isfinite(
-                                                secondDimension.second);
-                                   });
-             });
-    });
-  };
+      validPositiveKeyTree(dotFlopsPerCycleByWarpCount, positiveLeaf);
+  const bool validIndirectStartupCurve = validPositiveKeyTree(
+      indirectLoadStartupSystemCyclesByWarpInstructions,
+      [](double value) { return std::isfinite(value) && value >= 0.0; });
   const bool hasGridStrideCompositionResidual =
       !gridStrideIndirectDotCompositionBodyResidualByFactorAndGeometry
            .empty() ||
@@ -3672,46 +3341,11 @@ bool StageModeProfile::isValid(StageMode mode) const {
              segmentedIndirectLoadFp32GroupCyclesByFactorSegmentsAndContiguousElements) &&
          validFactorCurves(gridStrideDotCyclesByFactorAndFlops) &&
          validFactorCurves(gridStrideDotStartupCyclesByFactorAndFlops) &&
-         llvm::all_of(
-             rowwiseReductionGroupCyclesByFactorRowsAndExtent,
-             [](const auto &factorEntry) {
-               return factorEntry.first > 0 && !factorEntry.second.empty() &&
-                      llvm::all_of(
-                          factorEntry.second, [](const auto &rowEntry) {
-                            return rowEntry.first > 0 &&
-                                   !rowEntry.second.empty() &&
-                                   llvm::all_of(
-                                       rowEntry.second,
-                                       [](const auto &extentEntry) {
-                                         return extentEntry.first > 0 &&
-                                                std::isfinite(
-                                                    extentEntry.second) &&
-                                                extentEntry.second > 0.0;
-                                       });
-                          });
-             }) &&
-         llvm::all_of(
+         validPositiveKeyTree(rowwiseReductionGroupCyclesByFactorRowsAndExtent,
+                              positiveLeaf) &&
+         validPositiveKeyTree(
              rowwiseReductionGroupCyclesByOperationFactorRowsAndExtent,
-             [](const auto &operationEntry) {
-               return llvm::all_of(
-                   operationEntry.second, [](const auto &factorEntry) {
-                     return factorEntry.first > 0 &&
-                            !factorEntry.second.empty() &&
-                            llvm::all_of(
-                                factorEntry.second, [](const auto &rowEntry) {
-                                  return rowEntry.first > 0 &&
-                                         !rowEntry.second.empty() &&
-                                         llvm::all_of(
-                                             rowEntry.second,
-                                             [](const auto &extentEntry) {
-                                               return extentEntry.first > 0 &&
-                                                      std::isfinite(
-                                                          extentEntry.second) &&
-                                                      extentEntry.second > 0.0;
-                                             });
-                                });
-                   });
-             }) &&
+             positiveLeaf) &&
          llvm::all_of(
              operationRates,
              [](const auto &entry) {
@@ -3817,50 +3451,22 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
           .twoPassRowwiseCompletionResidualByFactorExtentAndProgramsPerSlot;
   table.simdTwoPassRowwiseCompletionEvidence =
       profile.simd.twoPassRowwiseCompletionEvidence;
-  table.simdSingleResultRowReductionRecurrenceCompletionEnabled =
-      profile.simd.singleResultRowReductionRecurrenceCompletionEnabled;
-  table.simdSingleResultRowReductionRecurrenceMinimumExtent =
-      profile.simd.singleResultRowReductionRecurrenceMinimumExtent;
-  table.simdSingleResultRowReductionRecurrenceMaximumExtent =
-      profile.simd.singleResultRowReductionRecurrenceMaximumExtent;
-  table.simdSingleResultRowReductionRecurrenceMinimumIterations =
-      profile.simd.singleResultRowReductionRecurrenceMinimumIterations;
-  table.simdSingleResultRowReductionRecurrenceMaximumIterations =
-      profile.simd.singleResultRowReductionRecurrenceMaximumIterations;
-  table.simdSingleResultRowReductionRecurrenceMinimumPrograms =
-      profile.simd.singleResultRowReductionRecurrenceMinimumPrograms;
-  table.simdSingleResultRowReductionRecurrenceMaximumPrograms =
-      profile.simd.singleResultRowReductionRecurrenceMaximumPrograms;
-  table.simdSingleResultRowReductionRecurrenceIterationCycles =
-      profile.simd.singleResultRowReductionRecurrenceIterationCycles;
-  table.simdSingleResultRowReductionRecurrenceStartupInterceptCycles =
-      profile.simd.singleResultRowReductionRecurrenceStartupInterceptCycles;
-  table.simdSingleResultRowReductionRecurrenceStartupSqrtProgramCycles =
-      profile.simd.singleResultRowReductionRecurrenceStartupSqrtProgramCycles;
-  table.simdSingleResultRowReductionRecurrenceEvidence =
-      profile.simd.singleResultRowReductionRecurrenceEvidence;
-  table.simtSingleResultRowReductionRecurrenceCompletionEnabled =
-      profile.simt.singleResultRowReductionRecurrenceCompletionEnabled;
-  table.simtSingleResultRowReductionRecurrenceMinimumExtent =
-      profile.simt.singleResultRowReductionRecurrenceMinimumExtent;
-  table.simtSingleResultRowReductionRecurrenceMaximumExtent =
-      profile.simt.singleResultRowReductionRecurrenceMaximumExtent;
-  table.simtSingleResultRowReductionRecurrenceMinimumIterations =
-      profile.simt.singleResultRowReductionRecurrenceMinimumIterations;
-  table.simtSingleResultRowReductionRecurrenceMaximumIterations =
-      profile.simt.singleResultRowReductionRecurrenceMaximumIterations;
-  table.simtSingleResultRowReductionRecurrenceMinimumPrograms =
-      profile.simt.singleResultRowReductionRecurrenceMinimumPrograms;
-  table.simtSingleResultRowReductionRecurrenceMaximumPrograms =
-      profile.simt.singleResultRowReductionRecurrenceMaximumPrograms;
-  table.simtSingleResultRowReductionRecurrenceIterationCycles =
-      profile.simt.singleResultRowReductionRecurrenceIterationCycles;
-  table.simtSingleResultRowReductionRecurrenceStartupInterceptCycles =
-      profile.simt.singleResultRowReductionRecurrenceStartupInterceptCycles;
-  table.simtSingleResultRowReductionRecurrenceStartupSqrtProgramCycles =
-      profile.simt.singleResultRowReductionRecurrenceStartupSqrtProgramCycles;
-  table.simtSingleResultRowReductionRecurrenceEvidence =
-      profile.simt.singleResultRowReductionRecurrenceEvidence;
+  const auto singleResultReduction = [](const StageModeProfile &mode) {
+    return StageCostTable::SingleResultReductionCompletion{
+        mode.singleResultRowReductionRecurrenceCompletionEnabled,
+        mode.singleResultRowReductionRecurrenceMinimumExtent,
+        mode.singleResultRowReductionRecurrenceMaximumExtent,
+        mode.singleResultRowReductionRecurrenceMinimumIterations,
+        mode.singleResultRowReductionRecurrenceMaximumIterations,
+        mode.singleResultRowReductionRecurrenceMinimumPrograms,
+        mode.singleResultRowReductionRecurrenceMaximumPrograms,
+        mode.singleResultRowReductionRecurrenceIterationCycles,
+        mode.singleResultRowReductionRecurrenceStartupInterceptCycles,
+        mode.singleResultRowReductionRecurrenceStartupSqrtProgramCycles,
+        mode.singleResultRowReductionRecurrenceEvidence};
+  };
+  table.simdSingleResultReduction = singleResultReduction(profile.simd);
+  table.simtSingleResultReduction = singleResultReduction(profile.simt);
   table.mixedParentMemoryCompletionEnabled =
       profile.simd.mixedParentMemoryCompletionEnabled;
   table.mixedParentMemoryMinimumIterations =
@@ -3929,9 +3535,7 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
       for (int64_t factor : stage.legalSimtFactors)
         implementations.push_back({StageMode::SIMT, factor, false});
     // Report mode estimates every Stage's SIMT body, whether or not an anchor
-    // exists. The online selector evaluates only materializable local scopes;
-    // those are the only local candidates that can affect a route decision.
-    // Both paths still use this one formula to prevent calibration drift.
+    // exists.
     for (int64_t factor : {1, 2, 4}) {
       if (factor > profile.maximumSimtEstimationFactor &&
           !llvm::is_contained(stage.localSimtFactors, factor))
@@ -4033,9 +3637,6 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
       if (stage.costModelKind == StageCostModelKind::VectorIssue)
         cost.formulaEvidence += "+elementwise_workload";
 
-      // Numeric operations can live inside reduction, recurrence, scan, dot
-      // and memory-dominated Stages as well as a VectorIssue Stage. Keep their
-      // execution coverage visible in every formula report.
       bool usedSaturatedComputeFallback = false;
       bool hasUnprofiledExecution = false;
       for (const auto &entry : stage.workload.operationCounts) {
@@ -4131,10 +3732,7 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
         cost.cvPartitionIdealTotalCycles = cost.totalCycles;
         cost.cvPartitionPayloadEfficiency =
             profile.scopeHandoff.cvPartitionPayloadEfficiency;
-        // CV1:N is not guaranteed to realize an ideal N-way speedup.  Blend
-        // the ideal partitioned estimate toward the same implementation's
-        // unpartitioned payload cost.  Setup/control work is unchanged in the
-        // two estimates and therefore cancels from the correction naturally.
+        // CV1:N is not guaranteed to realize an ideal N-way speedup.
         if (cost.cvPartitionPayloadEfficiency < 1.0) {
           auto fullResources =
               mapWorkload(stage, modeProfile, implementation.mode,

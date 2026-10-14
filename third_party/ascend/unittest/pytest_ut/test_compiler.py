@@ -190,7 +190,7 @@ def test_legacy_bisheng_options_launch_uses_backend_defaults(backend, value):
     kwargs = {"bisheng_options": value}
 
     with pytest.warns(FutureWarning, match="bisheng_options.*backend-managed"):
-        options, signature, constexprs, attrs = kernel._pack_args(backend, kwargs, {}, [], None)
+        options, signature, constexprs, attrs = kernel._pack_args(backend, kwargs, {}, [], {})
 
     assert kwargs == {"bisheng_options": value}
     assert options.bisheng_options == "-cce-link-aicore-ll-module " + compiler.get_libdevice()

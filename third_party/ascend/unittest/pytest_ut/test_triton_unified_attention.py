@@ -20,6 +20,15 @@ QDTYPES = [None]
 NUM_BLOCKS = [32768, 2048]
 
 
+@pytest.fixture(autouse=True)
+def restore_default_device():
+    previous_device = torch.get_default_device()
+    try:
+        yield
+    finally:
+        torch.set_default_device(previous_device)
+
+
 @triton.jit
 def cdiv_fn(x, y):
     return (x + y - 1) // y

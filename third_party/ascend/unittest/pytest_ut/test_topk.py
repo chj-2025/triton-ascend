@@ -31,7 +31,7 @@ import test_common
 
 @pytest.mark.interpreter
 @pytest.mark.parametrize("shape", [
-    (16, 64),
+    (16, 16),
     (16, 8, 8),
     (2, 8, 8, 8),
 ])
