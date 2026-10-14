@@ -242,7 +242,7 @@ diff --git a/bin/RegisterTritonDialects.h b/bin/RegisterTritonDialects.h
 index 48049f026..e96284bc2 100644
 --- a/bin/RegisterTritonDialects.h
 +++ b/bin/RegisterTritonDialects.h
-@@ -1,6 +1,37 @@
+@@ -1,6 +1,38 @@
  #pragma once
 +#include "ascend/include/AutoBlockify/Passes.h"
 +#include "ascend/include/AutoBlockifyV1/Passes.h"

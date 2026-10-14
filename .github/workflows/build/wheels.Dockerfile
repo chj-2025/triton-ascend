@@ -8,7 +8,13 @@ FROM ${MANYLINUX_IMAGE} AS builder
 # ---------------------------------------------------------------------------
 # Build dependencies (matching CIBW_BEFORE_ALL)
 # ---------------------------------------------------------------------------
-RUN dnf install -y clang lld ccache cmake
+# ca-certificates: the SWR-mirrored manylinux image can carry a stale or
+# incomplete CA trust store, which makes Python's urlopen fail TLS verification
+# when setup.py downloads the LLVM package from OBS
+# (SSL: CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate).
+# Reinstall the trust store and regenerate the bundle before building.
+RUN dnf install -y clang lld ccache cmake ca-certificates \
+    && update-ca-trust extract
 
 # ---------------------------------------------------------------------------
 # Build args — set by the workflow matrix
@@ -29,6 +35,7 @@ WORKDIR /project
 # Environment matching the original CIBW_ENVIRONMENT
 # ---------------------------------------------------------------------------
 ENV MAX_JOBS=${MAX_JOBS} \
+    SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt \
     TRITON_BUILD_WITH_CLANG_LLD=true \
     TRITON_BUILD_PROTON=OFF \
     TRITON_WHEEL_NAME=triton-ascend \
