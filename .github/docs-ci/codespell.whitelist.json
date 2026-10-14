@@ -22,6 +22,7 @@
   "llir",
   "FFTS",
   "HIVM",
+  "NPUIR",
   "linearization",
   "Blockify",
   "inplace",

@@ -104,12 +104,7 @@ static bool pointerDependsOnLoadedIndex(Operation *memoryOp) {
       continue;
 
     // Only shaped SSA values can carry a loaded index independently across
-    // tensor lanes.  Once a tensor has been reduced/extracted to a scalar,
-    // broadcasting that scalar changes the common base (or stride) but does
-    // not create a gather.  Following the scalar back through a reduction
-    // incorrectly classified regular tiles such as
-    //   splat(reduce(load(indices))) + row * stride + column
-    // as one indirect access per element.
+    // tensor lanes.
     if (!isa<ShapedType>(value.getType()))
       continue;
 
@@ -245,9 +240,7 @@ static bool isTriangularSolveLoop(Operation *op) {
   if (!hasVectorLoad || !hasAxisZeroReduce || !hasMaskedUpdate)
     return false;
 
-  // The production solve_tril kernel has one block-update loop.  Its
-  // iter_args carry the 16x16 triangular state; requiring that fixed state
-  // shape keeps this single-loop form distinct from a generic vector reduce.
+  // The production solve_tril kernel has one block-update loop.
   bool hasTriangularState = false;
   for (BlockArgument argument : body.getArguments()) {
     if (auto type = dyn_cast<RankedTensorType>(argument.getType()))
@@ -256,9 +249,6 @@ static bool isTriangularSolveLoop(Operation *op) {
                             type.getShape()[1] == 16;
   }
 
-  // Multi-loop lowering variants use two or more sibling block-update loops;
-  // retain that form for kernels whose state shape is not explicit in the
-  // loop arguments.
   Block *parentBlock = op->getBlock();
   if (!parentBlock)
     return false;
@@ -315,12 +305,9 @@ static TriangularSolveFacts analyzeTriangularSolveFacts(Operation *anchor) {
   }
 
   // The recognized 16x16 recurrence updates rows [2, 16), hence 14 modeled
-  // trips per full block.  Keep the start row explicit so structural matching
-  // and reports do not hide that structural assumption in a magic trip count.
+  // trips per full block.
   facts.recurrenceStartRow = 2;
-  // recurrenceLoopCount is consumed by StageCostModel as N_iter.  It must be
-  // the dynamic body execution count, not the number of sibling scf.for ops.
-  // A full 16x16 block updates rows [2, 16), hence 14 iterations.
+  // recurrenceLoopCount is consumed by StageCostModel as N_iter.
   facts.recurrenceLoopCount =
       facts.blockRows > facts.recurrenceStartRow
           ? recurrenceLoopOps * (facts.blockRows - facts.recurrenceStartRow)
@@ -345,9 +332,8 @@ static bool isMovableTriangularTensorSetup(Operation *op) {
                     [](Type type) { return isa<RankedTensorType>(type); }))
     return false;
   llvm::StringRef name = op->getName().getStringRef();
-  // Triton hoists both integer offset splats and floating-point zero splats
-  // out of a hand-written scope. Keep all arith.constant ops as captures so
-  // the automatically materialized scope has the same boundary contract.
+  // Triton hoists both integer offset splats and floating-point zero splats out
+  // of a hand-written scope.
   return name == "tt.make_range" || name == "tt.expand_dims" ||
          name == "tt.broadcast" || name == "tt.splat" || name == "arith.cmpi" ||
          name == "arith.cmpf" || name == "arith.andi" || name == "arith.ori" ||
@@ -362,11 +348,7 @@ static Operation *getTopLevelOwnerInBlock(Operation *op, Block *block) {
 }
 
 /// Return the exact TTIR operations represented by the hand-written
-/// triangular-solve scope. The four 16x16 input loads stay outside. Pure
-/// ranked-tensor mask setup is moved after those loads, then the sibling
-/// recurrences and final diagonal updates execute inside the scope. The dense
-/// tt.dot tail remains outside. Keeping this in analysis makes the plan
-/// authoritative; the materializer must not rediscover a different set.
+/// triangular-solve scope.
 static llvm::SmallVector<Operation *, 0>
 collectTriangularSolveScopeOperations(Operation *anchor,
                                       Operation *&insertionPoint) {
@@ -419,11 +401,8 @@ collectTriangularSolveScopeOperations(Operation *anchor,
   if (recurrenceRange.empty() || recurrenceRange.back() != end)
     return {};
 
-  // In the unscope source, o_i/m_A/m_I are constructed before the initial
-  // block loads. The hand-written scope constructs them after the loads.
-  // Pull in only a side-effect-free ranked-tensor backward slice whose uses
-  // are entirely inside the selected scope; scalar/pointer setup and all
-  // memory operations remain captures outside.
+  // In the unscope source, o_i/m_A/m_I are constructed before the initial block
+  // loads.
   llvm::DenseSet<Operation *> setupCandidates;
   llvm::SmallVector<Value, 16> worklist;
   for (Operation *op : recurrenceRange) {

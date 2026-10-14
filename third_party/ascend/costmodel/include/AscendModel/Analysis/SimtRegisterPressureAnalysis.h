@@ -9,10 +9,7 @@
 namespace mlir::ascend {
 
 /// Analyze liveness over the whole prospective pure-SIMT function, not each
-/// Stage in isolation. The result is a TTIR pressure proxy, NOT a register
-/// allocation prediction or a proven lower bound. No performance is charged.
-/// baseWarpCount maps one logical program; SuperBlock replication must not
-/// multiply its per-thread live state. Local scopes need separate analysis.
+/// Stage in isolation.
 class SimtRegisterPressureAnalysis {
 public:
   llvm::Error analyze(ModuleOp module, StagePartition &partition,

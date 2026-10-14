@@ -81,11 +81,6 @@ static bool isMemoryMaskOnlyValue(Value value);
 static bool shouldSplitLoopBodyIntoStages(Operation *operation);
 static bool isGridStrideLoop(Operation *operation);
 
-/// True when a loop argument only participates in address induction or in
-/// masking the accesses that addressing guards. Such a value is an
-/// implementation recurrence that later pointer canonicalization can
-/// eliminate; it is not an algorithmic loop-carried dependency and must not
-/// disable the SIMD independent-loop roofline model.
 static bool isAddressOnlyLoopValue(Value root) {
   llvm::SmallVector<Value, 8> worklist{root};
   llvm::DenseSet<Value> visited;
@@ -148,8 +143,7 @@ static double getValueBytes(Value value) {
 
 static double getOperationElements(Operation *operation) {
   // Histogram result width is the number of bins, while the helper consumes
-  // every source element.  Counting only the result made M=256 and M=2048
-  // indistinguishable whenever BINS was unchanged.
+  // every source element.
   if (operation->getName().getStringRef() == "tt.histogram" &&
       operation->getNumOperands() > 0)
     return getTypeElementCount(operation->getOperand(0).getType());
@@ -171,12 +165,6 @@ static bool isDotOperationName(llvm::StringRef name) {
   return name == "tt.dot" || name == "tt.dot_scaled";
 }
 
-/// Return true when an otherwise-unclassified TTIR operation represents
-/// numeric execution rather than shape, address, layout, or bookkeeping work.
-/// These operations use the measured FP32 saturated arithmetic rate as a
-/// conservative execution lower bound until an operation-specific rate is
-/// available. Keep the original operation name in the workload key so reports
-/// show exactly which TTIR computation consumed the fallback.
 static bool isSaturatedComputeFallback(Operation *operation) {
   if (!operation)
     return false;
@@ -211,16 +199,12 @@ static bool isSaturatedComputeFallback(Operation *operation) {
         return isa<FloatType, IntegerType, IndexType>(scalar);
       });
 
-  // Arithmetic and math dialect operations with a numeric result are
-  // executable ALU work. Specific high-cost operations are mapped before this
-  // fallback; this branch guarantees that the remaining TTIR operations do
-  // not disappear from C_compute.
+  // Arithmetic and math dialect operations with a numeric result are executable
+  // ALU work.
   if (name.starts_with("arith.") || name.starts_with("math."))
     return hasNumericResult;
 
-  // Triton elementwise operations that survive into TTIR. Pointer/shape/view
-  // operations are deliberately absent: they are accounted by address issue,
-  // memory geometry, or layout models rather than FP32 arithmetic throughput.
+  // Triton elementwise operations that survive into TTIR.
   if (name == "tt.mulhiui" || name == "tt.extern_elementwise")
     return hasNumericResult;
   if (name == "tt.elementwise_inline_asm")
@@ -231,10 +215,7 @@ static bool isSaturatedComputeFallback(Operation *operation) {
   // non-zero execution floor; pointer-valued operations remain excluded.
   if (!operation->hasTrait<OpTrait::Elementwise>())
     // Keep future TTIR numeric execution visible even when the new operation
-    // does not declare Elementwise.  Every currently structural, address,
-    // memory, collective and layout-only TT operation is excluded above; an
-    // unrecognized numeric TT result is safer as a named non-zero execution
-    // lower bound than as a silent issue-only operation.
+    // does not declare Elementwise.
     return name.starts_with("tt.") && hasNumericResult;
   return hasNumericResult;
 }
@@ -248,10 +229,7 @@ static std::string getProfileOperationName(Operation *operation) {
   }
   if (name == "tt.extern_elementwise") {
     // Extern elementwise is a transport op: the symbol carries the actual
-    // numerical semantics.  Reuse a measured execution class only when the
-    // mapping is unambiguous.  Unknown helpers retain the symbol in their
-    // fallback key so a later microbenchmark can override that helper without
-    // adding another C++ allowlist entry.
+    // numerical semantics.
     if (auto symbol = operation->getAttrOfType<StringAttr>("symbol")) {
       const llvm::StringRef value = symbol.getValue();
       if (value.contains("relu"))
@@ -331,9 +309,7 @@ static RankedTensorType getRepresentativeTensorType(Operation *operation) {
   return representative;
 }
 
-/// Project the dense static subset of HIVM's pointwise reassociation. Unit
-/// axes disappear; adjacent axes merge only while every tensor operand keeps
-/// the same broadcast role. The final run is the SIMD segment width.
+/// Project the dense static subset of HIVM's pointwise reassociation.
 static int64_t getPostFlattenPointwiseRun(Operation *operation,
                                           RankedTensorType outputType) {
   SmallVector<int64_t> activeAxes;
@@ -457,10 +433,8 @@ static void accumulateDotWorkload(Operation *operation, StageWorkload &work) {
   }
 }
 
-/// Classify a scan from the operation that directly defines each
-/// tt.scan.return operand. Diagnostic operations in the combine region (for
-/// example integer-overflow assertions) are deliberately ignored because
-/// they do not define the associative value returned by the region.
+/// Classify a scan from the operation that directly defines each tt.scan.return
+/// operand.
 static std::string classifyScanCombine(Operation *scan) {
   if (!scan || scan->getName().getStringRef() != "tt.scan" ||
       scan->getNumRegions() == 0)
@@ -626,9 +600,6 @@ struct MaskedAccumulatorDerivation {
   bool hasMatchingLoad = false;
 };
 
-/// Prove that a loop contribution is composed only from constants and
-/// arithmetic rooted in zero-filled loads guarded by the loop's active-prefix
-/// bound. Unknown operations and external block arguments stop the proof.
 static MaskedAccumulatorDerivation
 analyzeMaskedAccumulatorContribution(Value value, Value bound,
                                      unsigned depth = 0) {
@@ -666,10 +637,6 @@ analyzeMaskedAccumulatorContribution(Value value, Value bound,
   return result;
 }
 
-/// Return the exact active reduction extent when the reduction operand is a
-/// physically wide accumulator produced by one loop iteration. The proof is
-/// deliberately narrow: zero init, additive loop carry, and a zero-filled
-/// prefix-masked load using the same exact runtime upper bound.
 static std::optional<int64_t>
 getOneTripMaskedAccumulatorExtent(Operation *reduction,
                                   int64_t physicalExtent) {
@@ -881,10 +848,6 @@ static bool isDiagnosticAssertionSink(Operation *operation) {
   return name == "tt.assert" || name == "cf.assert";
 }
 
-/// Return whether an operation is a side-effect-free building block emitted
-/// only to compute a diagnostic assertion condition.  Keep this list narrow:
-/// an operation is excluded from the workload only when every result use also
-/// reaches an assertion through this same allowlist.
 static bool isDiagnosticAssertionSupport(Operation *operation) {
   if (!operation || operation->getNumRegions() != 0)
     return false;
@@ -920,10 +883,6 @@ static bool isElidedDiagnosticOnlyOperationImpl(
   return hasUse;
 }
 
-/// Triton debug overflow checks appear in TTIR as arithmetic feeding
-/// tt.assert, but Ascend lowering removes the complete chain from NPUIR.  Such
-/// diagnostic-only IR must not consume SIMD/SIMT issue or execution resources.
-/// A shared value with any real consumer remains fully counted.
 static bool isElidedDiagnosticOnlyOperation(Operation *operation) {
   llvm::SmallPtrSet<Operation *, 16> visiting;
   return isElidedDiagnosticOnlyOperationImpl(operation, visiting);
@@ -946,11 +905,8 @@ static bool isStaticAddressForwardingOperation(Operation *operation) {
       .Default(false);
 }
 
-/// Prove that a TTIR value is only static affine address scaffolding for a
-/// flat contiguous transfer.  The Ascend lowering folds this DAG into the DMA
-/// descriptor, so charging its tensor-shaped arithmetic in addition to the
-/// memory service double counts work.  Any data use, indirect address, mask,
-/// control use, or unknown layout stops the proof.
+/// Prove that a TTIR value is only static affine address scaffolding for a flat
+/// contiguous transfer.
 static FoldedAddressProof
 proveFoldedFlatAddressUses(Operation *operation,
                            llvm::SmallPtrSetImpl<Operation *> &visiting) {
@@ -1011,10 +967,6 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work,
   if (!operation || operation->hasTrait<OpTrait::IsTerminator>())
     return;
   const llvm::StringRef name = operation->getName().getStringRef();
-  // Generic/unregistered TTIR used by diagnostics and unit tests does not
-  // carry the registered IsTerminator trait.  Region return/yield operations
-  // are still structural terminators and must never become issue or execution
-  // work merely because their dialect was intentionally left unregistered.
   if (name.ends_with(".return") || name.ends_with(".yield"))
     return;
   if (isElidedDiagnosticOnlyOperation(operation))
@@ -1024,26 +976,16 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work,
       name == "tt.map_elementwise")
     return;
   const double elements = getOperationElements(operation);
-  // A tt.map_elementwise region is scalar in TTIR but the Ascend lowering
-  // promotes each region operation to the map's complete tensor shape.  Keep
-  // that tensor width on both issue and execution work; multiplying scalar
-  // operation count by the element count would invent one scalar instruction
-  // per element and lose 2048-bit SIMD segmentation.
   const double executionElements =
       mappedTensor ? static_cast<double>(mappedTensor.getNumElements())
                    : elements;
   if (isFoldedFlatAddressScaffolding(operation)) {
-    // Keep route-neutral semantic work visible for SIMT, whose lane lowering
-    // can still issue these operations.  SIMD recognizes this reserved class
-    // as address work folded into the already-priced flat DMA descriptor.
     work.operationCounts["simd.folded_flat_address"]
                         [static_cast<int64_t>(elements)] += 1.0;
     return;
   }
 
-  // Some post-layout IRs expose shared/local traffic directly.  Count those
-  // semantic vector operations when no lowering attribute supplied an exact
-  // stream count; the attribute path above remains authoritative when present.
+  // Some post-layout IRs expose shared/local traffic directly.
   const double localWarpInstructions = std::ceil(elements / 32.0);
   if ((name == "ttg.local_load" || name == "hivm.hir.local_load") &&
       !hasNumericAttr(operation,
@@ -1187,8 +1129,7 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work,
         identity &= indexed.value() == static_cast<int32_t>(indexed.index());
       if (!identity) {
         // The lowering exchanges every logical element across the moved
-        // innermost axis.  Keep this as an explicit layout workload rather
-        // than treating tt.trans as one generic vector instruction.
+        // innermost axis.
         const int64_t inner = input.getDimSize(input.getRank() - 1);
         const int64_t logical = input.getNumElements();
         if (inner > 0 && logical > 0 &&
@@ -1220,64 +1161,65 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work,
 
 static void mergeWorkload(StageWorkload &into, StageWorkload from);
 
+static constexpr double StageWorkload::*workloadScalarFields[] = {
+    &StageWorkload::scalarOperations,
+    &StageWorkload::loadBytes,
+    &StageWorkload::storeBytes,
+    &StageWorkload::loadOperations,
+    &StageWorkload::storeOperations,
+    &StageWorkload::loadWarpInstructions,
+    &StageWorkload::storeWarpInstructions,
+    &StageWorkload::sharedLocalLoadInstructions,
+    &StageWorkload::sharedLocalStoreInstructions,
+    &StageWorkload::privateStackLoadInstructions,
+    &StageWorkload::privateStackStoreInstructions,
+    &StageWorkload::reductionOperations,
+    &StageWorkload::shuffleLaneSteps,
+    &StageWorkload::dotOperations,
+    &StageWorkload::dotFlops,
+    &StageWorkload::loopBackedges,
+    &StageWorkload::conditionalBranches,
+    &StageWorkload::divergentBranches,
+    &StageWorkload::synchronizations,
+    &StageWorkload::scalarLoadCount,
+    &StageWorkload::scalarStoreCount,
+};
+
+template <typename Map> static void scaleCounts(Map &counts, double scale) {
+  for (auto &entry : counts)
+    entry.second *= scale;
+}
+
+template <typename Map> static void mergeCounts(Map &into, const Map &from) {
+  for (const auto &[key, count] : from)
+    into[key] += count;
+}
+
 static void scaleWorkload(StageWorkload &work, double scale) {
-  work.scalarOperations *= scale;
-  work.loadBytes *= scale;
-  work.storeBytes *= scale;
-  work.loadOperations *= scale;
-  work.storeOperations *= scale;
-  work.loadWarpInstructions *= scale;
-  work.storeWarpInstructions *= scale;
-  work.sharedLocalLoadInstructions *= scale;
-  work.sharedLocalStoreInstructions *= scale;
-  work.privateStackLoadInstructions *= scale;
-  work.privateStackStoreInstructions *= scale;
+  for (auto field : workloadScalarFields)
+    work.*field *= scale;
   for (auto &access : work.memoryAccesses)
     access.count *= scale;
   for (AtomicWorkload &atomic : work.atomicWorkloads) {
     atomic.logicalElements *= scale;
     atomic.logicalOperationInstances *= scale;
   }
-  for (auto &[size, count] : work.indirectLoadCounts)
-    count *= scale;
-  for (auto &[shape, count] : work.segmentedIndirectLoadCounts)
-    count *= scale;
-  for (auto &[shape, count] : work.indirectStoreCounts)
-    count *= scale;
-  for (auto &[shape, count] : work.segmentedIndirectStoreCounts)
-    count *= scale;
-  for (auto &[size, count] : work.continuousLoadCounts)
-    count *= scale;
-  for (auto &[size, count] : work.continuousStoreCounts)
-    count *= scale;
-  for (auto &[size, count] : work.predicateCounts)
-    count *= scale;
-  for (auto &[shape, count] : work.prefixScanCounts)
-    count *= scale;
-  work.reductionOperations *= scale;
-  work.shuffleLaneSteps *= scale;
-  for (auto &[shape, count] : work.reductionGeometryCounts)
-    count *= scale;
-  for (auto &[combineClass, count] : work.reductionCombineClassCounts)
-    count *= scale;
-  for (auto &[shape, count] : work.scalarizedMultiResultReductionCounts)
-    count *= scale;
-  for (auto &[shape, count] : work.sortCounts)
-    count *= scale;
-  for (auto &[shape, count] : work.oneTripMaskedAccumulatorReductionExtents)
-    count *= scale;
-  work.dotOperations *= scale;
-  for (auto &[flops, count] : work.dotFlopCounts)
-    count *= scale;
+  scaleCounts(work.indirectLoadCounts, scale);
+  scaleCounts(work.segmentedIndirectLoadCounts, scale);
+  scaleCounts(work.indirectStoreCounts, scale);
+  scaleCounts(work.segmentedIndirectStoreCounts, scale);
+  scaleCounts(work.continuousLoadCounts, scale);
+  scaleCounts(work.continuousStoreCounts, scale);
+  scaleCounts(work.predicateCounts, scale);
+  scaleCounts(work.prefixScanCounts, scale);
+  scaleCounts(work.reductionGeometryCounts, scale);
+  scaleCounts(work.reductionCombineClassCounts, scale);
+  scaleCounts(work.scalarizedMultiResultReductionCounts, scale);
+  scaleCounts(work.sortCounts, scale);
+  scaleCounts(work.oneTripMaskedAccumulatorReductionExtents, scale);
+  scaleCounts(work.dotFlopCounts, scale);
   for (auto &[key, entry] : work.dotOperandPaths)
     entry.second *= scale;
-  work.dotFlops *= scale;
-  work.loopBackedges *= scale;
-  work.conditionalBranches *= scale;
-  work.divergentBranches *= scale;
-  work.synchronizations *= scale;
-  work.scalarLoadCount *= scale;
-  work.scalarStoreCount *= scale;
   for (auto &entry : work.operationCounts)
     for (auto &[size, count] : entry.second)
       count *= scale;
@@ -1326,10 +1268,6 @@ static std::optional<int64_t> getSplatConstantInteger(Value value) {
 using TensorAffineStrides = llvm::SmallVector<std::optional<int64_t>, 4>;
 
 /// Infer the coefficient of each tensor index in a tensor-of-pointer offset.
-/// The result is expressed in pointed-to elements. Scalar values and splats
-/// are uniform across tensor lanes and therefore have zero lane stride even
-/// when their runtime value is unknown. Unknown/non-affine operations stop the
-/// proof instead of guessing a memory layout.
 static std::optional<TensorAffineStrides>
 inferTensorAffineStrides(Value value, unsigned depth = 0) {
   auto outputType = dyn_cast<RankedTensorType>(value.getType());
@@ -1453,10 +1391,6 @@ inferTensorAffineStrides(Value value, unsigned depth = 0) {
       return input;
     }
 
-    // Multiplication by a runtime scalar splat is not affine with a known
-    // coefficient, but it does preserve axes that are provably uniform. Keep
-    // those zero coefficients so an orthogonal unit-stride component can
-    // still prove a contiguous run (for example rows[index, 0:16]).
     auto lhs = inferTensorAffineStrides(definition->getOperand(0), depth + 1);
     auto rhs = inferTensorAffineStrides(definition->getOperand(1), depth + 1);
     auto isUniform = [rank](const auto &coefficients) {
@@ -1485,9 +1419,7 @@ inferTensorAffineStrides(Value value, unsigned depth = 0) {
 }
 
 /// Detect address expressions that the SIMD backend currently expands into a
-/// scalar lane loop. Keep this as source-structure provenance: the cost model
-/// still requires an unknown rank-one layout and an explicit measured profile
-/// before charging a completion term.
+/// scalar lane loop.
 static bool addressHasNonAffineTensorComputation(
     Value value, llvm::SmallPtrSetImpl<Operation *> &visited,
     unsigned depth = 0) {
@@ -1564,8 +1496,7 @@ static bool isPredicateType(Type type) {
 }
 
 /// A shape-preserving elementwise operation inherits its nonconstant tensor
-/// inputs' layout. Do not follow transposes, reshapes, loads or loop results:
-/// their physical representation requires a different lowering contract.
+/// inputs' layout.
 static bool fromDotAccumulator(Value value, unsigned depth = 0) {
   Operation *producer = value.getDefiningOp();
   if (!producer || depth >= 16)
@@ -1816,10 +1747,8 @@ static StageMemoryAccess describeMemoryAccess(Operation *operation,
   return access;
 }
 
-/// Provenance at the TTIR boundary, not a claim that arbitrary values reside
-/// in shared memory. Only a profile with a matching lowering contract may use
-/// these facts. Unknown producers, transposes, batches and non-FP32 dots fall
-/// back to the existing analytical dot model.
+/// Provenance at the TTIR boundary, not a claim that arbitrary values reside in
+/// shared memory.
 static std::optional<std::string> describeDotOperandPath(Operation *operation) {
   if (operation->getName().getStringRef() != "tt.dot" ||
       operation->getNumOperands() != 3 || operation->getNumResults() != 1)
@@ -1860,10 +1789,6 @@ static std::optional<std::string> describeDotOperandPath(Operation *operation) {
 }
 
 /// A unit inner stride does not make a rectangular block a flat transfer.
-/// Require the block-pointer strides to describe a packed tile (allowing axis
-/// permutations and ignoring singleton axes). Unknown strides retain the
-/// analytical workload; they are not evidence for the measured flat curve.
-/// Tensor-of-pointer analysis remains separate from this block-pointer check.
 static bool blockPointerCanUseFlatMemoryCurve(Value pointer, Type valueType) {
   Operation *definition = pointer.getDefiningOp();
   while (definition && definition->getName().getStringRef() == "tt.advance") {
@@ -1871,9 +1796,7 @@ static bool blockPointerCanUseFlatMemoryCurve(Value pointer, Type valueType) {
     definition = pointer.getDefiningOp();
   }
   // Plain pointers and tensor-of-pointer accesses do not carry a complete
-  // rectangular descriptor.  Keep them on the analytical/indirect path;
-  // applying a flat measured curve here was the source of the old S6/S22
-  // under-modeling.
+  // rectangular descriptor.
   if (!definition ||
       definition->getName().getStringRef() != "tt.make_tensor_ptr")
     return false;
@@ -1905,8 +1828,7 @@ static bool blockPointerCanUseFlatMemoryCurve(Value pointer, Type valueType) {
 }
 
 // A signed minimum supplies an upper bound even when its other operand is
-// runtime-dependent. Do not treat unsigned min, casts or arbitrary arithmetic
-// as signed bounds. The recursion limit also bounds analysis cost.
+// runtime-dependent.
 static std::optional<int64_t> getSignedUpperBound(Value value,
                                                   unsigned depth = 0) {
   if (auto constant = getConstantInteger(value))
@@ -1966,15 +1888,6 @@ static bool valueDependsOnProgramQuery(Value value, StringRef query,
   });
 }
 
-/// Triton grid-stride loops use
-///   for iv = program_id(0); iv < runtime_upper; iv += num_programs(0)
-/// (or the AutoBlockify equivalent with a remainder-derived lower bound).
-/// Runtime scalar arguments are attached to the analysis function before
-/// Stage partitioning.  The launch grid is supplied independently as the
-/// logical-program hint, so the slowest participating program executes
-/// ceil(runtime_upper / logical_programs) iterations.  Recognize only this
-/// structural induction form; arbitrary dynamic loops retain the existing
-/// unknown-trip fallback.
 static std::optional<int64_t>
 getGridStrideTripCount(Operation *operation, int64_t logicalProgramCountHint) {
   if (!operation || operation->getName().getStringRef() != "scf.for" ||
@@ -2047,12 +1960,6 @@ static bool hasKnownAtMostOneIteration(Operation *operation) {
 }
 
 /// Accumulate dynamic work, not merely the number of syntactic TTIR ops.
-/// A loop body appears once in TTIR but executes `tripCount` times.  The
-/// resulting total dynamic work is normalized to one Stage iteration by
-/// makePerIteration().  Consequently N_iter * C_body accounts for every
-/// loop iteration instead of accidentally counting the body once.
-/// AutoBlockify V1 is the exception: its loop is a scheduling shell and its
-/// direct body operations are already separate semantic roots.
 static void accumulateDynamicOperationTree(
     Operation *operation, StageWorkload &work, double multiplicity,
     int64_t fallbackLoopTripCount, StageModelFeatures &estimates,
@@ -2131,64 +2038,35 @@ inferRuntimeGridStrideIterations(const LogicalStage &stage,
 }
 
 static void mergeWorkload(StageWorkload &into, StageWorkload from) {
-  into.scalarOperations += from.scalarOperations;
-  into.loadBytes += from.loadBytes;
-  into.storeBytes += from.storeBytes;
-  into.loadOperations += from.loadOperations;
-  into.storeOperations += from.storeOperations;
-  into.loadWarpInstructions += from.loadWarpInstructions;
-  into.storeWarpInstructions += from.storeWarpInstructions;
-  into.sharedLocalLoadInstructions += from.sharedLocalLoadInstructions;
-  into.sharedLocalStoreInstructions += from.sharedLocalStoreInstructions;
-  into.privateStackLoadInstructions += from.privateStackLoadInstructions;
-  into.privateStackStoreInstructions += from.privateStackStoreInstructions;
+  for (auto field : workloadScalarFields)
+    into.*field += from.*field;
   into.memoryAccesses.insert(into.memoryAccesses.end(),
                              from.memoryAccesses.begin(),
                              from.memoryAccesses.end());
   llvm::append_range(into.atomicWorkloads, std::move(from.atomicWorkloads));
-  for (const auto &[size, count] : from.indirectLoadCounts)
-    into.indirectLoadCounts[size] += count;
-  for (const auto &[shape, count] : from.segmentedIndirectLoadCounts)
-    into.segmentedIndirectLoadCounts[shape] += count;
-  for (const auto &[shape, count] : from.indirectStoreCounts)
-    into.indirectStoreCounts[shape] += count;
-  for (const auto &[shape, count] : from.segmentedIndirectStoreCounts)
-    into.segmentedIndirectStoreCounts[shape] += count;
-  for (const auto &[size, count] : from.continuousLoadCounts)
-    into.continuousLoadCounts[size] += count;
-  for (const auto &[size, count] : from.continuousStoreCounts)
-    into.continuousStoreCounts[size] += count;
-  for (const auto &[size, count] : from.predicateCounts)
-    into.predicateCounts[size] += count;
-  for (const auto &[shape, count] : from.prefixScanCounts)
-    into.prefixScanCounts[shape] += count;
-  into.reductionOperations += from.reductionOperations;
-  into.shuffleLaneSteps += from.shuffleLaneSteps;
-  for (const auto &[shape, count] : from.reductionGeometryCounts)
-    into.reductionGeometryCounts[shape] += count;
-  for (const auto &[combineClass, count] : from.reductionCombineClassCounts)
-    into.reductionCombineClassCounts[combineClass] += count;
-  for (const auto &[shape, count] : from.scalarizedMultiResultReductionCounts)
-    into.scalarizedMultiResultReductionCounts[shape] += count;
-  for (const auto &[shape, count] : from.sortCounts)
-    into.sortCounts[shape] += count;
-  for (const auto &[shape, count] :
-       from.oneTripMaskedAccumulatorReductionExtents)
-    into.oneTripMaskedAccumulatorReductionExtents[shape] += count;
-  into.dotOperations += from.dotOperations;
-  for (const auto &[flops, count] : from.dotFlopCounts)
-    into.dotFlopCounts[flops] += count;
+  mergeCounts(into.indirectLoadCounts, from.indirectLoadCounts);
+  mergeCounts(into.segmentedIndirectLoadCounts,
+              from.segmentedIndirectLoadCounts);
+  mergeCounts(into.indirectStoreCounts, from.indirectStoreCounts);
+  mergeCounts(into.segmentedIndirectStoreCounts,
+              from.segmentedIndirectStoreCounts);
+  mergeCounts(into.continuousLoadCounts, from.continuousLoadCounts);
+  mergeCounts(into.continuousStoreCounts, from.continuousStoreCounts);
+  mergeCounts(into.predicateCounts, from.predicateCounts);
+  mergeCounts(into.prefixScanCounts, from.prefixScanCounts);
+  mergeCounts(into.reductionGeometryCounts, from.reductionGeometryCounts);
+  mergeCounts(into.reductionCombineClassCounts,
+              from.reductionCombineClassCounts);
+  mergeCounts(into.scalarizedMultiResultReductionCounts,
+              from.scalarizedMultiResultReductionCounts);
+  mergeCounts(into.sortCounts, from.sortCounts);
+  mergeCounts(into.oneTripMaskedAccumulatorReductionExtents,
+              from.oneTripMaskedAccumulatorReductionExtents);
+  mergeCounts(into.dotFlopCounts, from.dotFlopCounts);
   for (const auto &[key, entry] : from.dotOperandPaths) {
     into.dotOperandPaths[key].first = entry.first;
     into.dotOperandPaths[key].second += entry.second;
   }
-  into.dotFlops += from.dotFlops;
-  into.loopBackedges += from.loopBackedges;
-  into.conditionalBranches += from.conditionalBranches;
-  into.divergentBranches += from.divergentBranches;
-  into.synchronizations += from.synchronizations;
-  into.scalarLoadCount += from.scalarLoadCount;
-  into.scalarStoreCount += from.scalarStoreCount;
   for (const auto &[name, counts] : from.operationCounts)
     for (const auto &[size, count] : counts)
       into.operationCounts[name][size] += count;
@@ -2233,10 +2111,6 @@ static bool stageOwnsAnchor(const LogicalStage &stage,
   return llvm::all_of(anchor.scopeOperations, owns);
 }
 
-/// Associate exact anchor descriptors with their owning Stage after complete
-/// operation ownership has been established.  This is deliberately separate
-/// from operation assignment: anchors are materialization evidence, not a
-/// second source of Stage boundaries.
 static void attachExactAnchorOwnership(StagePartition &partition,
                                        const SimtAnchorPlan &anchorPlan) {
   for (LogicalStage &stage : partition.stages) {
@@ -2281,10 +2155,8 @@ static Operation *getTopLevelSemanticRoot(Operation *operation) {
   Operation *root = operation;
   while (Operation *parent = root->getParentOp()) {
     const llvm::StringRef parentName = parent->getName().getStringRef();
-    // AutoBlockify V1 may wrap a multi-block original function body in a
-    // newly created scf.execute_region.  That region is only a scheduling
-    // shell, so semantic roots inside it should be exposed directly instead
-    // of being owned by the execute_region.
+    // AutoBlockify V1 may wrap a multi-block original function body in a newly
+    // created scf.execute_region.
     if (isFunctionLikeTTIROp(parent) ||
         parent->hasAttr("ta.auto_blockify_v1.loop") ||
         (parentName == "scf.execute_region" &&
@@ -2315,9 +2187,7 @@ static std::vector<Operation *> collectTopLevelSemanticRoots(ModuleOp module) {
       const llvm::StringRef name = nested.getName().getStringRef();
       const bool isV1Loop = nested.hasAttr("ta.auto_blockify_v1.loop");
       // AutoBlockify V1 wraps a multi-block original function body in a new
-      // scf.execute_region.  That region is only a scheduling shell; expose
-      // its inner operations as semantic roots so the real algorithm is not
-      // hidden behind an auto_blockify_dispatch stage.
+      // scf.execute_region.
       const bool isV1ExecuteRegion =
           insideV1Loop && name == "scf.execute_region" &&
           nested.hasAttr("ta.auto_blockify_v1.schedule");
@@ -2329,10 +2199,7 @@ static std::vector<Operation *> collectTopLevelSemanticRoots(ModuleOp module) {
       }
 
       result.push_back(&nested);
-      // AutoBlockify V1's scf.for is a scheduling shell.  Own the shell as
-      // loop control, then expose its direct body operations as semantic
-      // roots.  Other structured operations remain atomic roots so their
-      // nested recurrence/reduction work is not double-owned.
+      // AutoBlockify V1's scf.for is a scheduling shell.
       if (!isV1Loop || nested.getNumRegions() == 0)
         continue;
       for (Region &region : nested.getRegions())
@@ -2439,8 +2306,6 @@ static bool operationTreeHasVectorCompute(Operation *root) {
   bool found = false;
   root->walk([&](Operation *operation) {
     // A one-element tensor is still vector work; a scalar arith.subf is not.
-    // Use IR semantics rather than a subf/name/profile whitelist. Constants
-    // and shape construction are not executed elementwise arithmetic.
     found |= hasTensorResult(operation) &&
              operation->hasTrait<OpTrait::Elementwise>() &&
              !operation->hasTrait<OpTrait::ConstantLike>();
@@ -2497,9 +2362,7 @@ static bool isIndependentStructuredLoop(Operation *operation) {
   return !operationTreeHasTrueLoopCarriedDependency(operation);
 }
 
-/// Follow scalar cast/shape helpers to a Triton launch builtin.  Grid-stride
-/// loops normally use the builtin values directly, while index casts appear
-/// after a few canonicalization pipelines.
+/// Follow scalar cast/shape helpers to a Triton launch builtin.
 static bool valueComesFrom(Value value, llvm::StringRef operationName) {
   llvm::SmallVector<Value, 8> worklist{value};
   llvm::DenseSet<Value> visited;
@@ -2531,21 +2394,13 @@ static bool isGridStrideLoop(Operation *operation) {
   Value lower = operation->getOperand(0);
   const bool directProgramId = valueComesFrom(lower, "tt.get_program_id");
   // AutoBlockify rewrites the resident program id to a remainder modulo the
-  // original program count.  The outer loop induction then arrives as a
-  // block argument, so the original get_program_id is no longer reachable;
-  // remui(..., get_num_programs) is its canonical structural replacement.
+  // original program count.
   Operation *lowerDefinition = lower.getDefiningOp();
   const bool remappedProgramId =
       lowerDefinition &&
       (lowerDefinition->getName().getStringRef() == "arith.remui" ||
        lowerDefinition->getName().getStringRef() == "arith.remsi") &&
       valueComesFrom(lower, "tt.get_num_programs");
-  // AutoBlockify V1 can also replace the source loop's program-id lower bound
-  // directly with the scheduling loop induction argument.  A block argument
-  // has no defining operation, so the two provenance checks above cannot see
-  // it.  Accept only an induction argument owned by the explicitly tagged V1
-  // scheduling loop; the num-programs step below still proves grid-stride
-  // semantics and avoids classifying arbitrary nested loops this way.
   bool autoBlockifyProgramId = false;
   if (auto blockArgument = llvm::dyn_cast<BlockArgument>(lower)) {
     Block *owner = blockArgument.getOwner();
@@ -2639,9 +2494,7 @@ static double semanticRootEntryMultiplicity(Operation *root) {
   return static_cast<double>(enclosingSplitLoopTripCount(root));
 }
 
-/// Classify one transitive semantic ownership unit.  This function consumes
-/// only TTIR structure; it does not inspect a kernel name, workload name,
-/// measured performance, or route score.
+/// Classify one transitive semantic ownership unit.
 static StageCostModelKind classifySemanticRoot(Operation *root) {
   if (root->hasAttr("ta.auto_blockify_v1.loop"))
     return StageCostModelKind::AutoBlockifyLoop;
@@ -2744,8 +2597,7 @@ static void collectOwnedOperationTree(Operation *root,
     return;
   owned.insert(root);
   // The AutoBlockify loop is intentionally split into a scheduling shell and
-  // direct semantic body roots.  Treating the shell as the owner of its body
-  // would double-own every algorithm operation.
+  // direct semantic body roots.
   if (root->hasAttr("ta.auto_blockify_v1.loop") ||
       shouldSplitLoopBodyIntoStages(root))
     return;
@@ -2793,8 +2645,6 @@ static int64_t staticTensorBytes(llvm::ArrayRef<Value> values) {
 }
 
 /// Derive the exact SSA contract of every Stage from operation ownership.
-/// Values defined outside and consumed inside are live-ins; values defined
-/// inside and consumed by any operation outside are live-outs.
 static void deriveStageLiveValues(StagePartition &partition) {
   for (LogicalStage &stage : partition.stages) {
     llvm::DenseSet<Operation *> owned;
@@ -2821,21 +2671,12 @@ static void deriveStageLiveValues(StagePartition &partition) {
 }
 
 /// Derive the physical tensor traffic of the exact local SIMT scopes that the
-/// materializer will create.  Stage live values are intentionally not used:
-/// a Stage can own SIMD operations around a much smaller local scope, and
-/// charging its complete live-out footprint would invent UB traffic.
+/// materializer will create.
 static void deriveLocalSimtScopeTraffic(StagePartition &partition,
                                         const SimtAnchorPlan &anchorPlan) {
   for (LogicalStage &stage : partition.stages) {
     stage.scopeInputTensorBytes = 0;
     stage.scopeOutputTensorBytes = 0;
-    // The current scope.scope -> HIVM conversion cannot legalize a locally
-    // wrapped atomic result/captured tensor contract: the outlined function
-    // retains MemRef block arguments and Stage2 fails.  Whole-kernel SIMT
-    // lowers the same atomic correctly, so reject only the local Mixed
-    // implementation before it can win route selection.  This is a backend
-    // materialization capability boundary for every AtomicMemory Stage, not
-    // an operator or address-shape policy.
     if (stage.costModelKind == StageCostModelKind::AtomicMemory) {
       stage.localSimtMaterializable = false;
       stage.localSuperblockMaterializable = false;
@@ -2845,9 +2686,7 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
     }
     auto merged = mergeSimtStageAnchors(anchorPlan, stage.simtAnchorIndices);
     if (!merged) {
-      // The selector materializes exactly the same merged descriptor.  A
-      // Stage whose anchors cannot form one compound scope must not remain a
-      // scored Mixed candidate and fail only after route selection.
+      // The selector materializes exactly the same merged descriptor.
       stage.localSimtMaterializable = false;
       stage.localSuperblockMaterializable = false;
       stage.localSimtFactors.clear();
@@ -2891,12 +2730,6 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
         }
       }
 
-      // TritonToUnstructure cannot reconstruct offset information for a
-      // tensor-of-pointer returned by scope.scope.  Capturing pointers is
-      // legal (the scope is not isolated from above), but returning pointer
-      // state would make this local Mixed implementation fail after route
-      // selection.  Reject that implementation before it is scored; the
-      // same Stage remains legal in a whole-kernel pure-SIMT route.
       if (llvm::any_of(returned, [](Value value) {
             return isPointerLikeType(value.getType());
           })) {
@@ -2929,12 +2762,6 @@ ProgramStructureAnalysis::analyze(ModuleOp module,
         "ProgramStructureAnalysis found no top-level TTIR operation");
 
   // Compound scopes may legally move pure tensor setup across input loads.
-  // Stage boundaries must describe the program that the selected route will
-  // materialize, rather than treating the pre-materialization textual order
-  // as immutable.  Normalize each compound anchor to its planned insertion
-  // point before StageBoundaryAnalysis performs its semantic cut.  The
-  // operation objects are not mutated here; only the analysis view is
-  // reordered.
   for (const SimtAnchorDescriptor &anchor : anchorPlan.anchors) {
     if (!anchor.materializable || anchor.scopeOperations.size() < 2 ||
         !anchor.scopeInsertionPoint)
@@ -3017,11 +2844,6 @@ static int semanticKindPriority(StageCostModelKind kind) {
   }
 }
 
-/// Scalar/vector/index/predicate work is a supporting resource of a Stage,
-/// rather than necessarily a Stage boundary of its own.  StageCostModel
-/// accounts for those resources inside every dominant model.  Keeping this
-/// distinction here prevents one Triton statement such as a masked load from
-/// being split into artificial index, predicate and memory Stages.
 static bool isSupportingSemanticKind(StageCostModelKind kind) {
   switch (kind) {
   case StageCostModelKind::ScalarIssue:
@@ -3172,10 +2994,7 @@ StageBoundaryAnalysis::analyze(const ProgramStructure &structure,
           !getSourceStatement(stage.operations.back()->getLoc()) &&
           !getSourceStatement(candidate->getLoc());
       // TRITON_DISABLE_LINE_INFO deliberately replaces source locations with
-      // unknown.  Preserve the same structural partition in that mode: a
-      // straight-line prefix of address/index/predicate resources belongs to
-      // the first dominant operation it prepares.  Stop after that dominant
-      // operation so a following compute/store statement remains a boundary.
+      // unknown.
       const bool mergeLocationlessSupportingPrefix =
           startsWithSupportingKind && !absorbedDominantWithoutSource &&
           sourceLocationsUnavailable &&
@@ -3359,13 +3178,6 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
     const bool autoBlockifyKind =
         stage.costModelKind == StageCostModelKind::AutoBlockifyDispatch ||
         stage.costModelKind == StageCostModelKind::AutoBlockifyLoop;
-    // AutoBlockify marks both the synthetic scheduling shell and region owners
-    // that can contain the complete original kernel body.  Only the former is
-    // a dispatch/loop cost model.  Treating every marked owner as a shell drops
-    // its loads, stores, dot and recurrence resources from all-SIMD routes and
-    // reduces SIMT routes to an issue-only estimate.  Classify a marked owner
-    // from its mode-independent workload whenever it owns algorithmic data
-    // work; scalar dispatch/index bookkeeping alone remains a shell.
     const bool hasAlgorithmicPayload =
         stage.workload.loadBytes > 0.0 || stage.workload.storeBytes > 0.0 ||
         stage.workload.loadOperations > 0.0 ||
@@ -3378,9 +3190,6 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
         stage.workload.scalarLoadCount > 0.0 ||
         stage.workload.scalarStoreCount > 0.0;
     // collectTopLevelSemanticRoots recursively exposes execute_region bodies.
-    // Preserve the AutoBlockify-body exception for those materialized body
-    // stages instead of treating their dot + recurrence/gather payload as an
-    // invalid unsplit top-level stage.
     const bool autoBlockifyBody =
         (autoBlockifyKind || facts.insideAutoBlockifyV1Loop) &&
         hasAlgorithmicPayload;
@@ -3403,11 +3212,7 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
         return StageCostModelKind::RowwiseReduction;
       if (facts.hasDot) {
         const int64_t tinyLimit = std::max<int64_t>(1, tinyDotFlopsMax);
-        // `dotFlops` is the sum of all matrix instances in this Stage.  A
-        // chain of nine 16x16x16 dots is still a tiny-dot workload even
-        // though its aggregate FLOPs exceed the limit.  Prefer the exact
-        // per-matrix shape map; retain the aggregate fallback for synthetic
-        // StagePartition unit tests that construct workload by hand.
+        // `dotFlops` is the sum of all matrix instances in this Stage.
         const bool allMatricesTiny =
             !stage.workload.dotFlopCounts.empty()
                 ? llvm::all_of(stage.workload.dotFlopCounts,
@@ -3581,9 +3386,7 @@ StageModeLegalityAnalysis::analyze(StagePartition &partition,
                                    int64_t maximumScopeSuperblockFactor) const {
   const int64_t maximum = std::clamp<int64_t>(maximumSuperblockFactor, 1, 64);
   // Local and whole-kernel SuperBlock candidates consume the same SIMT warp
-  // resources.  Do not regenerate F4 here after evaluateStageModel has
-  // already reduced the target maximum to F2 for num_warps=32 (or to F1 for
-  // a smaller runtime grid).
+  // resources.
   const int64_t localMaximum =
       scopeSuperblockMaterializable
           ? std::min(maximum,
@@ -3593,47 +3396,28 @@ StageModeLegalityAnalysis::analyze(StagePartition &partition,
     stage.simdLegal = true;
     stage.simtLegal = true;
     bool requiresFactorOneLocalSimt = false;
-    // The current SIMD backend materializes the common one-result associative
-    // add, multiply, min and max scans. Reject other combine graphs unless
-    // their returned values are defined by one of those supported operations.
     for (Operation *root : stage.operations) {
       root->walk([&](Operation *operation) {
         // ascend.sort lowers through the SIMD-only native vsort template.
-        // Advertising a pure or local SIMT implementation lets automatic
-        // routing select a candidate that the downstream SIMT compiler
-        // cannot parse or materialize.
         if (operation->getName().getStringRef() == "ascend.sort")
           stage.simtLegal = false;
-        // Histogram is supported by the outlined SIMT pipeline, but its
-        // tensor result is one complete bin vector per logical program.  The
-        // current scope ABI cannot safely batch several such results through
-        // one SuperBlock capture, so retain the materializable F1 scope only.
         if (operation->getName().getStringRef() == "tt.histogram")
           requiresFactorOneLocalSimt = true;
         if (operation->getName().getStringRef() != "tt.scan")
           return;
-        // Judge the combine by the values returned from the region. Integer
-        // overflow instrumentation may add casts, compares, boolean logic and
-        // tt.assert beside the actual add. Those side checks do not change the
-        // scan combine lowered by the SIMD backend and must not make an
-        // additive scan look like an unsupported combine.
+        // Judge the combine by the values returned from the region.
         if (classifyScanCombine(operation) == "other")
           stage.simdLegal = false;
       });
     }
     stage.legalSimtFactors = {1};
     // A pure-SIMT SuperBlock factor is a whole-kernel schedule, not a
-    // recurrence-only annotation.  Every SIMT Stage must therefore expose
-    // the same factor candidates; KernelRouteSolver keeps the chosen factor
-    // uniform.  Local mixed scopes stay restricted by localSimtFactors
-    // (F1 unless Scope SuperBlock materialization is explicitly available).
+    // recurrence-only annotation.
     for (int64_t factor = 2; factor <= maximum; factor *= 2)
       stage.legalSimtFactors.push_back(factor);
     if (stage.localSimtMaterializable) {
-      // The ABI-v2 scope materializer batches complete logical programs
-      // around this Stage.  F2/F4 therefore does not require multiple
-      // recurrence groups inside one logical program; that older W2/W4
-      // interpretation was only warp widening, not a SuperBlock.
+      // The ABI-v2 scope materializer batches complete logical programs around
+      // this Stage.
       stage.localSimtFactors = {1};
       if (scopeSuperblockMaterializable && stage.localSuperblockMaterializable)
         for (int64_t factor = 2; factor <= localMaximum; factor *= 2)
@@ -3681,11 +3465,8 @@ llvm::Error StageResourceLegalityAnalysis::applySimtUbCapacity(
     if (m <= 0 || n <= 0 || k <= 0 || elementBits <= 0)
       continue;
 
-    // lhs[M,K], rhs[K,N] and accumulator[M,N] are simultaneously visible at
-    // a dot in TTIR.  This upper bound is independent of the operator and of
-    // measured elapsed time.  It intentionally leaves backend streaming and
-    // reuse as future refinements instead of assuming capacity that lowering
-    // cannot guarantee.
+    // lhs[M,K], rhs[K,N] and accumulator[M,N] are simultaneously visible at a
+    // dot in TTIR.
     const __int128 elements = static_cast<__int128>(m) * k +
                               static_cast<__int128>(k) * n +
                               static_cast<__int128>(m) * n;

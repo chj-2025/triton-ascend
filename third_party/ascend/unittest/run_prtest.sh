@@ -48,7 +48,10 @@ function run_case_by_multi_card() {
 
     # run tests and capture exit status
     set +e
-    python -m pytest ${test_dir} -n auto --dist=loadfile -v --junitxml=logs/results.xml | tee logs/raw_output.log
+    # Keep one pytest worker per device.  ``-n auto`` follows the CPU count
+    # (256 on A5), which maps about 32 concurrent workers to each of the eight
+    # NPUs through conftest.py and can corrupt device-level correctness runs.
+    python -m pytest ${test_dir} -n "${NPU_DEVICES}" --dist=loadfile -v --junitxml=logs/results.xml | tee logs/raw_output.log
     pytest_exit=$?
     set -e
 

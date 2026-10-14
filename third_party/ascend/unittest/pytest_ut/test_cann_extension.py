@@ -30,7 +30,6 @@ from triton.compiler.compiler import ASTSource
 from triton.compiler.code_generator import ast_to_ttir
 from triton._C.libtriton import ir, buffer_ir
 from triton._C.libtriton.ascend import ir as ascend_ir
-from triton.compiler.errors import MLIRCompilationError
 from triton.backends.ascend import _apply_ascend_patch
 
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
@@ -247,25 +246,27 @@ def test_math_ops():
 
 def test_mem_ops():
     print("=" * 60)
-    print("Test 3: Memory Operations (EXPECTED TO FAIL)")
+    print("Test 3: Memory Operations (index_put)")
     print("=" * 60)
 
     # 构造输入（必须放在测试内，防止模块加载时报错）
-    value = torch.randn(3, 3, device='npu').half()
-    index = torch.tensor([0, 1], device='npu')
-    dst = torch.zeros(4, 2, device='npu').half()
+    dst = torch.zeros((4, 2), device='npu', dtype=torch.float32)
+    value = torch.tensor([[1., 2.], [3., 4.]], device='npu')
+    index = torch.tensor([2, 0], device='npu')
 
-    # ✅ 核心：把编译+运行的代码包在这里，pytest 才能捕获
-    with pytest.warns(FutureWarning, match="index_put"), pytest.raises(MLIRCompilationError):
-        # 这一行会触发编译，直接抛出你要的错误
+    with pytest.warns(FutureWarning, match="index_put"):
         kernel_index_put_simple[(1, )](value, index, dst)
 
-    print("✅ 成功捕获预期的 MLIRCompilationError 错误！测试通过！")
+    # dst[index[i], :] = value[i, :]
+    expected = torch.tensor([[3., 4.], [0., 0.], [1., 2.], [0., 0.]], device='cpu')
+    assert torch.allclose(dst.cpu(), expected), f"Mismatch: expected {expected}, got {dst.cpu()}"
+
+    print("✅ index_put 已支持 Ascend 950PR&950DT 并产出正确结果！测试通过！")
 
 
 def test_mem2_ops():
     print("=" * 60)
-    print("Test 3: Memory Operations (EXPECTED TO FAIL)")
+    print("Test 3: Memory Operations (gather_out_to_ub)")
     print("=" * 60)
 
     # 构造输入（必须放在测试内，防止模块加载时报错）
@@ -273,15 +274,19 @@ def test_mem2_ops():
     index = torch.tensor([[0, 1], [2, 3]], device='npu')
     out = torch.empty((2, 2), device='npu', dtype=torch.float32)
 
-    with pytest.warns(FutureWarning, match="gather_out_to_ub"), pytest.raises(MLIRCompilationError):
+    with pytest.warns(FutureWarning, match="gather_out_to_ub"):
         simple_gather_kernel[(1, )](src, index, out)
 
-    print("✅ 成功捕获预期的 MLIRCompilationError 错误！测试通过！")
+    # out[i, j] = src[index[i, j], j]
+    expected = torch.tensor([[1., 4.], [5., 8.]], device='cpu')
+    assert torch.allclose(out.cpu(), expected), f"Mismatch: expected {expected}, got {out.cpu()}"
+
+    print("✅ gather_out_to_ub 已支持 Ascend 950PR&950DT 并产出正确结果！测试通过！")
 
 
 def test_mem3_ops():
     print("=" * 60)
-    print("Test 3: Memory Operations (EXPECTED TO FAIL)")
+    print("Test 3: Memory Operations (scatter_ub_to_out)")
     print("=" * 60)
 
     # 构造输入（必须放在测试内，防止模块加载时报错）
@@ -289,15 +294,19 @@ def test_mem3_ops():
     value = torch.tensor([[1., 2.], [3., 4.]], device='npu')
     index = torch.tensor([[1, 2], [3, 0]], device='npu')
 
-    with pytest.warns(FutureWarning, match="scatter_ub_to_out"), pytest.raises(MLIRCompilationError):
+    with pytest.warns(FutureWarning, match="scatter_ub_to_out"):
         simple_scatter_kernel[(1, )](value, index, dst)
 
-    print("✅ 成功捕获预期的 MLIRCompilationError 错误！测试通过！")
+    # dst[index[i, j], j] = value[i, j]
+    expected = torch.tensor([[0., 4.], [1., 0.], [0., 2.], [3., 0.]], device='cpu')
+    assert torch.allclose(dst.cpu(), expected), f"Mismatch: expected {expected}, got {dst.cpu()}"
+
+    print("✅ scatter_ub_to_out 已支持 Ascend 950PR&950DT 并产出正确结果！测试通过！")
 
 
 def test_mem4_ops():
     print("=" * 60)
-    print("Test 3: Memory Operations (EXPECTED TO FAIL)")
+    print("Test 3: Memory Operations (scatter_ub_to_out, re-launch)")
     print("=" * 60)
 
     # 构造输入（必须放在测试内，防止模块加载时报错）
@@ -305,10 +314,17 @@ def test_mem4_ops():
     value = torch.tensor([[1., 2.], [3., 4.]], device='npu')
     index = torch.tensor([[1, 2], [3, 0]], device='npu')
 
-    with pytest.warns(FutureWarning, match="scatter_ub_to_out"), pytest.raises(MLIRCompilationError):
-        simple_scatter_kernel[(1, )](value, index, dst)
+    # The deprecation FutureWarning is emitted while tracing, so it only fires
+    # for the first launch of a given specialization (covered by test_mem3_ops).
+    # This case pins that re-launching the already-compiled kernel still
+    # produces the correct result instead of silently going wrong.
+    simple_scatter_kernel[(1, )](value, index, dst)
 
-    print("✅ 成功捕获预期的 MLIRCompilationError 错误！测试通过！")
+    # dst[index[i, j], j] = value[i, j]
+    expected = torch.tensor([[0., 4.], [1., 0.], [0., 2.], [3., 0.]], device='cpu')
+    assert torch.allclose(dst.cpu(), expected), f"Mismatch: expected {expected}, got {dst.cpu()}"
+
+    print("✅ scatter_ub_to_out 复用已编译 kernel 仍产出正确结果！测试通过！")
 
 
 def test_vec_ops():

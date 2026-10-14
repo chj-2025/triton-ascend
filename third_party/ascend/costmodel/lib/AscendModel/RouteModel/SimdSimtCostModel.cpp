@@ -1,8 +1,6 @@
 //===- SimdSimtCostModel.cpp - Ascend SIMD/SIMT candidate model ----------===//
 //
-// The numerical model in this file is the versioned C++ candidate model.  It
-// intentionally produces a relative per-program selection score, not an
-// end-to-end kernel-time prediction.
+// The numerical model in this file is the versioned C++ candidate model.
 //
 //===----------------------------------------------------------------------===//
 
@@ -45,22 +43,139 @@
 using namespace mlir;
 using namespace mlir::ascend;
 
+static bool finiteValues(std::initializer_list<double> values) {
+  return llvm::all_of(values,
+                      [](double value) { return std::isfinite(value); });
+}
+
+static bool finiteNonNegative(std::initializer_list<double> values) {
+  return llvm::all_of(values, [](double value) {
+    return std::isfinite(value) && value >= 0.0;
+  });
+}
+
+static bool finitePositive(std::initializer_list<double> values) {
+  return llvm::all_of(
+      values, [](double value) { return std::isfinite(value) && value > 0.0; });
+}
+
+bool StageRouteCompletionProfile::MultiResultPrefixScan::isValid() const {
+  if (!enabled)
+    return true;
+  return minimumPrograms > 0 && maximumPrograms >= minimumPrograms &&
+         minimumPaddedAxis > 0 && maximumPaddedAxis >= minimumPaddedAxis &&
+         requiredResultCount > 1 && requiredIndependentSequences > 0 &&
+         minimumActiveRatio > 0.0 && minimumActiveRatio <= 1.0 &&
+         maximumActiveRatio >= minimumActiveRatio &&
+         maximumActiveRatio <= 1.0 &&
+         finiteValues({minimumActiveRatio, maximumActiveRatio,
+                       elapsedInterceptCycles, elapsedPaddedAxisCycles}) &&
+         finiteNonNegative(
+             {elapsedSqrtProgramCycles, elapsedInactiveRatioCycles}) &&
+         !evidence.empty();
+}
+
+bool StageRouteCompletionProfile::PairwiseSelectionNetwork::isValid() const {
+  if (!enabled)
+    return true;
+  return minimumInputElements > 0 &&
+         maximumInputElements >= minimumInputElements &&
+         minimumOutputColumns > 0 &&
+         maximumOutputColumns >= minimumOutputColumns &&
+         minimumReductionStages > 0 && finiteValues({interceptCycles}) &&
+         finiteNonNegative({inputElementCycles, log2OutputColumnCycles}) &&
+         !evidence.empty();
+}
+
+bool StageRouteCompletionProfile::LargeSequenceMinmaxScan::isValid() const {
+  if (!enabled)
+    return true;
+  return minimumIndependentSequences > 1 &&
+         maximumIndependentSequences >= minimumIndependentSequences &&
+         minimumExtent > 1 && maximumExtent >= minimumExtent &&
+         finiteNonNegative({perIndependentSequenceSystemCycles}) &&
+         !evidence.empty();
+}
+
+bool StageRouteCompletionProfile::MultiSequenceMinmaxScan::isValid() const {
+  if (!enabled)
+    return true;
+  const bool base =
+      minimumIndependentSequences > 1 &&
+      maximumIndependentSequences >= minimumIndependentSequences &&
+      minimumExtent > 1 && maximumExtent >= minimumExtent &&
+      finiteNonNegative({baseReductionSystemCycles,
+                         perIndependentSequenceReductionSystemCycles,
+                         maximumReductionSystemCycles}) &&
+      maximumReductionSystemCycles >= baseReductionSystemCycles;
+  const bool hasLarge =
+      largeMinimumIndependentSequences != 0 ||
+      largeMaximumIndependentSequences != 0 || largeMinimumExtent != 0 ||
+      largeMaximumExtent != 0 || largeBaseReductionSystemCycles != 0.0 ||
+      largePerIndependentSequenceReductionSystemCycles != 0.0 ||
+      largeMaximumReductionSystemCycles != 0.0;
+  const bool large =
+      !hasLarge ||
+      (largeMinimumIndependentSequences > maximumIndependentSequences &&
+       largeMaximumIndependentSequences >= largeMinimumIndependentSequences &&
+       largeMinimumExtent > 1 && largeMaximumExtent >= largeMinimumExtent &&
+       finiteNonNegative({largeBaseReductionSystemCycles,
+                          largePerIndependentSequenceReductionSystemCycles,
+                          largeMaximumReductionSystemCycles}) &&
+       largeMaximumReductionSystemCycles >= largeBaseReductionSystemCycles);
+  return base && large && !evidence.empty();
+}
+
+bool StageRouteCompletionProfile::StraightLineAddReduction::isValid() const {
+  if (!enabled)
+    return true;
+  return minimumRows > 0 && maximumRows >= minimumRows && minimumExtent > 1 &&
+         maximumExtent >= minimumExtent &&
+         finiteNonNegative({sharedCompletionSystemCycles}) && !evidence.empty();
+}
+
+bool StageRouteCompletionProfile::TwoLoopSingleReduction::isValid() const {
+  if (!enabled)
+    return true;
+  return minimumSourcePrograms > 0 &&
+         maximumSourcePrograms >= minimumSourcePrograms &&
+         minimumRuntimeIterations > 0 &&
+         maximumRuntimeIterations >= minimumRuntimeIterations &&
+         requiredReductionExtent > 1 &&
+         finiteNonNegative(
+             {firstIterationSystemCycles, additionalIterationSystemCycles}) &&
+         !evidence.empty();
+}
+
+bool StageRouteCompletionProfile::isValid() const {
+  return multiResultPrefixScan.isValid() &&
+         pairwiseSelectionNetwork.isValid() &&
+         largeSequenceMinmaxScan.isValid() &&
+         multiSequenceMinmaxScan.isValid() &&
+         straightLineAddReduction.isValid() && twoLoopSingleReduction.isValid();
+}
+
 namespace {
 
 constexpr llvm::StringLiteral kAllSimd = "all_simd";
 constexpr llvm::StringLiteral kAllSimtOnly = "all_simt_only";
 constexpr llvm::StringLiteral kMixedSimdSimt = "mixed_simd_simt";
-constexpr int64_t kSupportedProfileSchemaVersion = 12;
+
+static bool isKnownRoute(llvm::StringRef route) {
+  return route == kAllSimd || route == kAllSimtOnly || route == kMixedSimdSimt;
+}
+
+static bool validNonNegativeCurve(const std::map<int64_t, double> &curve) {
+  return llvm::all_of(curve, [](const auto &entry) {
+    return entry.first > 0 && finiteNonNegative({entry.second});
+  });
+}
 
 struct StructuralProfile {
   int64_t tinyDotFlopsMax = 0;
 };
 
-/// Route-independent scalar work outside the Stage graph.  The Stage route
-/// score is already expressed in SYS_CNT cycles, so elapsed prediction adds
-/// measured kernel boundaries and structural lowering completion terms before
-/// unit conversion.  No operator identity, function name, or exact DAG
-/// signature participates in this formula.
+/// Route-independent scalar work outside the Stage graph.
 struct KernelTimingProfile {
   struct RuntimeArgumentSetup {
     int64_t freeArgumentCount = 0;
@@ -68,10 +183,9 @@ struct KernelTimingProfile {
     double incrementalExcessSystemCycles = 0.0;
 
     bool isValid() const {
-      return freeArgumentCount >= 0 && std::isfinite(firstExcessSystemCycles) &&
-             firstExcessSystemCycles >= 0.0 &&
-             std::isfinite(incrementalExcessSystemCycles) &&
-             incrementalExcessSystemCycles >= 0.0;
+      return freeArgumentCount >= 0 &&
+             finiteNonNegative(
+                 {firstExcessSystemCycles, incrementalExcessSystemCycles});
     }
 
     double cost(int64_t argumentCount) const {
@@ -80,185 +194,6 @@ struct KernelTimingProfile {
         return 0.0;
       return firstExcessSystemCycles +
              static_cast<double>(excess - 1) * incrementalExcessSystemCycles;
-    }
-  };
-
-  struct SimdMultiResultPrefixScanCompletion {
-    bool enabled = false;
-    int64_t minimumPrograms = 0;
-    int64_t maximumPrograms = 0;
-    int64_t minimumPaddedAxis = 0;
-    int64_t maximumPaddedAxis = 0;
-    int64_t requiredResultCount = 0;
-    int64_t requiredIndependentSequences = 0;
-    double minimumActiveRatio = 0.0;
-    double maximumActiveRatio = 0.0;
-    double elapsedInterceptCycles = 0.0;
-    double elapsedSqrtProgramCycles = 0.0;
-    double elapsedInactiveRatioCycles = 0.0;
-    double elapsedPaddedAxisCycles = 0.0;
-    std::string evidence;
-
-    bool isValid() const {
-      if (!enabled)
-        return true;
-      return minimumPrograms > 0 && maximumPrograms >= minimumPrograms &&
-             minimumPaddedAxis > 0 && maximumPaddedAxis >= minimumPaddedAxis &&
-             requiredResultCount > 1 && requiredIndependentSequences > 0 &&
-             std::isfinite(minimumActiveRatio) && minimumActiveRatio > 0.0 &&
-             minimumActiveRatio <= 1.0 && std::isfinite(maximumActiveRatio) &&
-             maximumActiveRatio >= minimumActiveRatio &&
-             maximumActiveRatio <= 1.0 &&
-             std::isfinite(elapsedInterceptCycles) &&
-             std::isfinite(elapsedSqrtProgramCycles) &&
-             elapsedSqrtProgramCycles >= 0.0 &&
-             std::isfinite(elapsedInactiveRatioCycles) &&
-             elapsedInactiveRatioCycles >= 0.0 &&
-             std::isfinite(elapsedPaddedAxisCycles) && !evidence.empty();
-    }
-  };
-
-  struct SimtPairwiseSelectionNetworkCompletion {
-    bool enabled = false;
-    int64_t minimumInputElements = 0;
-    int64_t maximumInputElements = 0;
-    int64_t minimumOutputColumns = 0;
-    int64_t maximumOutputColumns = 0;
-    int64_t minimumReductionStages = 0;
-    double interceptCycles = 0.0;
-    double inputElementCycles = 0.0;
-    double log2OutputColumnCycles = 0.0;
-    std::string evidence;
-
-    bool isValid() const {
-      if (!enabled)
-        return true;
-      return minimumInputElements > 0 &&
-             maximumInputElements >= minimumInputElements &&
-             minimumOutputColumns > 0 &&
-             maximumOutputColumns >= minimumOutputColumns &&
-             minimumReductionStages > 0 && std::isfinite(interceptCycles) &&
-             std::isfinite(inputElementCycles) && inputElementCycles >= 0.0 &&
-             std::isfinite(log2OutputColumnCycles) &&
-             log2OutputColumnCycles >= 0.0 && !evidence.empty();
-    }
-  };
-
-  struct SimtMultiSequenceMinmaxScanCompletion {
-    bool enabled = false;
-    int64_t minimumIndependentSequences = 0;
-    int64_t maximumIndependentSequences = 0;
-    int64_t minimumExtent = 0;
-    int64_t maximumExtent = 0;
-    double baseReductionSystemCycles = 0.0;
-    double perIndependentSequenceReductionSystemCycles = 0.0;
-    double maximumReductionSystemCycles = 0.0;
-    int64_t largeMinimumIndependentSequences = 0;
-    int64_t largeMaximumIndependentSequences = 0;
-    int64_t largeMinimumExtent = 0;
-    int64_t largeMaximumExtent = 0;
-    double largeBaseReductionSystemCycles = 0.0;
-    double largePerIndependentSequenceReductionSystemCycles = 0.0;
-    double largeMaximumReductionSystemCycles = 0.0;
-    std::string evidence;
-
-    bool isValid() const {
-      if (!enabled)
-        return true;
-      const bool validBase =
-          minimumIndependentSequences > 1 &&
-          maximumIndependentSequences >= minimumIndependentSequences &&
-          minimumExtent > 1 && maximumExtent >= minimumExtent &&
-          std::isfinite(baseReductionSystemCycles) &&
-          baseReductionSystemCycles >= 0.0 &&
-          std::isfinite(perIndependentSequenceReductionSystemCycles) &&
-          perIndependentSequenceReductionSystemCycles >= 0.0 &&
-          std::isfinite(maximumReductionSystemCycles) &&
-          maximumReductionSystemCycles >= baseReductionSystemCycles;
-      const bool hasLarge =
-          largeMinimumIndependentSequences != 0 ||
-          largeMaximumIndependentSequences != 0 || largeMinimumExtent != 0 ||
-          largeMaximumExtent != 0 || largeBaseReductionSystemCycles != 0.0 ||
-          largePerIndependentSequenceReductionSystemCycles != 0.0 ||
-          largeMaximumReductionSystemCycles != 0.0;
-      const bool validLarge =
-          !hasLarge ||
-          (largeMinimumIndependentSequences > maximumIndependentSequences &&
-           largeMaximumIndependentSequences >=
-               largeMinimumIndependentSequences &&
-           largeMinimumExtent > 1 && largeMaximumExtent >= largeMinimumExtent &&
-           std::isfinite(largeBaseReductionSystemCycles) &&
-           largeBaseReductionSystemCycles >= 0.0 &&
-           std::isfinite(largePerIndependentSequenceReductionSystemCycles) &&
-           largePerIndependentSequenceReductionSystemCycles >= 0.0 &&
-           std::isfinite(largeMaximumReductionSystemCycles) &&
-           largeMaximumReductionSystemCycles >= largeBaseReductionSystemCycles);
-      return validBase && validLarge && !evidence.empty();
-    }
-  };
-
-  struct SimdLargeSequenceMinmaxScanCompletion {
-    bool enabled = false;
-    int64_t minimumIndependentSequences = 0;
-    int64_t maximumIndependentSequences = 0;
-    int64_t minimumExtent = 0;
-    int64_t maximumExtent = 0;
-    double perIndependentSequenceSystemCycles = 0.0;
-    std::string evidence;
-
-    bool isValid() const {
-      if (!enabled)
-        return true;
-      return minimumIndependentSequences > 1 &&
-             maximumIndependentSequences >= minimumIndependentSequences &&
-             minimumExtent > 1 && maximumExtent >= minimumExtent &&
-             std::isfinite(perIndependentSequenceSystemCycles) &&
-             perIndependentSequenceSystemCycles >= 0.0 && !evidence.empty();
-    }
-  };
-
-  struct SimdStraightLineAddReductionCompletion {
-    bool enabled = false;
-    int64_t minimumRows = 0;
-    int64_t maximumRows = 0;
-    int64_t minimumExtent = 0;
-    int64_t maximumExtent = 0;
-    double sharedCompletionSystemCycles = 0.0;
-    std::string evidence;
-
-    bool isValid() const {
-      if (!enabled)
-        return true;
-      return minimumRows > 0 && maximumRows >= minimumRows &&
-             minimumExtent > 1 && maximumExtent >= minimumExtent &&
-             std::isfinite(sharedCompletionSystemCycles) &&
-             sharedCompletionSystemCycles >= 0.0 && !evidence.empty();
-    }
-  };
-
-  struct SimdTwoLoopSingleReductionCompletion {
-    bool enabled = false;
-    int64_t minimumSourcePrograms = 0;
-    int64_t maximumSourcePrograms = 0;
-    int64_t minimumRuntimeIterations = 0;
-    int64_t maximumRuntimeIterations = 0;
-    int64_t requiredReductionExtent = 0;
-    double firstIterationSystemCycles = 0.0;
-    double additionalIterationSystemCycles = 0.0;
-    std::string evidence;
-
-    bool isValid() const {
-      if (!enabled)
-        return true;
-      return minimumSourcePrograms > 0 &&
-             maximumSourcePrograms >= minimumSourcePrograms &&
-             minimumRuntimeIterations > 0 &&
-             maximumRuntimeIterations >= minimumRuntimeIterations &&
-             requiredReductionExtent > 1 &&
-             std::isfinite(firstIterationSystemCycles) &&
-             firstIterationSystemCycles >= 0.0 &&
-             std::isfinite(additionalIterationSystemCycles) &&
-             additionalIterationSystemCycles >= 0.0 && !evidence.empty();
     }
   };
 
@@ -272,7 +207,7 @@ struct KernelTimingProfile {
       if (!enabled)
         return true;
       return maximumElementsPerAccess > 0 &&
-             std::isfinite(signedResidualSystemCycles) && !evidence.empty();
+             finiteValues({signedResidualSystemCycles}) && !evidence.empty();
     }
   };
 
@@ -290,6 +225,35 @@ struct KernelTimingProfile {
              llvm::all_of(residualBySourceProgramCount, [](const auto &entry) {
                return entry.first > 0 && std::isfinite(entry.second);
              });
+    }
+  };
+
+  struct Rank2StridedDirectLoadCompletion {
+    int64_t minimumElements = 0;
+    int64_t maximumElements = 0;
+    double startupCycles = 0.0;
+    double perElementCycles = 0.0;
+    double maximumCycles = 0.0;
+    std::string evidence;
+
+    bool isPresent() const {
+      return minimumElements != 0 || maximumElements != 0 ||
+             startupCycles != 0.0 || perElementCycles != 0.0 ||
+             maximumCycles != 0.0 || !evidence.empty();
+    }
+
+    bool isValid() const {
+      return !isPresent() ||
+             (minimumElements > 0 && maximumElements >= minimumElements &&
+              finiteNonNegative({startupCycles, perElementCycles}) &&
+              finitePositive({maximumCycles}) && !evidence.empty());
+    }
+
+    double cycles(int64_t elements) const {
+      if (elements < minimumElements || elements > maximumElements)
+        return 0.0;
+      return std::min(maximumCycles,
+                      startupCycles + perElementCycles * elements);
     }
   };
 
@@ -320,22 +284,15 @@ struct KernelTimingProfile {
              minimumExtent > 1 && maximumExtent >= minimumExtent &&
              minimumIndependentSequences > 1 &&
              maximumIndependentSequences >= minimumIndependentSequences &&
-             std::isfinite(startupSystemCycles) && startupSystemCycles >= 0.0 &&
-             std::isfinite(perElementSystemCycles) &&
-             perElementSystemCycles > 0.0 &&
-             std::isfinite(factor2StartupSystemCycles) &&
-             factor2StartupSystemCycles >= 0.0 &&
-             std::isfinite(factor2PerElementSystemCycles) &&
-             factor2PerElementSystemCycles > 0.0 &&
              factor2ReferencePhysicalProgramCount > 0 &&
-             std::isfinite(factor2PerActivePhysicalProgramSystemCycles) &&
-             factor2PerActivePhysicalProgramSystemCycles >= 0.0 &&
-             std::isfinite(factor2MinimumTargetSystemCycles) &&
-             factor2MinimumTargetSystemCycles > 0.0 &&
-             std::isfinite(factor4StartupSystemCycles) &&
-             factor4StartupSystemCycles >= 0.0 &&
-             std::isfinite(factor4PerElementSystemCycles) &&
-             factor4PerElementSystemCycles > 0.0 && !evidence.empty();
+             finiteNonNegative({startupSystemCycles, factor2StartupSystemCycles,
+                                factor2PerActivePhysicalProgramSystemCycles,
+                                factor4StartupSystemCycles}) &&
+             finitePositive({perElementSystemCycles,
+                             factor2PerElementSystemCycles,
+                             factor2MinimumTargetSystemCycles,
+                             factor4PerElementSystemCycles}) &&
+             !evidence.empty();
     }
   };
 
@@ -361,8 +318,7 @@ struct KernelTimingProfile {
           requiredContiguousElements <= 0 || requiredElementBits <= 0 ||
           minimumLoadCount <= 0 || maximumLoadCount < minimumLoadCount ||
           requiredStoreCount != 1 || maximumSuperblockFactor <= 0 ||
-          !std::isfinite(startupSystemCycles) || startupSystemCycles < 0.0 ||
-          evidence.empty())
+          !finiteNonNegative({startupSystemCycles}) || evidence.empty())
         return false;
       for (int64_t loads = minimumLoadCount; loads <= maximumLoadCount;
            ++loads) {
@@ -389,41 +345,18 @@ struct KernelTimingProfile {
   std::map<int64_t, double> boundaryResidualSystemCyclesByPhysicalProgramCount;
   std::map<std::string, std::map<int64_t, std::map<int64_t, double>>>
       boundaryResidualSystemCyclesByRouteFactorAndPhysicalProgramCount;
-  /// A minimal observable boundary kernel contains a final global store but
-  /// no global load.  Ordinary memory kernels pay one additional completion
-  /// envelope when at least one global load is present.  This is selected by
-  /// route and composed once per kernel, never once per Stage or operation.
+  /// A minimal observable boundary kernel contains a final global store but no
+  /// global load.
   std::map<std::string, double> globalLoadBoundaryResidualSystemCyclesByRoute;
   std::map<std::string, RuntimeArgumentSetup> runtimeArgumentSetupByRoute;
-  /// Completion residual for the generic SIMD lowering in which a tiny
-  /// rank-2 loaded-index tile becomes nested scalar loops.  The shape gate is
-  /// a compiler-structure boundary (rank and total elements), while the curve
-  /// is indexed only by physical program count.
   int64_t scalarizedRank2IndirectLoadMaximumElements = 0;
   std::map<int64_t, double>
       scalarizedRank2IndirectLoadResidualByPhysicalProgramCount;
   std::string scalarizedRank2IndirectLoadEvidence;
-  /// Completion residual for a one-program whole-SIMD direct rank-2 load
-  /// whose inner stride is not contiguous. The scalarized backend path has a
-  /// bounded setup-plus-element cost which is not represented by byte
-  /// throughput alone.
-  int64_t simdRank2StridedDirectLoadMinimumElements = 0;
-  int64_t simdRank2StridedDirectLoadMaximumElements = 0;
-  double simdRank2StridedDirectLoadStartupCycles = 0.0;
-  double simdRank2StridedDirectLoadPerElementCycles = 0.0;
-  double simdRank2StridedDirectLoadMaximumResidualCycles = 0.0;
-  std::string simdRank2StridedDirectLoadEvidence;
-  int64_t simtRank2StridedDirectLoadMinimumElements = 0;
-  int64_t simtRank2StridedDirectLoadMaximumElements = 0;
-  double simtRank2StridedDirectLoadStartupCycles = 0.0;
-  double simtRank2StridedDirectLoadPerElementCycles = 0.0;
-  double simtRank2StridedDirectLoadMaximumTargetCycles = 0.0;
-  std::string simtRank2StridedDirectLoadEvidence;
-  /// Signed completion adjustment for the whole-SIMT lowering of a tiny
-  /// rank-2 loaded-index tile.  Curves are separated by source element bit
-  /// width, then indexed by the compiler-derived tile element count.  FP16
-  /// and FP32 lowerings have different completion envelopes even when their
-  /// rank and element count match, so sharing one curve is not valid.
+  Rank2StridedDirectLoadCompletion simdRank2StridedDirectLoad;
+  Rank2StridedDirectLoadCompletion simtRank2StridedDirectLoad;
+  /// Signed completion adjustment for the whole-SIMT lowering of a tiny rank-2
+  /// loaded-index tile.
   int64_t simtRank2IndirectLoadMaximumElements = 0;
   std::map<int64_t, std::map<int64_t, double>>
       simtRank2IndirectLoadResidualByElementBitsAndElements;
@@ -431,12 +364,7 @@ struct KernelTimingProfile {
   int64_t subwarpIndirectCompositeMaximumElements = 0;
   std::map<int64_t, double> subwarpIndirectCompositeResidualByElements;
   std::string subwarpIndirectCompositeEvidence;
-  SimdMultiResultPrefixScanCompletion simdMultiResultPrefixScanCompletion;
-  SimtPairwiseSelectionNetworkCompletion simtPairwiseSelectionNetworkCompletion;
-  SimdLargeSequenceMinmaxScanCompletion simdLargeSequenceMinmaxScanCompletion;
-  SimtMultiSequenceMinmaxScanCompletion simtMultiSequenceMinmaxScanCompletion;
-  SimdStraightLineAddReductionCompletion simdStraightLineAddReductionCompletion;
-  SimdTwoLoopSingleReductionCompletion simdTwoLoopSingleReductionCompletion;
+  StageRouteCompletionProfile routeCompletions;
   TinyStraightLineSimtMemoryCompletion tinyStraightLineSimtMemoryCompletion;
   SimtNonAffineRank1MemoryCompletion simtNonAffineRank1MemoryCompletion;
   Rank2InterleavedPrefixScanCompletion rank2InterleavedPrefixScanCompletion;
@@ -445,40 +373,27 @@ struct KernelTimingProfile {
   std::string evidence;
 
   bool isValid() const {
-    const bool validCurve =
-        llvm::all_of(boundaryResidualSystemCyclesByPhysicalProgramCount,
-                     [](const auto &entry) {
-                       return entry.first > 0 && std::isfinite(entry.second) &&
-                              entry.second >= 0.0;
-                     });
+    const bool validCurve = validNonNegativeCurve(
+        boundaryResidualSystemCyclesByPhysicalProgramCount);
     const bool validRouteCurves = llvm::all_of(
         boundaryResidualSystemCyclesByRouteFactorAndPhysicalProgramCount,
         [](const auto &routeEntry) {
-          if (routeEntry.first != kAllSimd &&
-              routeEntry.first != kAllSimtOnly &&
-              routeEntry.first != kMixedSimdSimt)
+          if (!isKnownRoute(routeEntry.first))
             return false;
           return llvm::all_of(routeEntry.second, [](const auto &factorEntry) {
             return factorEntry.first > 0 && !factorEntry.second.empty() &&
-                   llvm::all_of(factorEntry.second, [](const auto &entry) {
-                     return entry.first > 0 && std::isfinite(entry.second) &&
-                            entry.second >= 0.0;
-                   });
+                   validNonNegativeCurve(factorEntry.second);
           });
         });
     const bool validGlobalLoadResiduals = llvm::all_of(
         globalLoadBoundaryResidualSystemCyclesByRoute, [](const auto &entry) {
           const llvm::StringRef route(entry.first);
-          return (route == kAllSimd || route == kAllSimtOnly ||
-                  route == kMixedSimdSimt) &&
-                 std::isfinite(entry.second) && entry.second >= 0.0;
+          return isKnownRoute(route) && finiteNonNegative({entry.second});
         });
     const bool validArgumentSetup =
         llvm::all_of(runtimeArgumentSetupByRoute, [](const auto &entry) {
           const llvm::StringRef route(entry.first);
-          return (route == kAllSimd || route == kAllSimtOnly ||
-                  route == kMixedSimdSimt) &&
-                 entry.second.isValid();
+          return isKnownRoute(route) && entry.second.isValid();
         });
     const bool hasScalarizedRank2Residual =
         scalarizedRank2IndirectLoadMaximumElements != 0 ||
@@ -489,11 +404,8 @@ struct KernelTimingProfile {
         (scalarizedRank2IndirectLoadMaximumElements > 0 &&
          !scalarizedRank2IndirectLoadResidualByPhysicalProgramCount.empty() &&
          !scalarizedRank2IndirectLoadEvidence.empty() &&
-         llvm::all_of(scalarizedRank2IndirectLoadResidualByPhysicalProgramCount,
-                      [](const auto &entry) {
-                        return entry.first > 0 && std::isfinite(entry.second) &&
-                               entry.second >= 0.0;
-                      }));
+         validNonNegativeCurve(
+             scalarizedRank2IndirectLoadResidualByPhysicalProgramCount));
     const bool hasSubwarpIndirectComposite =
         subwarpIndirectCompositeMaximumElements != 0 ||
         !subwarpIndirectCompositeResidualByElements.empty() ||
@@ -503,11 +415,7 @@ struct KernelTimingProfile {
         (subwarpIndirectCompositeMaximumElements > 0 &&
          !subwarpIndirectCompositeResidualByElements.empty() &&
          !subwarpIndirectCompositeEvidence.empty() &&
-         llvm::all_of(subwarpIndirectCompositeResidualByElements,
-                      [](const auto &entry) {
-                        return entry.first > 0 && std::isfinite(entry.second) &&
-                               entry.second >= 0.0;
-                      }));
+         validNonNegativeCurve(subwarpIndirectCompositeResidualByElements));
     const bool hasSimtRank2Residual =
         simtRank2IndirectLoadMaximumElements != 0 ||
         !simtRank2IndirectLoadResidualByElementBitsAndElements.empty() ||
@@ -525,64 +433,19 @@ struct KernelTimingProfile {
                         return entry.first > 0 && std::isfinite(entry.second);
                       });
              }));
-    const bool hasSimdRank2StridedDirect =
-        simdRank2StridedDirectLoadMinimumElements != 0 ||
-        simdRank2StridedDirectLoadMaximumElements != 0 ||
-        simdRank2StridedDirectLoadStartupCycles != 0.0 ||
-        simdRank2StridedDirectLoadPerElementCycles != 0.0 ||
-        simdRank2StridedDirectLoadMaximumResidualCycles != 0.0 ||
-        !simdRank2StridedDirectLoadEvidence.empty();
-    const bool validSimdRank2StridedDirect =
-        !hasSimdRank2StridedDirect ||
-        (simdRank2StridedDirectLoadMinimumElements > 0 &&
-         simdRank2StridedDirectLoadMaximumElements >=
-             simdRank2StridedDirectLoadMinimumElements &&
-         std::isfinite(simdRank2StridedDirectLoadStartupCycles) &&
-         simdRank2StridedDirectLoadStartupCycles >= 0.0 &&
-         std::isfinite(simdRank2StridedDirectLoadPerElementCycles) &&
-         simdRank2StridedDirectLoadPerElementCycles >= 0.0 &&
-         std::isfinite(simdRank2StridedDirectLoadMaximumResidualCycles) &&
-         simdRank2StridedDirectLoadMaximumResidualCycles > 0.0 &&
-         !simdRank2StridedDirectLoadEvidence.empty());
-    const bool hasSimtRank2StridedDirect =
-        simtRank2StridedDirectLoadMinimumElements != 0 ||
-        simtRank2StridedDirectLoadMaximumElements != 0 ||
-        simtRank2StridedDirectLoadStartupCycles != 0.0 ||
-        simtRank2StridedDirectLoadPerElementCycles != 0.0 ||
-        simtRank2StridedDirectLoadMaximumTargetCycles != 0.0 ||
-        !simtRank2StridedDirectLoadEvidence.empty();
-    const bool validSimtRank2StridedDirect =
-        !hasSimtRank2StridedDirect ||
-        (simtRank2StridedDirectLoadMinimumElements > 0 &&
-         simtRank2StridedDirectLoadMaximumElements >=
-             simtRank2StridedDirectLoadMinimumElements &&
-         std::isfinite(simtRank2StridedDirectLoadStartupCycles) &&
-         simtRank2StridedDirectLoadStartupCycles >= 0.0 &&
-         std::isfinite(simtRank2StridedDirectLoadPerElementCycles) &&
-         simtRank2StridedDirectLoadPerElementCycles >= 0.0 &&
-         std::isfinite(simtRank2StridedDirectLoadMaximumTargetCycles) &&
-         simtRank2StridedDirectLoadMaximumTargetCycles > 0.0 &&
-         !simtRank2StridedDirectLoadEvidence.empty());
     return validCurve && validRouteCurves && validGlobalLoadResiduals &&
            validArgumentSetup && validScalarizedRank2Residual &&
-           validSimdRank2StridedDirect && validSimtRank2StridedDirect &&
+           simdRank2StridedDirectLoad.isValid() &&
+           simtRank2StridedDirectLoad.isValid() &&
            validSubwarpIndirectComposite && validSimtRank2Residual &&
-           simdMultiResultPrefixScanCompletion.isValid() &&
-           simtPairwiseSelectionNetworkCompletion.isValid() &&
-           simdLargeSequenceMinmaxScanCompletion.isValid() &&
-           simtMultiSequenceMinmaxScanCompletion.isValid() &&
-           simdStraightLineAddReductionCompletion.isValid() &&
-           simdTwoLoopSingleReductionCompletion.isValid() &&
+           routeCompletions.isValid() &&
            tinyStraightLineSimtMemoryCompletion.isValid() &&
            simtNonAffineRank1MemoryCompletion.isValid() &&
            rank2InterleavedPrefixScanCompletion.isValid() &&
            simtStaticLoopDirectMemoryCompletion.isValid() &&
-           std::isfinite(scalarPrologueSystemCycles) &&
-           scalarPrologueSystemCycles >= 0.0 &&
-           std::isfinite(scalarEpilogueSystemCycles) &&
-           scalarEpilogueSystemCycles >= 0.0 &&
-           std::isfinite(systemCounterFrequencyMHz) &&
-           systemCounterFrequencyMHz > 0.0 && !evidence.empty();
+           finiteNonNegative(
+               {scalarPrologueSystemCycles, scalarEpilogueSystemCycles}) &&
+           finitePositive({systemCounterFrequencyMHz}) && !evidence.empty();
   }
 
   static double interpolateBoundaryCurve(const std::map<int64_t, double> &curve,
@@ -645,27 +508,6 @@ struct KernelTimingProfile {
     return interpolateBoundaryCurve(
         scalarizedRank2IndirectLoadResidualByPhysicalProgramCount,
         physicalProgramCount, 0.0);
-  }
-
-  double
-  simdRank2StridedDirectLoadResidualSystemCycles(int64_t elements) const {
-    if (elements < simdRank2StridedDirectLoadMinimumElements ||
-        elements > simdRank2StridedDirectLoadMaximumElements)
-      return 0.0;
-    return std::min(simdRank2StridedDirectLoadMaximumResidualCycles,
-                    simdRank2StridedDirectLoadStartupCycles +
-                        simdRank2StridedDirectLoadPerElementCycles *
-                            static_cast<double>(elements));
-  }
-
-  double simtRank2StridedDirectLoadTargetSystemCycles(int64_t elements) const {
-    if (elements < simtRank2StridedDirectLoadMinimumElements ||
-        elements > simtRank2StridedDirectLoadMaximumElements)
-      return 0.0;
-    return std::min(simtRank2StridedDirectLoadMaximumTargetCycles,
-                    simtRank2StridedDirectLoadStartupCycles +
-                        simtRank2StridedDirectLoadPerElementCycles *
-                            static_cast<double>(elements));
   }
 
   double subwarpIndirectCompositeResidualSystemCycles(int64_t elements) const {
@@ -800,6 +642,44 @@ public:
 private:
   std::string error;
 };
+
+using NumberDestination = std::pair<llvm::StringRef, double *>;
+using IntegerDestination = std::pair<llvm::StringRef, int64_t *>;
+using IntegerCurve = std::map<int64_t, double>;
+using FactorCurves = std::map<int64_t, IntegerCurve>;
+using FactorSurfaces = std::map<int64_t, std::map<int64_t, IntegerCurve>>;
+template <typename Curves>
+using CurveDestination = std::pair<llvm::StringRef, Curves *>;
+
+static void readNumbers(ProfileJSONReader &reader,
+                        const llvm::json::Object &object,
+                        llvm::StringRef context,
+                        std::initializer_list<NumberDestination> fields) {
+  for (const auto &[key, destination] : fields)
+    *destination = reader.number(object, key, context);
+}
+
+static void
+readOptionalNumbers(ProfileJSONReader &reader, const llvm::json::Object &object,
+                    std::initializer_list<NumberDestination> fields) {
+  for (const auto &[key, destination] : fields)
+    *destination = reader.optionalNumber(object, key, *destination);
+}
+
+static void readIntegers(ProfileJSONReader &reader,
+                         const llvm::json::Object &object,
+                         llvm::StringRef context,
+                         std::initializer_list<IntegerDestination> fields) {
+  for (const auto &[key, destination] : fields)
+    *destination = reader.integer(object, key, context);
+}
+
+static void
+readOptionalIntegers(const llvm::json::Object &object,
+                     std::initializer_list<IntegerDestination> fields) {
+  for (const auto &[key, destination] : fields)
+    *destination = object.getInteger(key).value_or(*destination);
+}
 
 static double resolveNumberOrMeasurement(
     const llvm::json::Object &object, llvm::StringRef numberKey,
@@ -953,7 +833,7 @@ static void readRouteFactorNumberCurves(
     return;
   for (const auto &routeEntry : *routes) {
     const llvm::StringRef route(routeEntry.first);
-    if (route != kAllSimd && route != kAllSimtOnly && route != kMixedSimdSimt) {
+    if (!isKnownRoute(route)) {
       reader.setError(context + "." + curveKey +
                       " contains an unknown route key '" + route + "'");
       return;
@@ -1007,9 +887,8 @@ static void readRouteNumberMap(const llvm::json::Object &owner,
   for (const auto &entry : *object) {
     const llvm::StringRef route(entry.first);
     const auto value = entry.second.getAsNumber();
-    if ((route != kAllSimd && route != kAllSimtOnly &&
-         route != kMixedSimdSimt) ||
-        !value || !std::isfinite(*value) || *value < 0.0) {
+    if (!isKnownRoute(route) || !value || !std::isfinite(*value) ||
+        *value < 0.0) {
       reader.setError(context + "." + mapKey +
                       " must map known route keys to non-negative numbers");
       return;
@@ -1030,9 +909,7 @@ static void readRuntimeArgumentSetupByRoute(
   for (const auto &entry : *routes) {
     const llvm::StringRef route(entry.first);
     const auto *object = entry.second.getAsObject();
-    if ((route != kAllSimd && route != kAllSimtOnly &&
-         route != kMixedSimdSimt) ||
-        !object) {
+    if (!isKnownRoute(route) || !object) {
       reader.setError(context + "." + key +
                       " must contain known route objects");
       return;
@@ -1174,6 +1051,35 @@ static void readFactorRowExtentMeasurementSurfaces(
   }
 }
 
+static void readPositiveIntegerMeasurementCurves(
+    const llvm::json::Object &owner, llvm::StringRef expectedUnit,
+    const MicrobenchmarkProfile *microbench, ProfileJSONReader &reader,
+    llvm::StringRef context,
+    std::initializer_list<CurveDestination<IntegerCurve>> destinations) {
+  for (const auto &[key, destination] : destinations)
+    readPositiveIntegerMeasurementCurve(owner, key, expectedUnit, microbench,
+                                        reader, context, *destination);
+}
+
+static void readFactorMeasurementCurveFields(
+    const llvm::json::Object &owner, llvm::StringRef expectedUnit,
+    const MicrobenchmarkProfile *microbench, ProfileJSONReader &reader,
+    llvm::StringRef context,
+    std::initializer_list<CurveDestination<FactorCurves>> destinations) {
+  for (const auto &[key, destination] : destinations)
+    readFactorMeasurementCurves(owner, key, expectedUnit, microbench, reader,
+                                context, *destination);
+}
+
+static void readFactorRowExtentMeasurementSurfaceFields(
+    const llvm::json::Object &owner, const MicrobenchmarkProfile *microbench,
+    ProfileJSONReader &reader, llvm::StringRef context,
+    std::initializer_list<CurveDestination<FactorSurfaces>> destinations) {
+  for (const auto &[key, destination] : destinations)
+    readFactorRowExtentMeasurementSurfaces(owner, key, microbench, reader,
+                                           context, *destination);
+}
+
 static StageOperationRate
 resolveOpProfile(const llvm::json::Object &ops, llvm::StringRef opName,
                  llvm::StringRef throughputKey, llvm::StringRef expectedUnit,
@@ -1252,9 +1158,7 @@ static void readMaskedStridedCopyCompletion(
   }
 }
 
-/// Match Python's json.dumps(value, sort_keys=True) representation.  Keeping
-/// this stable makes profile_content_sha256 identical across the temporary
-/// Python model and this C++ implementation.
+/// Match Python's json.dumps(value, sort_keys=True) representation.
 static void emitPythonCanonicalJSON(const llvm::json::Value &value,
                                     llvm::raw_ostream &os) {
   if (const auto *object = value.getAsObject()) {
@@ -1392,55 +1296,42 @@ static void readStageResources(ProfileJSONReader &reader,
       profile.spillTransactionCoverage = *coverage;
   }
   if (const auto *scalar = reader.object(*resources, "scalar_memory", prefix)) {
-    profile.mainScalarLoadPrepCycles =
-        reader.optionalNumber(*scalar, "main_load_prep_system_cycles",
-                              profile.mainScalarLoadPrepCycles);
-    profile.mainScalarLoadFillCycles =
-        reader.optionalNumber(*scalar, "main_load_fill_system_cycles",
-                              profile.mainScalarLoadFillCycles);
-    profile.mainScalarLoadIssueCycles =
-        reader.optionalNumber(*scalar, "main_load_issue_system_cycles",
-                              profile.mainScalarLoadIssueCycles);
-    profile.mainScalarLoadOutstandingLines =
-        reader.optionalNumber(*scalar, "main_load_outstanding_line_count",
-                              profile.mainScalarLoadOutstandingLines);
-    profile.mainScalarLoadExtraLineLowCycles =
-        reader.optionalNumber(*scalar, "main_load_extra_line_low_system_cycles",
-                              profile.mainScalarLoadExtraLineLowCycles);
-    profile.mainScalarLoadExtraLineHighCycles = reader.optionalNumber(
-        *scalar, "main_load_extra_line_high_system_cycles",
-        profile.mainScalarLoadExtraLineHighCycles);
-    profile.mainScalarLoadExtraLineHighThreshold =
-        reader.optionalNumber(*scalar, "main_load_extra_line_high_threshold",
-                              profile.mainScalarLoadExtraLineHighThreshold);
-    profile.simtUniformLoadPrepCycles =
-        reader.optionalNumber(*scalar, "uniform_load_prep_system_cycles",
-                              profile.simtUniformLoadPrepCycles);
-    profile.simtUniformLoadFillCycles =
-        reader.optionalNumber(*scalar, "uniform_load_fill_system_cycles",
-                              profile.simtUniformLoadFillCycles);
-    profile.simtUniformLoadDiffLineIssueCycles = reader.optionalNumber(
-        *scalar, "uniform_load_diff_line_issue_system_cycles",
-        profile.simtUniformLoadDiffLineIssueCycles);
-    profile.mte3StorePrepCycles = reader.optionalNumber(
-        *scalar, "mte3_store_prep_system_cycles", profile.mte3StorePrepCycles);
-    profile.mte3StoreFillCycles = reader.optionalNumber(
-        *scalar, "mte3_store_fill_system_cycles", profile.mte3StoreFillCycles);
-    profile.simtUniformStoreBaseCycles =
-        reader.optionalNumber(*scalar, "uniform_store_base_system_cycles",
-                              profile.simtUniformStoreBaseCycles);
+    readOptionalNumbers(
+        reader, *scalar,
+        {{"main_load_prep_system_cycles", &profile.mainScalarLoadPrepCycles},
+         {"main_load_fill_system_cycles", &profile.mainScalarLoadFillCycles},
+         {"main_load_issue_system_cycles", &profile.mainScalarLoadIssueCycles},
+         {"main_load_outstanding_line_count",
+          &profile.mainScalarLoadOutstandingLines},
+         {"main_load_extra_line_low_system_cycles",
+          &profile.mainScalarLoadExtraLineLowCycles},
+         {"main_load_extra_line_high_system_cycles",
+          &profile.mainScalarLoadExtraLineHighCycles},
+         {"main_load_extra_line_high_threshold",
+          &profile.mainScalarLoadExtraLineHighThreshold},
+         {"uniform_load_prep_system_cycles",
+          &profile.simtUniformLoadPrepCycles},
+         {"uniform_load_fill_system_cycles",
+          &profile.simtUniformLoadFillCycles},
+         {"uniform_load_diff_line_issue_system_cycles",
+          &profile.simtUniformLoadDiffLineIssueCycles},
+         {"mte3_store_prep_system_cycles", &profile.mte3StorePrepCycles},
+         {"mte3_store_fill_system_cycles", &profile.mte3StoreFillCycles},
+         {"uniform_store_base_system_cycles",
+          &profile.simtUniformStoreBaseCycles}});
   }
   if (const auto *generated =
           resources->getObject("generated_vector_traffic")) {
     const std::string path = prefix + ".generated_vector_traffic";
-    profile.sharedLocalLoadInstructionsPerCycle = reader.optionalNumber(
-        *generated, "shared_local_load_instructions_per_system_cycle", 0.0);
-    profile.sharedLocalStoreInstructionsPerCycle = reader.optionalNumber(
-        *generated, "shared_local_store_instructions_per_system_cycle", 0.0);
-    profile.privateStackLoadInstructionsPerCycle = reader.optionalNumber(
-        *generated, "private_stack_load_instructions_per_system_cycle", 0.0);
-    profile.privateStackStoreInstructionsPerCycle = reader.optionalNumber(
-        *generated, "private_stack_store_instructions_per_system_cycle", 0.0);
+    readOptionalNumbers(reader, *generated,
+                        {{"shared_local_load_instructions_per_system_cycle",
+                          &profile.sharedLocalLoadInstructionsPerCycle},
+                         {"shared_local_store_instructions_per_system_cycle",
+                          &profile.sharedLocalStoreInstructionsPerCycle},
+                         {"private_stack_load_instructions_per_system_cycle",
+                          &profile.privateStackLoadInstructionsPerCycle},
+                         {"private_stack_store_instructions_per_system_cycle",
+                          &profile.privateStackStoreInstructionsPerCycle}});
     if (profile.sharedLocalLoadInstructionsPerCycle < 0.0 ||
         profile.sharedLocalStoreInstructionsPerCycle < 0.0 ||
         profile.privateStackLoadInstructionsPerCycle < 0.0 ||
@@ -1461,96 +1352,88 @@ static void readStageResources(ProfileJSONReader &reader,
         }
         WholeSimdCompletionCurve result;
         result.enabled = curve->getBoolean("enabled").value_or(false);
-        result.minimumComponentNodes =
-            reader.integer(*curve, "minimum_component_nodes", path);
-        result.maximumComponentNodes =
-            reader.integer(*curve, "maximum_component_nodes", path);
-        result.m = reader.integer(*curve, "dot_m", path);
-        result.n = reader.integer(*curve, "dot_n", path);
-        result.k = reader.integer(*curve, "dot_k", path);
-        result.elementBits = reader.integer(*curve, "element_bits", path);
+        readIntegers(
+            reader, *curve, path,
+            {
+                {"minimum_component_nodes", &result.minimumComponentNodes},
+                {"maximum_component_nodes", &result.maximumComponentNodes},
+                {"dot_m", &result.m},
+                {"dot_n", &result.n},
+                {"dot_k", &result.k},
+                {"element_bits", &result.elementBits},
+                {"minimum_row_stride_bytes", &result.minimumRowStrideBytes},
+                {"maximum_row_stride_bytes", &result.maximumRowStrideBytes},
+                {"minimum_group_count", &result.minimumGroupCount},
+                {"maximum_group_count", &result.maximumGroupCount},
+            });
         result.dotUseSignature =
             reader.string(*curve, "dot_use_signature", path);
-        result.minimumRowStrideBytes =
-            reader.integer(*curve, "minimum_row_stride_bytes", path);
-        result.maximumRowStrideBytes =
-            reader.integer(*curve, "maximum_row_stride_bytes", path);
-        result.minimumGroupCount =
-            reader.integer(*curve, "minimum_group_count", path);
-        result.maximumGroupCount =
-            reader.integer(*curve, "maximum_group_count", path);
-        result.entryBaseScale = reader.number(*curve, "entry_base_scale", path);
-        result.entrySaturatedScale =
-            reader.number(*curve, "entry_saturated_scale", path);
-        result.entryUnalignedGroupMidpoint =
-            reader.number(*curve, "entry_unaligned_group_midpoint", path);
-        result.entryGroupMidpoint =
-            reader.number(*curve, "entry_group_midpoint", path);
-        result.entryGroupPower =
-            reader.number(*curve, "entry_group_power", path);
-        result.singleWaveEntryBaseSystemCycles =
-            reader.number(*curve, "single_wave_entry_base_system_cycles", path);
-        result.singleWaveEntrySaturatedSystemCycles = reader.number(
-            *curve, "single_wave_entry_saturated_system_cycles", path);
-        result.singleWaveEntrySlotMidpoint =
-            reader.number(*curve, "single_wave_entry_slot_midpoint", path);
-        result.singleWaveEntrySlotPower =
-            reader.number(*curve, "single_wave_entry_slot_power", path);
-        result.twoWaveEntryBaseSystemCycles =
-            reader.number(*curve, "two_wave_entry_base_system_cycles", path);
-        result.twoWaveEntryGaussianSystemCycles = reader.number(
-            *curve, "two_wave_entry_gaussian_system_cycles", path);
-        result.twoWaveEntryTailCenter =
-            reader.number(*curve, "two_wave_entry_tail_center", path);
-        result.twoWaveEntryTailWidth =
-            reader.number(*curve, "two_wave_entry_tail_width", path);
-        result.twoWaveEntryHighTailPenaltySystemCycles = reader.number(
-            *curve, "two_wave_entry_high_tail_penalty_system_cycles", path);
-        result.twoWaveEntryHighTailMidpoint =
-            reader.number(*curve, "two_wave_entry_high_tail_midpoint", path);
-        result.twoWaveEntryHighTailPower =
-            reader.number(*curve, "two_wave_entry_high_tail_power", path);
-        result.twoWaveEntryFullTailSystemCycles = reader.number(
-            *curve, "two_wave_entry_full_tail_system_cycles", path);
-        result.recurrenceSetupSystemCyclesPerGroup = reader.number(
-            *curve, "recurrence_setup_system_cycles_per_group", path);
-        result.dotRegionScale = reader.number(*curve, "dot_region_scale", path);
-        result.singleWaveDotBaseSystemCycles =
-            reader.number(*curve, "single_wave_dot_base_system_cycles", path);
-        result.singleWaveDotSaturatedSystemCycles = reader.number(
-            *curve, "single_wave_dot_saturated_system_cycles", path);
-        result.singleWaveDotSlotMidpoint =
-            reader.number(*curve, "single_wave_dot_slot_midpoint", path);
-        result.singleWaveDotSlotPower =
-            reader.number(*curve, "single_wave_dot_slot_power", path);
-        result.twoWaveDotTargetSystemCycles =
-            reader.number(*curve, "two_wave_dot_target_system_cycles", path);
-        result.exitBaseScale = reader.number(*curve, "exit_base_scale", path);
-        result.exitSaturatedScale =
-            reader.number(*curve, "exit_saturated_scale", path);
-        result.exitUnalignedGroupMidpoint =
-            reader.number(*curve, "exit_unaligned_group_midpoint", path);
-        result.exitGroupMidpoint =
-            reader.number(*curve, "exit_group_midpoint", path);
-        result.exitGroupPower = reader.number(*curve, "exit_group_power", path);
-        result.singleWaveExitBaseSystemCycles =
-            reader.number(*curve, "single_wave_exit_base_system_cycles", path);
-        result.singleWaveExitSaturatedSystemCycles = reader.number(
-            *curve, "single_wave_exit_saturated_system_cycles", path);
-        result.singleWaveExitSlotMidpoint =
-            reader.number(*curve, "single_wave_exit_slot_midpoint", path);
-        result.singleWaveExitSlotPower =
-            reader.number(*curve, "single_wave_exit_slot_power", path);
-        result.twoWaveExitBaseSystemCycles =
-            reader.number(*curve, "two_wave_exit_base_system_cycles", path);
-        result.twoWaveExitGaussianSystemCycles =
-            reader.number(*curve, "two_wave_exit_gaussian_system_cycles", path);
-        result.twoWaveExitTailCenter =
-            reader.number(*curve, "two_wave_exit_tail_center", path);
-        result.twoWaveExitTailWidth =
-            reader.number(*curve, "two_wave_exit_tail_width", path);
-        result.kernelBoundarySystemCycles =
-            reader.number(*curve, "kernel_boundary_system_cycles", path);
+        readNumbers(
+            reader, *curve, path,
+            {
+                {"entry_base_scale", &result.entryBaseScale},
+                {"entry_saturated_scale", &result.entrySaturatedScale},
+                {"entry_unaligned_group_midpoint",
+                 &result.entryUnalignedGroupMidpoint},
+                {"entry_group_midpoint", &result.entryGroupMidpoint},
+                {"entry_group_power", &result.entryGroupPower},
+                {"single_wave_entry_base_system_cycles",
+                 &result.singleWaveEntryBaseSystemCycles},
+                {"single_wave_entry_saturated_system_cycles",
+                 &result.singleWaveEntrySaturatedSystemCycles},
+                {"single_wave_entry_slot_midpoint",
+                 &result.singleWaveEntrySlotMidpoint},
+                {"single_wave_entry_slot_power",
+                 &result.singleWaveEntrySlotPower},
+                {"two_wave_entry_base_system_cycles",
+                 &result.twoWaveEntryBaseSystemCycles},
+                {"two_wave_entry_gaussian_system_cycles",
+                 &result.twoWaveEntryGaussianSystemCycles},
+                {"two_wave_entry_tail_center", &result.twoWaveEntryTailCenter},
+                {"two_wave_entry_tail_width", &result.twoWaveEntryTailWidth},
+                {"two_wave_entry_high_tail_penalty_system_cycles",
+                 &result.twoWaveEntryHighTailPenaltySystemCycles},
+                {"two_wave_entry_high_tail_midpoint",
+                 &result.twoWaveEntryHighTailMidpoint},
+                {"two_wave_entry_high_tail_power",
+                 &result.twoWaveEntryHighTailPower},
+                {"two_wave_entry_full_tail_system_cycles",
+                 &result.twoWaveEntryFullTailSystemCycles},
+                {"recurrence_setup_system_cycles_per_group",
+                 &result.recurrenceSetupSystemCyclesPerGroup},
+                {"dot_region_scale", &result.dotRegionScale},
+                {"single_wave_dot_base_system_cycles",
+                 &result.singleWaveDotBaseSystemCycles},
+                {"single_wave_dot_saturated_system_cycles",
+                 &result.singleWaveDotSaturatedSystemCycles},
+                {"single_wave_dot_slot_midpoint",
+                 &result.singleWaveDotSlotMidpoint},
+                {"single_wave_dot_slot_power", &result.singleWaveDotSlotPower},
+                {"two_wave_dot_target_system_cycles",
+                 &result.twoWaveDotTargetSystemCycles},
+                {"exit_base_scale", &result.exitBaseScale},
+                {"exit_saturated_scale", &result.exitSaturatedScale},
+                {"exit_unaligned_group_midpoint",
+                 &result.exitUnalignedGroupMidpoint},
+                {"exit_group_midpoint", &result.exitGroupMidpoint},
+                {"exit_group_power", &result.exitGroupPower},
+                {"single_wave_exit_base_system_cycles",
+                 &result.singleWaveExitBaseSystemCycles},
+                {"single_wave_exit_saturated_system_cycles",
+                 &result.singleWaveExitSaturatedSystemCycles},
+                {"single_wave_exit_slot_midpoint",
+                 &result.singleWaveExitSlotMidpoint},
+                {"single_wave_exit_slot_power",
+                 &result.singleWaveExitSlotPower},
+                {"two_wave_exit_base_system_cycles",
+                 &result.twoWaveExitBaseSystemCycles},
+                {"two_wave_exit_gaussian_system_cycles",
+                 &result.twoWaveExitGaussianSystemCycles},
+                {"two_wave_exit_tail_center", &result.twoWaveExitTailCenter},
+                {"two_wave_exit_tail_width", &result.twoWaveExitTailWidth},
+                {"kernel_boundary_system_cycles",
+                 &result.kernelBoundarySystemCycles},
+            });
         result.evidence = reader.string(*curve, "evidence", path);
         if (!result.isValid())
           reader.setError(path + " contains an invalid completion curve");
@@ -1573,32 +1456,30 @@ static void readStageResources(ProfileJSONReader &reader,
         }
         DotComponentPrivateStackFloor result;
         result.enabled = floor->getBoolean("enabled").value_or(false);
-        result.activeWarpCount =
-            reader.integer(*floor, "active_warp_count", path);
-        result.superblockFactor =
-            reader.integer(*floor, "superblock_factor", path);
-        result.minimumComponentNodes =
-            reader.integer(*floor, "minimum_component_nodes", path);
-        result.maximumComponentNodes =
-            reader.integer(*floor, "maximum_component_nodes", path);
-        result.m = reader.integer(*floor, "dot_m", path);
-        result.n = reader.integer(*floor, "dot_n", path);
-        result.k = reader.integer(*floor, "dot_k", path);
-        result.elementBits = reader.integer(*floor, "element_bits", path);
+        readIntegers(
+            reader, *floor, path,
+            {
+                {"active_warp_count", &result.activeWarpCount},
+                {"superblock_factor", &result.superblockFactor},
+                {"minimum_component_nodes", &result.minimumComponentNodes},
+                {"maximum_component_nodes", &result.maximumComponentNodes},
+                {"dot_m", &result.m},
+                {"dot_n", &result.n},
+                {"dot_k", &result.k},
+                {"element_bits", &result.elementBits},
+                {"load_instruction_floor", &result.loadInstructionFloor},
+                {"store_instruction_floor", &result.storeInstructionFloor},
+            });
         result.dotUseSignature =
             reader.string(*floor, "dot_use_signature", path);
-        result.loadInstructionFloor =
-            reader.integer(*floor, "load_instruction_floor", path);
-        result.storeInstructionFloor =
-            reader.integer(*floor, "store_instruction_floor", path);
-        result.combinedGroupCycles =
-            reader.number(*floor, "combined_group_system_cycles", path);
-        result.preRecurrenceFraction =
-            reader.number(*floor, "pre_recurrence_fraction", path);
-        result.dotRegionFraction =
-            reader.number(*floor, "dot_region_fraction", path);
-        result.postDotFraction =
-            reader.number(*floor, "post_dot_fraction", path);
+        readNumbers(
+            reader, *floor, path,
+            {
+                {"combined_group_system_cycles", &result.combinedGroupCycles},
+                {"pre_recurrence_fraction", &result.preRecurrenceFraction},
+                {"dot_region_fraction", &result.dotRegionFraction},
+                {"post_dot_fraction", &result.postDotFraction},
+            });
         result.evidence = reader.string(*floor, "evidence", path);
         if (!result.isValid())
           reader.setError(path + " contains an invalid conditional floor");
@@ -1620,31 +1501,30 @@ static void readStageResources(ProfileJSONReader &reader,
         }
         WholeSimtCompletionCurve result;
         result.enabled = curve->getBoolean("enabled").value_or(false);
-        result.activeWarpCount =
-            reader.integer(*curve, "active_warp_count", path);
-        result.superblockFactor =
-            reader.integer(*curve, "superblock_factor", path);
-        result.minimumComponentNodes =
-            reader.integer(*curve, "minimum_component_nodes", path);
-        result.maximumComponentNodes =
-            reader.integer(*curve, "maximum_component_nodes", path);
-        result.m = reader.integer(*curve, "dot_m", path);
-        result.n = reader.integer(*curve, "dot_n", path);
-        result.k = reader.integer(*curve, "dot_k", path);
-        result.elementBits = reader.integer(*curve, "element_bits", path);
+        readIntegers(
+            reader, *curve, path,
+            {
+                {"active_warp_count", &result.activeWarpCount},
+                {"superblock_factor", &result.superblockFactor},
+                {"minimum_component_nodes", &result.minimumComponentNodes},
+                {"maximum_component_nodes", &result.maximumComponentNodes},
+                {"dot_m", &result.m},
+                {"dot_n", &result.n},
+                {"dot_k", &result.k},
+                {"element_bits", &result.elementBits},
+                {"reference_row_stride_bytes", &result.referenceRowStrideBytes},
+            });
         result.dotUseSignature =
             reader.string(*curve, "dot_use_signature", path);
-        result.referenceRowStrideBytes =
-            reader.integer(*curve, "reference_row_stride_bytes", path);
-        result.referencePreRecurrenceScalarOperations = reader.number(
-            *curve, "reference_pre_recurrence_scalar_operations", path);
-        result.recurrenceScale =
-            reader.number(*curve, "recurrence_scale", path);
-        result.dotRegionScale = reader.number(*curve, "dot_region_scale", path);
-        result.entryGroupMidpoint =
-            reader.number(*curve, "entry_group_midpoint", path);
-        result.entryGroupPower =
-            reader.number(*curve, "entry_group_power", path);
+        readNumbers(reader, *curve, path,
+                    {
+                        {"reference_pre_recurrence_scalar_operations",
+                         &result.referencePreRecurrenceScalarOperations},
+                        {"recurrence_scale", &result.recurrenceScale},
+                        {"dot_region_scale", &result.dotRegionScale},
+                        {"entry_group_midpoint", &result.entryGroupMidpoint},
+                        {"entry_group_power", &result.entryGroupPower},
+                    });
         result.entryAdditiveCoefficients = {
             reader.number(*curve, "entry_intercept_system_cycles_per_group",
                           path),
@@ -1690,10 +1570,13 @@ static void readStageResources(ProfileJSONReader &reader,
             reader.number(*curve, "exit_constant_system_cycles", path),
             reader.number(*curve, "exit_constant_log_stride_system_cycles",
                           path)};
-        result.exitTailLog2ActiveFractionCoefficient = reader.number(
-            *curve, "exit_tail_log2_active_fraction_system_cycles", path);
-        result.kernelBoundarySystemCycles =
-            reader.number(*curve, "kernel_boundary_system_cycles", path);
+        readNumbers(reader, *curve, path,
+                    {
+                        {"exit_tail_log2_active_fraction_system_cycles",
+                         &result.exitTailLog2ActiveFractionCoefficient},
+                        {"kernel_boundary_system_cycles",
+                         &result.kernelBoundarySystemCycles},
+                    });
         result.evidence = reader.string(*curve, "evidence", path);
         if (!result.isValid())
           reader.setError(path + " contains an invalid completion curve");
@@ -1796,14 +1679,13 @@ static void readStageResources(ProfileJSONReader &reader,
       else
         profile.recurrenceGroupBaseWarpCount = *baseWarpCount;
     }
-    readFactorMeasurementCurves(
-        *recurrence, "reduction_group_iteration_system_cycle_measurements",
-        "system_cycle", microbench, reader, prefix + ".loop_carried_recurrence",
-        profile.recurrenceReductionGroupCyclesByFactorAndLaneSteps);
-    readFactorMeasurementCurves(
-        *recurrence, "reduction_group_startup_system_cycle_measurements",
-        "system_cycle", microbench, reader, prefix + ".loop_carried_recurrence",
-        profile.recurrenceReductionGroupStartupCyclesByFactorAndLaneSteps);
+    readFactorMeasurementCurveFields(
+        *recurrence, "system_cycle", microbench, reader,
+        prefix + ".loop_carried_recurrence",
+        {{"reduction_group_iteration_system_cycle_measurements",
+          &profile.recurrenceReductionGroupCyclesByFactorAndLaneSteps},
+         {"reduction_group_startup_system_cycle_measurements",
+          &profile.recurrenceReductionGroupStartupCyclesByFactorAndLaneSteps}});
     if (const auto *completion =
             recurrence->getObject("single_result_row_reduction_completion")) {
       const std::string path =
@@ -1933,22 +1815,17 @@ static void readStageResources(ProfileJSONReader &reader,
       else
         profile.continuousMemoryGroupBaseWarpCount = *baseWarpCount;
     }
-    readFactorMeasurementCurves(
-        *continuous, "load_group_operation_system_cycle_measurements",
-        "system_cycle", microbench, reader, prefix + ".continuous_memory",
-        profile.continuousLoadGroupCyclesByFactorAndBytes);
-    readFactorMeasurementCurves(
-        *continuous, "store_group_operation_system_cycle_measurements",
-        "system_cycle", microbench, reader, prefix + ".continuous_memory",
-        profile.continuousStoreGroupCyclesByFactorAndBytes);
-    readFactorMeasurementCurves(
-        *continuous, "load_group_startup_system_cycle_measurements",
-        "system_cycle", microbench, reader, prefix + ".continuous_memory",
-        profile.continuousLoadGroupStartupCyclesByFactorAndBytes);
-    readFactorMeasurementCurves(
-        *continuous, "store_group_startup_system_cycle_measurements",
-        "system_cycle", microbench, reader, prefix + ".continuous_memory",
-        profile.continuousStoreGroupStartupCyclesByFactorAndBytes);
+    readFactorMeasurementCurveFields(
+        *continuous, "system_cycle", microbench, reader,
+        prefix + ".continuous_memory",
+        {{"load_group_operation_system_cycle_measurements",
+          &profile.continuousLoadGroupCyclesByFactorAndBytes},
+         {"store_group_operation_system_cycle_measurements",
+          &profile.continuousStoreGroupCyclesByFactorAndBytes},
+         {"load_group_startup_system_cycle_measurements",
+          &profile.continuousLoadGroupStartupCyclesByFactorAndBytes},
+         {"store_group_startup_system_cycle_measurements",
+          &profile.continuousStoreGroupStartupCyclesByFactorAndBytes}});
   }
   if (context == "simd")
     if (const auto *completion =
@@ -2009,53 +1886,43 @@ static void readStageResources(ProfileJSONReader &reader,
     profile.indirectDependencyLatencyCycles =
         reader.optionalNumber(*indirect, "dependency_latency_system_cycles",
                               profile.indirectDependencyLatencyCycles);
-    readPositiveIntegerMeasurementCurve(
-        *indirect, "load_system_cycle_measurements", "system_cycle", microbench,
-        reader, path, profile.indirectLoadSystemCyclesByWarpInstructions);
-    readPositiveIntegerMeasurementCurve(
-        *indirect, "load_element_system_cycle_measurements", "system_cycle",
-        microbench, reader, path, profile.indirectLoadSystemCyclesByElements);
-    readPositiveIntegerMeasurementCurve(
-        *indirect, "load_startup_system_cycle_measurements", "system_cycle",
-        microbench, reader, path,
-        profile.indirectLoadStartupSystemCyclesByWarpInstructions);
-    readPositiveIntegerMeasurementCurve(
-        *indirect, "store_system_cycle_measurements", "system_cycle",
-        microbench, reader, path, profile.indirectStoreSystemCyclesBySegments);
-    readFactorMeasurementCurves(
-        *indirect, "load_group_system_cycle_measurements", "system_cycle",
-        microbench, reader, path,
-        profile.indirectLoadGroupCyclesByFactorAndWarpInstructions);
-    readFactorMeasurementCurves(
-        *indirect, "load_group_startup_system_cycle_measurements",
-        "system_cycle", microbench, reader, path,
-        profile.indirectLoadGroupStartupCyclesByFactorAndWarpInstructions);
-    readFactorRowExtentMeasurementSurfaces(
-        *indirect, "segmented_load_group_system_cycle_measurements", microbench,
-        reader, path,
-        profile
-            .segmentedIndirectLoadGroupCyclesByFactorSegmentsAndContiguousElements);
-    readFactorRowExtentMeasurementSurfaces(
-        *indirect, "segmented_load_fp32_group_system_cycle_measurements",
-        microbench, reader, path,
-        profile
-            .segmentedIndirectLoadFp32GroupCyclesByFactorSegmentsAndContiguousElements);
-    readPositiveIntegerMeasurementCurve(
-        *indirect, "grid_stride_load_system_cycle_measurements", "system_cycle",
-        microbench, reader, path,
-        profile.gridStrideIndirectLoadCyclesByWarpInstructions);
-    readPositiveIntegerMeasurementCurve(
-        *indirect, "grid_stride_load_startup_system_cycle_measurements",
-        "system_cycle", microbench, reader, path,
-        profile.gridStrideIndirectLoadStartupCyclesByWarpInstructions);
-    readFactorMeasurementCurves(
-        *indirect, "grid_stride_load_factor_system_cycle_measurements",
-        "system_cycle", microbench, reader, path,
-        profile.gridStrideIndirectLoadCyclesByFactorAndWarpInstructions);
-    readFactorMeasurementCurves(
-        *indirect, "grid_stride_load_factor_startup_system_cycle_measurements",
-        "system_cycle", microbench, reader, path,
-        profile.gridStrideIndirectLoadStartupCyclesByFactorAndWarpInstructions);
+    readPositiveIntegerMeasurementCurves(
+        *indirect, "system_cycle", microbench, reader, path,
+        {{"load_system_cycle_measurements",
+          &profile.indirectLoadSystemCyclesByWarpInstructions},
+         {"load_element_system_cycle_measurements",
+          &profile.indirectLoadSystemCyclesByElements},
+         {"load_startup_system_cycle_measurements",
+          &profile.indirectLoadStartupSystemCyclesByWarpInstructions},
+         {"store_system_cycle_measurements",
+          &profile.indirectStoreSystemCyclesBySegments}});
+    readFactorMeasurementCurveFields(
+        *indirect, "system_cycle", microbench, reader, path,
+        {{"load_group_system_cycle_measurements",
+          &profile.indirectLoadGroupCyclesByFactorAndWarpInstructions},
+         {"load_group_startup_system_cycle_measurements",
+          &profile.indirectLoadGroupStartupCyclesByFactorAndWarpInstructions}});
+    readFactorRowExtentMeasurementSurfaceFields(
+        *indirect, microbench, reader, path,
+        {{"segmented_load_group_system_cycle_measurements",
+          &profile
+               .segmentedIndirectLoadGroupCyclesByFactorSegmentsAndContiguousElements},
+         {"segmented_load_fp32_group_system_cycle_measurements",
+          &profile
+               .segmentedIndirectLoadFp32GroupCyclesByFactorSegmentsAndContiguousElements}});
+    readPositiveIntegerMeasurementCurves(
+        *indirect, "system_cycle", microbench, reader, path,
+        {{"grid_stride_load_system_cycle_measurements",
+          &profile.gridStrideIndirectLoadCyclesByWarpInstructions},
+         {"grid_stride_load_startup_system_cycle_measurements",
+          &profile.gridStrideIndirectLoadStartupCyclesByWarpInstructions}});
+    readFactorMeasurementCurveFields(
+        *indirect, "system_cycle", microbench, reader, path,
+        {{"grid_stride_load_factor_system_cycle_measurements",
+          &profile.gridStrideIndirectLoadCyclesByFactorAndWarpInstructions},
+         {"grid_stride_load_factor_startup_system_cycle_measurements",
+          &profile
+               .gridStrideIndirectLoadStartupCyclesByFactorAndWarpInstructions}});
   }
   if (const auto *atomic = resources->getObject("atomic_memory")) {
     const std::string path = prefix + ".atomic_memory";
@@ -2122,65 +1989,49 @@ static void readStageResources(ProfileJSONReader &reader,
       profile.gridStrideResidentMemoryEvidence =
           reader.string(*resident, "evidence", residentPath);
     }
-    readPositiveIntegerMeasurementCurve(
-        *gridStride, "dot_system_cycle_measurements", "system_cycle",
-        microbench, reader, path, profile.gridStrideDotCyclesByFlops);
-    readPositiveIntegerMeasurementCurve(
-        *gridStride, "dot_startup_system_cycle_measurements", "system_cycle",
-        microbench, reader, path, profile.gridStrideDotStartupCyclesByFlops);
-    readFactorMeasurementCurves(
-        *gridStride, "dot_factor_system_cycle_measurements", "system_cycle",
-        microbench, reader, path, profile.gridStrideDotCyclesByFactorAndFlops);
-    readFactorMeasurementCurves(
-        *gridStride, "dot_factor_startup_system_cycle_measurements",
-        "system_cycle", microbench, reader, path,
-        profile.gridStrideDotStartupCyclesByFactorAndFlops);
-    readFactorRowExtentMeasurementSurfaces(
-        *gridStride,
-        "indirect_dot_composition_body_residual_system_cycle_measurements",
-        microbench, reader, path,
-        profile
-            .gridStrideIndirectDotCompositionBodyResidualByFactorAndGeometry);
-    readFactorRowExtentMeasurementSurfaces(
-        *gridStride,
-        "indirect_dot_composition_startup_residual_system_cycle_measurements",
-        microbench, reader, path,
-        profile
-            .gridStrideIndirectDotCompositionStartupResidualByFactorAndGeometry);
+    readPositiveIntegerMeasurementCurves(
+        *gridStride, "system_cycle", microbench, reader, path,
+        {{"dot_system_cycle_measurements", &profile.gridStrideDotCyclesByFlops},
+         {"dot_startup_system_cycle_measurements",
+          &profile.gridStrideDotStartupCyclesByFlops}});
+    readFactorMeasurementCurveFields(
+        *gridStride, "system_cycle", microbench, reader, path,
+        {{"dot_factor_system_cycle_measurements",
+          &profile.gridStrideDotCyclesByFactorAndFlops},
+         {"dot_factor_startup_system_cycle_measurements",
+          &profile.gridStrideDotStartupCyclesByFactorAndFlops}});
+    readFactorRowExtentMeasurementSurfaceFields(
+        *gridStride, microbench, reader, path,
+        {{"indirect_dot_composition_body_residual_system_cycle_measurements",
+          &profile
+               .gridStrideIndirectDotCompositionBodyResidualByFactorAndGeometry},
+         {"indirect_dot_composition_startup_residual_system_cycle_measurements",
+          &profile
+               .gridStrideIndirectDotCompositionStartupResidualByFactorAndGeometry}});
     if (gridStride->get(
             "indirect_dot_composition_body_residual_system_cycle_measurements"))
       profile.gridStrideIndirectDotCompositionEvidence =
           reader.string(*gridStride, "indirect_dot_composition_evidence", path);
-    readPositiveIntegerMeasurementCurve(
-        *gridStride, "forward_scan_system_cycle_measurements", "system_cycle",
-        microbench, reader, path, profile.gridStrideForwardScanCyclesByExtent);
-    readPositiveIntegerMeasurementCurve(
-        *gridStride, "forward_scan_startup_system_cycle_measurements",
-        "system_cycle", microbench, reader, path,
-        profile.gridStrideForwardScanStartupCyclesByExtent);
-    readPositiveIntegerMeasurementCurve(
-        *gridStride, "reverse_scan_system_cycle_measurements", "system_cycle",
-        microbench, reader, path, profile.gridStrideReverseScanCyclesByExtent);
-    readPositiveIntegerMeasurementCurve(
-        *gridStride, "reverse_scan_startup_system_cycle_measurements",
-        "system_cycle", microbench, reader, path,
-        profile.gridStrideReverseScanStartupCyclesByExtent);
-    readFactorMeasurementCurves(
-        *gridStride, "forward_scan_factor_system_cycle_measurements",
-        "system_cycle", microbench, reader, path,
-        profile.gridStrideForwardScanCyclesByFactorAndExtent);
-    readFactorMeasurementCurves(
-        *gridStride, "forward_scan_factor_startup_system_cycle_measurements",
-        "system_cycle", microbench, reader, path,
-        profile.gridStrideForwardScanStartupCyclesByFactorAndExtent);
-    readFactorMeasurementCurves(
-        *gridStride, "reverse_scan_factor_system_cycle_measurements",
-        "system_cycle", microbench, reader, path,
-        profile.gridStrideReverseScanCyclesByFactorAndExtent);
-    readFactorMeasurementCurves(
-        *gridStride, "reverse_scan_factor_startup_system_cycle_measurements",
-        "system_cycle", microbench, reader, path,
-        profile.gridStrideReverseScanStartupCyclesByFactorAndExtent);
+    readPositiveIntegerMeasurementCurves(
+        *gridStride, "system_cycle", microbench, reader, path,
+        {{"forward_scan_system_cycle_measurements",
+          &profile.gridStrideForwardScanCyclesByExtent},
+         {"forward_scan_startup_system_cycle_measurements",
+          &profile.gridStrideForwardScanStartupCyclesByExtent},
+         {"reverse_scan_system_cycle_measurements",
+          &profile.gridStrideReverseScanCyclesByExtent},
+         {"reverse_scan_startup_system_cycle_measurements",
+          &profile.gridStrideReverseScanStartupCyclesByExtent}});
+    readFactorMeasurementCurveFields(
+        *gridStride, "system_cycle", microbench, reader, path,
+        {{"forward_scan_factor_system_cycle_measurements",
+          &profile.gridStrideForwardScanCyclesByFactorAndExtent},
+         {"forward_scan_factor_startup_system_cycle_measurements",
+          &profile.gridStrideForwardScanStartupCyclesByFactorAndExtent},
+         {"reverse_scan_factor_system_cycle_measurements",
+          &profile.gridStrideReverseScanCyclesByFactorAndExtent},
+         {"reverse_scan_factor_startup_system_cycle_measurements",
+          &profile.gridStrideReverseScanStartupCyclesByFactorAndExtent}});
   }
 }
 
@@ -2300,198 +2151,179 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
   if (usesGenericResourceFormula && !kernelTiming)
     reader.setError("profile.kernel_timing must be an object for schema 19");
   if (kernelTiming) {
-    profile.kernelTiming.scalarPrologueSystemCycles =
+    auto &timing = profile.kernelTiming;
+    timing.scalarPrologueSystemCycles =
         reader.number(*kernelTiming, "scalar_prologue_system_cycles",
                       "profile.kernel_timing");
-    profile.kernelTiming.scalarEpilogueSystemCycles =
+    timing.scalarEpilogueSystemCycles =
         reader.number(*kernelTiming, "scalar_epilogue_system_cycles",
                       "profile.kernel_timing");
     readPositiveIntegerNumberCurve(
         *kernelTiming,
         "boundary_residual_system_cycles_by_physical_program_count", reader,
         "profile.kernel_timing",
-        profile.kernelTiming
-            .boundaryResidualSystemCyclesByPhysicalProgramCount);
+        timing.boundaryResidualSystemCyclesByPhysicalProgramCount);
     readRouteFactorNumberCurves(
         *kernelTiming,
         "boundary_residual_system_cycles_by_route_factor_and_physical_program_"
         "count",
         reader, "profile.kernel_timing",
-        profile.kernelTiming
+        timing
             .boundaryResidualSystemCyclesByRouteFactorAndPhysicalProgramCount);
-    readRouteNumberMap(
-        *kernelTiming, "global_load_boundary_residual_system_cycles_by_route",
-        reader, "profile.kernel_timing",
-        profile.kernelTiming.globalLoadBoundaryResidualSystemCyclesByRoute);
-    readRuntimeArgumentSetupByRoute(
-        *kernelTiming, reader, "profile.kernel_timing",
-        profile.kernelTiming.runtimeArgumentSetupByRoute);
+    readRouteNumberMap(*kernelTiming,
+                       "global_load_boundary_residual_system_cycles_by_route",
+                       reader, "profile.kernel_timing",
+                       timing.globalLoadBoundaryResidualSystemCyclesByRoute);
+    readRuntimeArgumentSetupByRoute(*kernelTiming, reader,
+                                    "profile.kernel_timing",
+                                    timing.runtimeArgumentSetupByRoute);
     if (const auto *scalarizedRank2 = kernelTiming->getObject(
             "scalarized_rank2_indirect_load_completion")) {
       const std::string path =
           "profile.kernel_timing.scalarized_rank2_indirect_load_completion";
-      profile.kernelTiming.scalarizedRank2IndirectLoadMaximumElements =
+      timing.scalarizedRank2IndirectLoadMaximumElements =
           reader.integer(*scalarizedRank2, "maximum_elements", path);
       readPositiveIntegerNumberCurve(
           *scalarizedRank2, "residual_system_cycles_by_physical_program_count",
           reader, path,
-          profile.kernelTiming
-              .scalarizedRank2IndirectLoadResidualByPhysicalProgramCount);
-      profile.kernelTiming.scalarizedRank2IndirectLoadEvidence =
+          timing.scalarizedRank2IndirectLoadResidualByPhysicalProgramCount);
+      timing.scalarizedRank2IndirectLoadEvidence =
           reader.string(*scalarizedRank2, "evidence", path);
     }
     if (const auto *rank2Direct = kernelTiming->getObject(
             "simd_rank2_strided_direct_load_completion")) {
       const std::string path =
           "profile.kernel_timing.simd_rank2_strided_direct_load_completion";
-      profile.kernelTiming.simdRank2StridedDirectLoadMinimumElements =
-          reader.integer(*rank2Direct, "minimum_elements", path);
-      profile.kernelTiming.simdRank2StridedDirectLoadMaximumElements =
-          reader.integer(*rank2Direct, "maximum_elements", path);
-      profile.kernelTiming.simdRank2StridedDirectLoadStartupCycles =
-          reader.number(*rank2Direct, "startup_system_cycles", path);
-      profile.kernelTiming.simdRank2StridedDirectLoadPerElementCycles =
-          reader.number(*rank2Direct, "per_element_system_cycles", path);
-      profile.kernelTiming.simdRank2StridedDirectLoadMaximumResidualCycles =
-          reader.number(*rank2Direct, "maximum_residual_system_cycles", path);
-      profile.kernelTiming.simdRank2StridedDirectLoadEvidence =
-          reader.string(*rank2Direct, "evidence", path);
+      auto &result = timing.simdRank2StridedDirectLoad;
+      readIntegers(reader, *rank2Direct, path,
+                   {{"minimum_elements", &result.minimumElements},
+                    {"maximum_elements", &result.maximumElements}});
+      readNumbers(reader, *rank2Direct, path,
+                  {{"startup_system_cycles", &result.startupCycles},
+                   {"per_element_system_cycles", &result.perElementCycles},
+                   {"maximum_residual_system_cycles", &result.maximumCycles}});
+      result.evidence = reader.string(*rank2Direct, "evidence", path);
     }
     if (const auto *rank2Direct = kernelTiming->getObject(
             "simt_rank2_strided_direct_load_completion")) {
       const std::string path =
           "profile.kernel_timing.simt_rank2_strided_direct_load_completion";
-      profile.kernelTiming.simtRank2StridedDirectLoadMinimumElements =
-          reader.integer(*rank2Direct, "minimum_elements", path);
-      profile.kernelTiming.simtRank2StridedDirectLoadMaximumElements =
-          reader.integer(*rank2Direct, "maximum_elements", path);
-      profile.kernelTiming.simtRank2StridedDirectLoadStartupCycles =
-          reader.number(*rank2Direct, "startup_system_cycles", path);
-      profile.kernelTiming.simtRank2StridedDirectLoadPerElementCycles =
-          reader.number(*rank2Direct, "per_element_system_cycles", path);
-      profile.kernelTiming.simtRank2StridedDirectLoadMaximumTargetCycles =
-          reader.number(*rank2Direct, "maximum_target_system_cycles", path);
-      profile.kernelTiming.simtRank2StridedDirectLoadEvidence =
-          reader.string(*rank2Direct, "evidence", path);
+      auto &result = timing.simtRank2StridedDirectLoad;
+      readIntegers(reader, *rank2Direct, path,
+                   {{"minimum_elements", &result.minimumElements},
+                    {"maximum_elements", &result.maximumElements}});
+      readNumbers(reader, *rank2Direct, path,
+                  {{"startup_system_cycles", &result.startupCycles},
+                   {"per_element_system_cycles", &result.perElementCycles},
+                   {"maximum_target_system_cycles", &result.maximumCycles}});
+      result.evidence = reader.string(*rank2Direct, "evidence", path);
     }
     if (const auto *simtRank2 =
             kernelTiming->getObject("simt_rank2_indirect_load_completion")) {
       const std::string path =
           "profile.kernel_timing.simt_rank2_indirect_load_completion";
-      profile.kernelTiming.simtRank2IndirectLoadMaximumElements =
+      timing.simtRank2IndirectLoadMaximumElements =
           reader.integer(*simtRank2, "maximum_elements", path);
       readSignedPositiveIntegerNumberCurves(
           *simtRank2, "residual_system_cycles_by_element_bits_and_elements",
           reader, path,
-          profile.kernelTiming
-              .simtRank2IndirectLoadResidualByElementBitsAndElements);
-      profile.kernelTiming.simtRank2IndirectLoadEvidence =
+          timing.simtRank2IndirectLoadResidualByElementBitsAndElements);
+      timing.simtRank2IndirectLoadEvidence =
           reader.string(*simtRank2, "evidence", path);
     }
     if (const auto *subwarpComposite =
             kernelTiming->getObject("subwarp_indirect_composite_completion")) {
       const std::string path =
           "profile.kernel_timing.subwarp_indirect_composite_completion";
-      profile.kernelTiming.subwarpIndirectCompositeMaximumElements =
+      timing.subwarpIndirectCompositeMaximumElements =
           reader.integer(*subwarpComposite, "maximum_elements", path);
       readPositiveIntegerNumberCurve(
           *subwarpComposite, "residual_system_cycles_by_elements", reader, path,
-          profile.kernelTiming.subwarpIndirectCompositeResidualByElements);
-      profile.kernelTiming.subwarpIndirectCompositeEvidence =
+          timing.subwarpIndirectCompositeResidualByElements);
+      timing.subwarpIndirectCompositeEvidence =
           reader.string(*subwarpComposite, "evidence", path);
     }
     if (const auto *multiResultScan = kernelTiming->getObject(
             "simd_multi_result_prefix_scan_completion")) {
       const std::string path =
           "profile.kernel_timing.simd_multi_result_prefix_scan_completion";
-      auto &result = profile.kernelTiming.simdMultiResultPrefixScanCompletion;
+      auto &result = timing.routeCompletions.multiResultPrefixScan;
       result.enabled = true;
-      result.minimumPrograms =
-          reader.integer(*multiResultScan, "minimum_source_programs", path);
-      result.maximumPrograms =
-          reader.integer(*multiResultScan, "maximum_source_programs", path);
-      result.minimumPaddedAxis =
-          reader.integer(*multiResultScan, "minimum_padded_axis", path);
-      result.maximumPaddedAxis =
-          reader.integer(*multiResultScan, "maximum_padded_axis", path);
-      result.requiredResultCount =
-          reader.integer(*multiResultScan, "required_result_count", path);
-      result.requiredIndependentSequences = reader.integer(
-          *multiResultScan, "required_independent_sequences", path);
-      result.minimumActiveRatio =
-          reader.number(*multiResultScan, "minimum_active_ratio", path);
-      result.maximumActiveRatio =
-          reader.number(*multiResultScan, "maximum_active_ratio", path);
-      result.elapsedInterceptCycles = reader.number(
-          *multiResultScan, "elapsed_intercept_system_cycles", path);
-      result.elapsedSqrtProgramCycles = reader.number(
-          *multiResultScan, "elapsed_sqrt_program_system_cycles", path);
-      result.elapsedInactiveRatioCycles = reader.number(
-          *multiResultScan, "elapsed_inactive_ratio_system_cycles", path);
-      result.elapsedPaddedAxisCycles = reader.number(
-          *multiResultScan, "elapsed_padded_axis_system_cycles", path);
+      readIntegers(reader, *multiResultScan, path,
+                   {{"minimum_source_programs", &result.minimumPrograms},
+                    {"maximum_source_programs", &result.maximumPrograms},
+                    {"minimum_padded_axis", &result.minimumPaddedAxis},
+                    {"maximum_padded_axis", &result.maximumPaddedAxis},
+                    {"required_result_count", &result.requiredResultCount},
+                    {"required_independent_sequences",
+                     &result.requiredIndependentSequences}});
+      readNumbers(
+          reader, *multiResultScan, path,
+          {{"minimum_active_ratio", &result.minimumActiveRatio},
+           {"maximum_active_ratio", &result.maximumActiveRatio},
+           {"elapsed_intercept_system_cycles", &result.elapsedInterceptCycles},
+           {"elapsed_sqrt_program_system_cycles",
+            &result.elapsedSqrtProgramCycles},
+           {"elapsed_inactive_ratio_system_cycles",
+            &result.elapsedInactiveRatioCycles},
+           {"elapsed_padded_axis_system_cycles",
+            &result.elapsedPaddedAxisCycles}});
       result.evidence = reader.string(*multiResultScan, "evidence", path);
     }
     if (const auto *scan = kernelTiming->getObject(
             "rank2_interleaved_prefix_scan_completion")) {
       const std::string path =
           "profile.kernel_timing.rank2_interleaved_prefix_scan_completion";
-      auto &result = profile.kernelTiming.rank2InterleavedPrefixScanCompletion;
+      auto &result = timing.rank2InterleavedPrefixScanCompletion;
       result.enabled = true;
-      result.minimumSourcePrograms =
-          reader.integer(*scan, "minimum_source_programs", path);
-      result.maximumSourcePrograms =
-          reader.integer(*scan, "maximum_source_programs", path);
-      result.minimumExtent = reader.integer(*scan, "minimum_scan_extent", path);
-      result.maximumExtent = reader.integer(*scan, "maximum_scan_extent", path);
-      result.minimumIndependentSequences =
-          reader.integer(*scan, "minimum_independent_sequences", path);
-      result.maximumIndependentSequences =
-          reader.integer(*scan, "maximum_independent_sequences", path);
-      result.startupSystemCycles =
-          reader.number(*scan, "startup_system_cycles", path);
-      result.perElementSystemCycles =
-          reader.number(*scan, "per_element_system_cycles", path);
-      result.factor2StartupSystemCycles =
-          reader.number(*scan, "factor2_startup_system_cycles", path);
-      result.factor2PerElementSystemCycles =
-          reader.number(*scan, "factor2_per_element_system_cycles", path);
-      result.factor2ReferencePhysicalProgramCount = reader.integer(
-          *scan, "factor2_reference_physical_program_count", path);
-      result.factor2PerActivePhysicalProgramSystemCycles = reader.number(
-          *scan, "factor2_per_active_physical_program_system_cycles", path);
-      result.factor2MinimumTargetSystemCycles =
-          reader.number(*scan, "factor2_minimum_target_system_cycles", path);
-      result.factor4StartupSystemCycles =
-          reader.number(*scan, "factor4_startup_system_cycles", path);
-      result.factor4PerElementSystemCycles =
-          reader.number(*scan, "factor4_per_element_system_cycles", path);
+      readIntegers(reader, *scan, path,
+                   {{"minimum_source_programs", &result.minimumSourcePrograms},
+                    {"maximum_source_programs", &result.maximumSourcePrograms},
+                    {"minimum_scan_extent", &result.minimumExtent},
+                    {"maximum_scan_extent", &result.maximumExtent},
+                    {"minimum_independent_sequences",
+                     &result.minimumIndependentSequences},
+                    {"maximum_independent_sequences",
+                     &result.maximumIndependentSequences},
+                    {"factor2_reference_physical_program_count",
+                     &result.factor2ReferencePhysicalProgramCount}});
+      readNumbers(
+          reader, *scan, path,
+          {{"startup_system_cycles", &result.startupSystemCycles},
+           {"per_element_system_cycles", &result.perElementSystemCycles},
+           {"factor2_startup_system_cycles",
+            &result.factor2StartupSystemCycles},
+           {"factor2_per_element_system_cycles",
+            &result.factor2PerElementSystemCycles},
+           {"factor2_per_active_physical_program_system_cycles",
+            &result.factor2PerActivePhysicalProgramSystemCycles},
+           {"factor2_minimum_target_system_cycles",
+            &result.factor2MinimumTargetSystemCycles},
+           {"factor4_startup_system_cycles",
+            &result.factor4StartupSystemCycles},
+           {"factor4_per_element_system_cycles",
+            &result.factor4PerElementSystemCycles}});
       result.evidence = reader.string(*scan, "evidence", path);
     }
     if (const auto *staticLoop = kernelTiming->getObject(
             "simt_static_loop_direct_memory_completion")) {
       const std::string path =
           "profile.kernel_timing.simt_static_loop_direct_memory_completion";
-      auto &result = profile.kernelTiming.simtStaticLoopDirectMemoryCompletion;
+      auto &result = timing.simtStaticLoopDirectMemoryCompletion;
       result.enabled = true;
-      result.minimumStaticIterations =
-          reader.integer(*staticLoop, "minimum_static_iterations", path);
-      result.maximumStaticIterations =
-          reader.integer(*staticLoop, "maximum_static_iterations", path);
-      result.requiredContiguousElements = reader.integer(
-          *staticLoop, "required_contiguous_elements_per_access", path);
-      result.requiredElementBits =
-          reader.integer(*staticLoop, "required_element_bits", path);
-      result.minimumLoadCount =
-          reader.integer(*staticLoop, "minimum_load_count", path);
-      result.maximumLoadCount =
-          reader.integer(*staticLoop, "maximum_load_count", path);
-      result.requiredStoreCount =
-          reader.integer(*staticLoop, "required_store_count", path);
-      result.maximumSuperblockFactor =
-          reader.integer(*staticLoop, "maximum_superblock_factor", path);
-      result.startupSystemCycles =
-          reader.number(*staticLoop, "startup_system_cycles", path);
+      readIntegers(
+          reader, *staticLoop, path,
+          {{"minimum_static_iterations", &result.minimumStaticIterations},
+           {"maximum_static_iterations", &result.maximumStaticIterations},
+           {"required_contiguous_elements_per_access",
+            &result.requiredContiguousElements},
+           {"required_element_bits", &result.requiredElementBits},
+           {"minimum_load_count", &result.minimumLoadCount},
+           {"maximum_load_count", &result.maximumLoadCount},
+           {"required_store_count", &result.requiredStoreCount},
+           {"maximum_superblock_factor", &result.maximumSuperblockFactor}});
+      readNumbers(reader, *staticLoop, path,
+                  {{"startup_system_cycles", &result.startupSystemCycles}});
       readPositiveIntegerNumberCurve(
           *staticLoop, "per_iteration_system_cycles_by_load_count", reader,
           path, result.perIterationSystemCyclesByLoadCount);
@@ -2501,133 +2333,119 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
             "simt_pairwise_selection_network_completion")) {
       const std::string path =
           "profile.kernel_timing.simt_pairwise_selection_network_completion";
-      auto &result =
-          profile.kernelTiming.simtPairwiseSelectionNetworkCompletion;
+      auto &result = timing.routeCompletions.pairwiseSelectionNetwork;
       result.enabled = true;
-      result.minimumInputElements =
-          reader.integer(*selectionNetwork, "minimum_input_elements", path);
-      result.maximumInputElements =
-          reader.integer(*selectionNetwork, "maximum_input_elements", path);
-      result.minimumOutputColumns =
-          reader.integer(*selectionNetwork, "minimum_output_columns", path);
-      result.maximumOutputColumns =
-          reader.integer(*selectionNetwork, "maximum_output_columns", path);
-      result.minimumReductionStages =
-          reader.integer(*selectionNetwork, "minimum_reduction_stages", path);
-      result.interceptCycles =
-          reader.number(*selectionNetwork, "intercept_system_cycles", path);
-      result.inputElementCycles =
-          reader.number(*selectionNetwork, "input_element_system_cycles", path);
-      result.log2OutputColumnCycles = reader.number(
-          *selectionNetwork, "log2_output_column_system_cycles", path);
+      readIntegers(
+          reader, *selectionNetwork, path,
+          {{"minimum_input_elements", &result.minimumInputElements},
+           {"maximum_input_elements", &result.maximumInputElements},
+           {"minimum_output_columns", &result.minimumOutputColumns},
+           {"maximum_output_columns", &result.maximumOutputColumns},
+           {"minimum_reduction_stages", &result.minimumReductionStages}});
+      readNumbers(reader, *selectionNetwork, path,
+                  {{"intercept_system_cycles", &result.interceptCycles},
+                   {"input_element_system_cycles", &result.inputElementCycles},
+                   {"log2_output_column_system_cycles",
+                    &result.log2OutputColumnCycles}});
       result.evidence = reader.string(*selectionNetwork, "evidence", path);
     }
     if (const auto *largeScan = kernelTiming->getObject(
             "simd_large_sequence_minmax_scan_completion")) {
       const std::string path =
           "profile.kernel_timing.simd_large_sequence_minmax_scan_completion";
-      auto &result = profile.kernelTiming.simdLargeSequenceMinmaxScanCompletion;
+      auto &result = timing.routeCompletions.largeSequenceMinmaxScan;
       result.enabled = true;
-      result.minimumIndependentSequences =
-          reader.integer(*largeScan, "minimum_independent_sequences", path);
-      result.maximumIndependentSequences =
-          reader.integer(*largeScan, "maximum_independent_sequences", path);
-      result.minimumExtent =
-          reader.integer(*largeScan, "minimum_scan_extent", path);
-      result.maximumExtent =
-          reader.integer(*largeScan, "maximum_scan_extent", path);
-      result.perIndependentSequenceSystemCycles = reader.number(
-          *largeScan, "per_independent_sequence_system_cycles", path);
+      readIntegers(reader, *largeScan, path,
+                   {{"minimum_independent_sequences",
+                     &result.minimumIndependentSequences},
+                    {"maximum_independent_sequences",
+                     &result.maximumIndependentSequences},
+                    {"minimum_scan_extent", &result.minimumExtent},
+                    {"maximum_scan_extent", &result.maximumExtent}});
+      readNumbers(reader, *largeScan, path,
+                  {{"per_independent_sequence_system_cycles",
+                    &result.perIndependentSequenceSystemCycles}});
       result.evidence = reader.string(*largeScan, "evidence", path);
     }
     if (const auto *minmaxScan = kernelTiming->getObject(
             "simt_multi_sequence_minmax_scan_completion")) {
       const std::string path =
           "profile.kernel_timing.simt_multi_sequence_minmax_scan_completion";
-      auto &result = profile.kernelTiming.simtMultiSequenceMinmaxScanCompletion;
+      auto &result = timing.routeCompletions.multiSequenceMinmaxScan;
       result.enabled = true;
-      result.minimumIndependentSequences =
-          reader.integer(*minmaxScan, "minimum_independent_sequences", path);
-      result.maximumIndependentSequences =
-          reader.integer(*minmaxScan, "maximum_independent_sequences", path);
-      result.minimumExtent =
-          reader.integer(*minmaxScan, "minimum_scan_extent", path);
-      result.maximumExtent =
-          reader.integer(*minmaxScan, "maximum_scan_extent", path);
-      result.baseReductionSystemCycles =
-          reader.number(*minmaxScan, "base_reduction_system_cycles", path);
-      result.perIndependentSequenceReductionSystemCycles = reader.number(
-          *minmaxScan, "per_independent_sequence_reduction_system_cycles",
-          path);
-      result.maximumReductionSystemCycles =
-          reader.number(*minmaxScan, "maximum_reduction_system_cycles", path);
-      result.largeMinimumIndependentSequences =
-          minmaxScan->getInteger("large_minimum_independent_sequences")
-              .value_or(0);
-      result.largeMaximumIndependentSequences =
-          minmaxScan->getInteger("large_maximum_independent_sequences")
-              .value_or(0);
-      result.largeMinimumExtent =
-          minmaxScan->getInteger("large_minimum_scan_extent").value_or(0);
-      result.largeMaximumExtent =
-          minmaxScan->getInteger("large_maximum_scan_extent").value_or(0);
-      result.largeBaseReductionSystemCycles =
-          minmaxScan->getNumber("large_base_reduction_system_cycles")
-              .value_or(0.0);
-      result.largePerIndependentSequenceReductionSystemCycles =
-          minmaxScan
-              ->getNumber(
-                  "large_per_independent_sequence_reduction_system_cycles")
-              .value_or(0.0);
-      result.largeMaximumReductionSystemCycles =
-          minmaxScan->getNumber("large_maximum_reduction_system_cycles")
-              .value_or(0.0);
+      readIntegers(reader, *minmaxScan, path,
+                   {{"minimum_independent_sequences",
+                     &result.minimumIndependentSequences},
+                    {"maximum_independent_sequences",
+                     &result.maximumIndependentSequences},
+                    {"minimum_scan_extent", &result.minimumExtent},
+                    {"maximum_scan_extent", &result.maximumExtent}});
+      readNumbers(
+          reader, *minmaxScan, path,
+          {{"base_reduction_system_cycles", &result.baseReductionSystemCycles},
+           {"per_independent_sequence_reduction_system_cycles",
+            &result.perIndependentSequenceReductionSystemCycles},
+           {"maximum_reduction_system_cycles",
+            &result.maximumReductionSystemCycles}});
+      readOptionalIntegers(
+          *minmaxScan,
+          {{"large_minimum_independent_sequences",
+            &result.largeMinimumIndependentSequences},
+           {"large_maximum_independent_sequences",
+            &result.largeMaximumIndependentSequences},
+           {"large_minimum_scan_extent", &result.largeMinimumExtent},
+           {"large_maximum_scan_extent", &result.largeMaximumExtent}});
+      readOptionalNumbers(
+          reader, *minmaxScan,
+          {{"large_base_reduction_system_cycles",
+            &result.largeBaseReductionSystemCycles},
+           {"large_per_independent_sequence_reduction_system_cycles",
+            &result.largePerIndependentSequenceReductionSystemCycles},
+           {"large_maximum_reduction_system_cycles",
+            &result.largeMaximumReductionSystemCycles}});
       result.evidence = reader.string(*minmaxScan, "evidence", path);
     }
     if (const auto *addReduction = kernelTiming->getObject(
             "simd_straight_line_add_reduction_completion")) {
       const std::string path =
           "profile.kernel_timing.simd_straight_line_add_reduction_completion";
-      auto &result =
-          profile.kernelTiming.simdStraightLineAddReductionCompletion;
+      auto &result = timing.routeCompletions.straightLineAddReduction;
       result.enabled = true;
-      result.minimumRows = reader.integer(*addReduction, "minimum_rows", path);
-      result.maximumRows = reader.integer(*addReduction, "maximum_rows", path);
-      result.minimumExtent =
-          reader.integer(*addReduction, "minimum_extent", path);
-      result.maximumExtent =
-          reader.integer(*addReduction, "maximum_extent", path);
-      result.sharedCompletionSystemCycles =
-          reader.number(*addReduction, "shared_completion_system_cycles", path);
+      readIntegers(reader, *addReduction, path,
+                   {{"minimum_rows", &result.minimumRows},
+                    {"maximum_rows", &result.maximumRows},
+                    {"minimum_extent", &result.minimumExtent},
+                    {"maximum_extent", &result.maximumExtent}});
+      readNumbers(reader, *addReduction, path,
+                  {{"shared_completion_system_cycles",
+                    &result.sharedCompletionSystemCycles}});
       result.evidence = reader.string(*addReduction, "evidence", path);
     }
     if (const auto *twoLoopReduction = kernelTiming->getObject(
             "simd_two_loop_single_reduction_completion")) {
       const std::string path =
           "profile.kernel_timing.simd_two_loop_single_reduction_completion";
-      auto &result = profile.kernelTiming.simdTwoLoopSingleReductionCompletion;
+      auto &result = timing.routeCompletions.twoLoopSingleReduction;
       result.enabled = true;
-      result.minimumSourcePrograms =
-          reader.integer(*twoLoopReduction, "minimum_source_programs", path);
-      result.maximumSourcePrograms =
-          reader.integer(*twoLoopReduction, "maximum_source_programs", path);
-      result.minimumRuntimeIterations =
-          reader.integer(*twoLoopReduction, "minimum_runtime_iterations", path);
-      result.maximumRuntimeIterations =
-          reader.integer(*twoLoopReduction, "maximum_runtime_iterations", path);
-      result.requiredReductionExtent =
-          reader.integer(*twoLoopReduction, "required_reduction_extent", path);
-      result.firstIterationSystemCycles = reader.number(
-          *twoLoopReduction, "first_iteration_system_cycles", path);
-      result.additionalIterationSystemCycles = reader.number(
-          *twoLoopReduction, "additional_iteration_system_cycles", path);
+      readIntegers(
+          reader, *twoLoopReduction, path,
+          {{"minimum_source_programs", &result.minimumSourcePrograms},
+           {"maximum_source_programs", &result.maximumSourcePrograms},
+           {"minimum_runtime_iterations", &result.minimumRuntimeIterations},
+           {"maximum_runtime_iterations", &result.maximumRuntimeIterations},
+           {"required_reduction_extent", &result.requiredReductionExtent}});
+      readNumbers(reader, *twoLoopReduction, path,
+                  {{"first_iteration_system_cycles",
+                    &result.firstIterationSystemCycles},
+                   {"additional_iteration_system_cycles",
+                    &result.additionalIterationSystemCycles}});
       result.evidence = reader.string(*twoLoopReduction, "evidence", path);
     }
     if (const auto *tinyMemory = kernelTiming->getObject(
             "tiny_straight_line_simt_memory_completion")) {
       const std::string path =
           "profile.kernel_timing.tiny_straight_line_simt_memory_completion";
-      auto &result = profile.kernelTiming.tinyStraightLineSimtMemoryCompletion;
+      auto &result = timing.tinyStraightLineSimtMemoryCompletion;
       result.enabled = true;
       result.maximumElementsPerAccess =
           reader.integer(*tinyMemory, "maximum_elements_per_access", path);
@@ -2639,7 +2457,7 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
             "simt_non_affine_rank1_memory_completion")) {
       const std::string path =
           "profile.kernel_timing.simt_non_affine_rank1_memory_completion";
-      auto &result = profile.kernelTiming.simtNonAffineRank1MemoryCompletion;
+      auto &result = timing.simtNonAffineRank1MemoryCompletion;
       result.enabled = true;
       result.maximumElementsPerAccess =
           reader.integer(*nonAffine, "maximum_elements_per_access", path);
@@ -2648,17 +2466,18 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
           path, result.residualBySourceProgramCount);
       result.evidence = reader.string(*nonAffine, "evidence", path);
     }
-    profile.kernelTiming.systemCounterFrequencyMHz = reader.number(
+    timing.systemCounterFrequencyMHz = reader.number(
         *kernelTiming, "system_counter_frequency_mhz", "profile.kernel_timing");
-    profile.kernelTiming.evidence =
+    timing.evidence =
         reader.string(*kernelTiming, "evidence", "profile.kernel_timing");
-    if (!profile.kernelTiming.isValid())
+    if (!timing.isValid())
       reader.setError("profile.kernel_timing contains invalid generic kernel "
                       "boundary parameters");
   }
 
   const auto *simd = reader.object(*root, "simd", "profile");
   if (simd) {
+    auto &simdProfile = hardware.simd;
     int64_t vectorWidthBits = 0;
     if (simd->getString("vector_width_measurement")) {
       vectorWidthBits =
@@ -2668,70 +2487,68 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
     } else {
       vectorWidthBits = reader.integer(*simd, "vector_width_bits", "simd");
     }
-    hardware.simd.vectorWidthBits = std::max<int64_t>(1, vectorWidthBits);
-    hardware.simd.vectorWidth =
-        std::max<int64_t>(1, hardware.simd.vectorWidthBits / 32);
-    hardware.simd.issueWidth = hardware.simd.vectorWidth;
+    simdProfile.vectorWidthBits = std::max<int64_t>(1, vectorWidthBits);
+    simdProfile.vectorWidth =
+        std::max<int64_t>(1, simdProfile.vectorWidthBits / 32);
+    simdProfile.issueWidth = simdProfile.vectorWidth;
     if (const auto *startup =
             reader.object(*simd, "startup_system_cycles", "simd"))
-      hardware.simd.setupCycles = resolveNumberOrMeasurement(
+      simdProfile.setupCycles = resolveNumberOrMeasurement(
           *startup, "vector", "vector_measurement", "system_cycle", microbench,
           reader, "simd.startup_system_cycles");
     if (const auto *ops = reader.object(*simd, "ops", "simd")) {
-      // The schema validates every entry. Loading the complete map lets a
-      // measured fp32.saturated.<ttir-op> key override the generic fallback
-      // without adding that semantic name to a C++ allowlist.
+      // The schema validates every entry.
       for (const auto &entry : *ops)
-        hardware.simd.operationRates[entry.first] = resolveOpProfile(
+        simdProfile.operationRates[entry.first] = resolveOpProfile(
             *ops, entry.first,
             "throughput_vector_instructions_per_system_cycle",
             "vector_instruction/system_cycle", microbench, reader);
     }
     if (const auto *memory = reader.object(*simd, "memory", "simd")) {
-      hardware.simd.loadBytesPerCycle = resolveNumberOrMeasurement(
+      simdProfile.loadBytesPerCycle = resolveNumberOrMeasurement(
           *memory, "vector_mte2_bytes_per_system_cycle",
           "load_throughput_measurement", "byte/system_cycle", microbench,
           reader, "simd.memory");
-      hardware.simd.storeBytesPerCycle = resolveNumberOrMeasurement(
+      simdProfile.storeBytesPerCycle = resolveNumberOrMeasurement(
           *memory, "mte3_bytes_per_system_cycle",
           "store_throughput_measurement", "byte/system_cycle", microbench,
           reader, "simd.memory");
       if (memory->getString("load_startup_measurement"))
-        hardware.simd.loadOperationSetupCycles = resolveNumberOrMeasurement(
+        simdProfile.loadOperationSetupCycles = resolveNumberOrMeasurement(
             *memory, "load_operation_startup_system_cycles",
             "load_startup_measurement", "system_cycle", microbench, reader,
             "simd.memory");
       else
-        hardware.simd.loadOperationSetupCycles = reader.optionalNumber(
+        simdProfile.loadOperationSetupCycles = reader.optionalNumber(
             *memory, "load_operation_startup_system_cycles", 0.0);
       if (memory->getString("store_startup_measurement"))
-        hardware.simd.storeOperationSetupCycles = resolveNumberOrMeasurement(
+        simdProfile.storeOperationSetupCycles = resolveNumberOrMeasurement(
             *memory, "store_operation_startup_system_cycles",
             "store_startup_measurement", "system_cycle", microbench, reader,
             "simd.memory");
       else
-        hardware.simd.storeOperationSetupCycles = reader.optionalNumber(
+        simdProfile.storeOperationSetupCycles = reader.optionalNumber(
             *memory, "store_operation_startup_system_cycles", 0.0);
       if (const auto *group =
               memory->getObject("independent_loop_load_group")) {
         const std::string path = "simd.memory.independent_loop_load_group";
-        hardware.simd.independentLoadGroupKernelStartupCycles =
+        simdProfile.independentLoadGroupKernelStartupCycles =
             resolveNumberOrMeasurement(*group, "kernel_startup_system_cycles",
                                        "kernel_startup_measurement",
                                        "system_cycle", microbench, reader,
                                        path);
-        hardware.simd.independentLoadGroupIterationStartupCycles =
+        simdProfile.independentLoadGroupIterationStartupCycles =
             resolveNumberOrMeasurement(
                 *group, "iteration_startup_system_cycles",
                 "iteration_startup_measurement", "system_cycle", microbench,
                 reader, path);
-        hardware.simd.independentLoadGroupBytesPerCycle =
+        simdProfile.independentLoadGroupBytesPerCycle =
             resolveNumberOrMeasurement(
                 *group, "bytes_per_system_cycle", "throughput_measurement",
                 "byte/system_cycle", microbench, reader, path);
-        hardware.simd.independentLoadGroupMinimumOperations =
+        simdProfile.independentLoadGroupMinimumOperations =
             reader.integer(*group, "minimum_operations", path);
-        hardware.simd.independentLoadGroupMaximumOperations =
+        simdProfile.independentLoadGroupMaximumOperations =
             reader.integer(*group, "maximum_operations", path);
         if (reader.string(*group, "evidence", path).empty())
           reader.setError(path + ".evidence must identify calibration data");
@@ -2739,13 +2556,13 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
       if (const auto *completion =
               memory->getObject("computed_address_scalarized_load")) {
         const std::string path = "simd.memory.computed_address_scalarized_load";
-        hardware.simd.computedAddressScalarizedLoadMinimumElements =
+        simdProfile.computedAddressScalarizedLoadMinimumElements =
             reader.integer(*completion, "minimum_elements", path);
-        hardware.simd.computedAddressScalarizedLoadMaximumElements =
+        simdProfile.computedAddressScalarizedLoadMaximumElements =
             reader.integer(*completion, "maximum_elements", path);
-        hardware.simd.computedAddressScalarizedLoadCyclesPerElement =
+        simdProfile.computedAddressScalarizedLoadCyclesPerElement =
             reader.number(*completion, "system_cycles_per_element", path);
-        hardware.simd.computedAddressScalarizedLoadEvidence =
+        simdProfile.computedAddressScalarizedLoadEvidence =
             reader.string(*completion, "evidence", path);
       }
       if (const auto *completion =
@@ -2754,9 +2571,9 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
             "simd.memory.control_flow_address_scalarized_load";
         readPositiveIntegerNumberCurve(
             *completion, "residual_system_cycles_by_elements", reader, path,
-            hardware.simd
+            simdProfile
                 .controlFlowAddressScalarizedLoadResidualCyclesByElements);
-        hardware.simd.controlFlowAddressScalarizedLoadEvidence =
+        simdProfile.controlFlowAddressScalarizedLoadEvidence =
             reader.string(*completion, "evidence", path);
       }
       if (const auto *completion =
@@ -2766,48 +2583,44 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
         readSignedPositiveIntegerNumberCurves(
             *completion, "residual_system_cycles_by_row_bytes_and_active_rows",
             reader, path,
-            hardware.simd
+            simdProfile
                 .maskedLoadStoreRmwResidualCyclesByRowBytesAndActiveRows);
-        hardware.simd.maskedLoadStoreRmwEvidence =
+        simdProfile.maskedLoadStoreRmwEvidence =
             reader.string(*completion, "evidence", path);
       }
       if (const auto *completion =
               memory->getObject("irregular_tile_completion")) {
         const std::string path = "simd.memory.irregular_tile_completion";
-        hardware.simd.irregularTileCompletionEnabled = true;
-        hardware.simd.irregularTilePhysicalThresholdElements =
-            reader.integer(*completion, "physical_threshold_elements", path);
-        hardware.simd.irregularTilePhysicalExcessCyclesPerElement =
-            reader.number(*completion,
-                          "physical_excess_system_cycles_per_element", path);
-        hardware.simd.irregularTileActiveCyclesPerElement = reader.number(
-            *completion, "active_system_cycles_per_element", path);
-        hardware.simd.irregularTileTailCyclesPerInactiveElement = reader.number(
-            *completion, "tail_system_cycles_per_inactive_element", path);
-        hardware.simd.irregularTileRowGroupSize =
-            reader.integer(*completion, "row_group_size", path);
-        hardware.simd.irregularTileSmallRowMaximumRows =
-            reader.integer(*completion, "small_row_maximum_rows", path);
-        hardware.simd.irregularTileLargeRowMaskedFloorScale =
-            reader.number(*completion, "large_row_masked_floor_scale", path);
-        hardware.simd
-            .irregularTileAlignedTwoRowGroupPhysicalMaterializationScale =
-            reader.number(
-                *completion,
-                "aligned_two_row_group_physical_materialization_scale", path);
-        hardware.simd.irregularTileLargeWorkingSetFullPhysicalMinimumBytes =
-            reader.integer(*completion,
-                           "large_working_set_full_physical_minimum_bytes",
-                           path);
-        hardware.simd.irregularTileAlignedFirstRowGroupCyclesPerElement =
-            reader.number(*completion,
-                          "aligned_first_row_group_system_cycles_per_element",
-                          path);
-        hardware.simd.irregularTileAlignedAdditionalRowGroupCyclesPerElement =
-            reader.number(
-                *completion,
-                "aligned_additional_row_group_system_cycles_per_element", path);
-        hardware.simd.irregularTileCompletionEvidence =
+        simdProfile.irregularTileCompletionEnabled = true;
+        readIntegers(
+            reader, *completion, path,
+            {{"physical_threshold_elements",
+              &simdProfile.irregularTilePhysicalThresholdElements},
+             {"row_group_size", &simdProfile.irregularTileRowGroupSize},
+             {"small_row_maximum_rows",
+              &simdProfile.irregularTileSmallRowMaximumRows},
+             {"large_working_set_full_physical_minimum_bytes",
+              &simdProfile
+                   .irregularTileLargeWorkingSetFullPhysicalMinimumBytes}});
+        readNumbers(
+            reader, *completion, path,
+            {{"physical_excess_system_cycles_per_element",
+              &simdProfile.irregularTilePhysicalExcessCyclesPerElement},
+             {"active_system_cycles_per_element",
+              &simdProfile.irregularTileActiveCyclesPerElement},
+             {"tail_system_cycles_per_inactive_element",
+              &simdProfile.irregularTileTailCyclesPerInactiveElement},
+             {"large_row_masked_floor_scale",
+              &simdProfile.irregularTileLargeRowMaskedFloorScale},
+             {"aligned_two_row_group_physical_materialization_scale",
+              &simdProfile
+                   .irregularTileAlignedTwoRowGroupPhysicalMaterializationScale},
+             {"aligned_first_row_group_system_cycles_per_element",
+              &simdProfile.irregularTileAlignedFirstRowGroupCyclesPerElement},
+             {"aligned_additional_row_group_system_cycles_per_element",
+              &simdProfile
+                   .irregularTileAlignedAdditionalRowGroupCyclesPerElement}});
+        simdProfile.irregularTileCompletionEvidence =
             reader.string(*completion, "evidence", path);
       }
       if (const auto *groups =
@@ -2847,36 +2660,36 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
           if (!cost.isValid())
             reader.setError(path + " contains an invalid store-group fit");
           else
-            hardware.simd
+            simdProfile
                 .pipelinedStridedStoreGroupsByRowStrideBytes[rowStrideBytes] =
                 std::move(cost);
         }
       }
       readMaskedStridedCopyCompletion(
           *memory, "masked_strided_load_copy_completion", "simd.memory", reader,
-          hardware.simd.maskedStridedLoadCopyCompletionByStrideBytes);
+          simdProfile.maskedStridedLoadCopyCompletionByStrideBytes);
       readMaskedStridedCopyCompletion(
           *memory, "masked_strided_store_copy_completion", "simd.memory",
-          reader, hardware.simd.maskedStridedStoreCopyCompletionByStrideBytes);
+          reader, simdProfile.maskedStridedStoreCopyCompletionByStrideBytes);
     }
     if (const auto *dot = reader.object(*simd, "dot", "simd")) {
-      hardware.simd.dotSetupCycles = resolveNumberOrMeasurement(
+      simdProfile.dotSetupCycles = resolveNumberOrMeasurement(
           *dot, "startup_system_cycles", "startup_measurement", "system_cycle",
           microbench, reader, "simd.dot");
-      hardware.simd.dotFlopsPerCycle = resolveNumberOrMeasurement(
+      simdProfile.dotFlopsPerCycle = resolveNumberOrMeasurement(
           *dot, "flops_per_system_cycle", "throughput_measurement",
           "flop/system_cycle", microbench, reader, "simd.dot");
     }
-    readStageResources(reader, *simd, "simd", microbench, hardware.simd);
-    const auto predicate = hardware.simd.operationRates.lookup("predicate.cmp");
-    hardware.simd.predicateOperationsPerCycle =
+    readStageResources(reader, *simd, "simd", microbench, simdProfile);
+    const auto predicate = simdProfile.operationRates.lookup("predicate.cmp");
+    simdProfile.predicateOperationsPerCycle =
         predicate.throughput / std::max(1.0, predicate.factor);
     if (const auto *reduction = simd->getObject("reduction")) {
-      hardware.simd.reductionOperationSetupCycles = resolveNumberOrMeasurement(
+      simdProfile.reductionOperationSetupCycles = resolveNumberOrMeasurement(
           *reduction, "operation_startup_system_cycles",
           "operation_startup_measurement", "system_cycle", microbench, reader,
           "simd.reduction");
-      hardware.simd.reductionLaneStepsPerCycle = resolveNumberOrMeasurement(
+      simdProfile.reductionLaneStepsPerCycle = resolveNumberOrMeasurement(
           *reduction, "lane_steps_per_system_cycle",
           "lane_step_throughput_measurement", "lane_step/system_cycle",
           microbench, reader, "simd.reduction");
@@ -2884,106 +2697,101 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
               "masked_accumulator_completion_setup_measurement") ||
           reduction->getNumber(
               "masked_accumulator_completion_setup_system_cycles"))
-        hardware.simd.maskedAccumulatorReductionCompletionSetupCycles =
+        simdProfile.maskedAccumulatorReductionCompletionSetupCycles =
             resolveNumberOrMeasurement(
                 *reduction, "masked_accumulator_completion_setup_system_cycles",
                 "masked_accumulator_completion_setup_measurement",
                 "system_cycle", microbench, reader, "simd.reduction");
       if (const auto *scalarized =
               reduction->getObject("scalarized_multi_result")) {
-        hardware.simd.scalarizedMultiResultReductionMinimumExtent =
+        simdProfile.scalarizedMultiResultReductionMinimumExtent =
             reader.integer(*scalarized, "minimum_axis_extent",
                            "simd.reduction.scalarized_multi_result");
-        hardware.simd.scalarizedMultiResultReductionReferenceResults =
+        simdProfile.scalarizedMultiResultReductionReferenceResults =
             reader.integer(*scalarized, "reference_result_count",
                            "simd.reduction.scalarized_multi_result");
-        hardware.simd.scalarizedMultiResultReductionSetupCycles =
+        simdProfile.scalarizedMultiResultReductionSetupCycles =
             reader.number(*scalarized, "operation_startup_system_cycles",
                           "simd.reduction.scalarized_multi_result");
-        hardware.simd.scalarizedMultiResultReductionElementsPerCycle =
+        simdProfile.scalarizedMultiResultReductionElementsPerCycle =
             reader.number(*scalarized, "logical_elements_per_system_cycle",
                           "simd.reduction.scalarized_multi_result");
-        hardware.simd.scalarizedMultiResultReductionEvidence = reader.string(
+        simdProfile.scalarizedMultiResultReductionEvidence = reader.string(
             *scalarized, "evidence", "simd.reduction.scalarized_multi_result");
       }
     }
     if (const auto *sort = simd->getObject("sort")) {
-      hardware.simd.sortMinimumExtent =
+      simdProfile.sortMinimumExtent =
           reader.integer(*sort, "minimum_axis_extent", "simd.sort");
-      hardware.simd.sortMaximumExtent =
+      simdProfile.sortMaximumExtent =
           reader.integer(*sort, "maximum_axis_extent", "simd.sort");
-      hardware.simd.sortElementBits =
+      simdProfile.sortElementBits =
           reader.integer(*sort, "element_bit_width", "simd.sort");
-      hardware.simd.sortSetupCycles =
+      simdProfile.sortSetupCycles =
           reader.number(*sort, "operation_startup_system_cycles", "simd.sort");
-      hardware.simd.sortRowsPerCycle =
+      simdProfile.sortRowsPerCycle =
           reader.number(*sort, "rows_per_system_cycle", "simd.sort");
-      hardware.simd.sortEvidence =
-          reader.string(*sort, "evidence", "simd.sort");
+      simdProfile.sortEvidence = reader.string(*sort, "evidence", "simd.sort");
     }
-    if (hardware.simd.reductionLaneStepsPerCycle <= 0.0)
-      hardware.simd.reductionLaneStepsPerCycle = hardware.simd.vectorWidth;
-    hardware.simd.shuffleLanesPerCycle = hardware.simd.vectorWidth;
+    if (simdProfile.reductionLaneStepsPerCycle <= 0.0)
+      simdProfile.reductionLaneStepsPerCycle = simdProfile.vectorWidth;
+    simdProfile.shuffleLanesPerCycle = simdProfile.vectorWidth;
   }
 
   const auto *simt = reader.object(*root, "simt", "profile");
   if (simt) {
+    auto &simtProfile = hardware.simt;
     if (simt->getString("warp_size_measurement")) {
-      hardware.simt.issueWidth =
+      simtProfile.issueWidth =
           static_cast<int64_t>(std::llround(resolveNumberOrMeasurement(
               *simt, "warp_size", "warp_size_measurement", "lane", microbench,
               reader, "simt")));
     } else {
-      hardware.simt.issueWidth = reader.integer(*simt, "warp_size", "simt");
+      simtProfile.issueWidth = reader.integer(*simt, "warp_size", "simt");
     }
-    hardware.simt.vectorWidth = 1;
-    hardware.simt.vectorWidthBits = 1;
+    simtProfile.vectorWidth = 1;
+    simtProfile.vectorWidthBits = 1;
     if (const auto *setup =
             reader.object(*simt, "setup_system_cycles", "simt")) {
-      hardware.simt.setupCycles = resolveNumberOrMeasurement(
+      simtProfile.setupCycles = resolveNumberOrMeasurement(
           *setup, "empty_launch", "empty_launch_measurement", "system_cycle",
           microbench, reader, "simt.setup_system_cycles");
-      readSetupCycleCurve(reader, *setup, microbench, hardware.simt);
+      readSetupCycleCurve(reader, *setup, microbench, simtProfile);
     }
     if (const auto *ops = reader.object(*simt, "ops", "simt")) {
       // Keep SIMD and SIMT operation namespaces equally extensible.
       for (const auto &entry : *ops)
-        hardware.simt.operationRates[entry.first] = resolveOpProfile(
+        simtProfile.operationRates[entry.first] = resolveOpProfile(
             *ops, entry.first, "throughput_scalar_ops_per_system_cycle",
             "scalar_op/system_cycle", microbench, reader);
     }
     if (const auto *dot = reader.object(*simt, "dot", "simt")) {
-      hardware.simt.dotSetupCycles = resolveNumberOrMeasurement(
+      simtProfile.dotSetupCycles = resolveNumberOrMeasurement(
           *dot, "startup_system_cycles", "startup_measurement", "system_cycle",
           microbench, reader, "simt.dot");
-      hardware.simt.dotFlopsPerCycle = resolveNumberOrMeasurement(
+      simtProfile.dotFlopsPerCycle = resolveNumberOrMeasurement(
           *dot, "flops_per_system_cycle", "throughput_measurement",
           "flop/system_cycle", microbench, reader, "simt.dot");
       readPositiveIntegerNumberCurve(
           *dot, "flops_per_system_cycle_by_active_warp_count", reader,
-          "simt.dot", hardware.simt.dotFlopsPerCycleByWarpCount);
-      // The isolated dependent-dot fit does not include the complete
-      // completion envelope of an uncomposited whole-SIMT dot path.  Keep the
-      // raw microbenchmark values immutable and apply independently calibrated
-      // completion scales to the generic body and to an unmatched residual
-      // that shares a Stage with an exact operand-path composite.
+          "simt.dot", simtProfile.dotFlopsPerCycleByWarpCount);
       const double genericCompletionScale =
           reader.optionalNumber(*dot, "generic_completion_scale", 1.0);
       const double partialCompositeResidualScale = reader.optionalNumber(
           *dot, "partial_composite_residual_scale", genericCompletionScale);
-      hardware.simt.dotPartialCompositeResidualRelativeScale =
+      simtProfile.dotPartialCompositeResidualRelativeScale =
           partialCompositeResidualScale / genericCompletionScale;
-      hardware.simt.dotSetupCycles *= genericCompletionScale;
-      hardware.simt.dotFlopsPerCycle /= genericCompletionScale;
-      for (auto &[warpCount, rate] : hardware.simt.dotFlopsPerCycleByWarpCount)
+      simtProfile.dotSetupCycles *= genericCompletionScale;
+      simtProfile.dotFlopsPerCycle /= genericCompletionScale;
+      for (auto &[warpCount, rate] : simtProfile.dotFlopsPerCycleByWarpCount)
         rate /= genericCompletionScale;
     }
-    const auto predicate = hardware.simt.operationRates.lookup("predicate.cmp");
-    hardware.simt.predicateOperationsPerCycle =
+    const auto predicate = simtProfile.operationRates.lookup("predicate.cmp");
+    simtProfile.predicateOperationsPerCycle =
         predicate.throughput / std::max(1.0, predicate.factor);
     if (const auto *shuffle = reader.object(*simt, "shuffle", "simt")) {
-      hardware.simt.shuffleLanesPerCycle =
-          hardware.simt.issueWidth *
+      simtProfile.shuffleLanesPerCycle =
+          simtProfile.issueWidth *
           resolveNumberOrMeasurement(
               *shuffle, "warp_instructions_per_system_cycle",
               "throughput_measurement", "warp_instruction/system_cycle",
@@ -2993,34 +2801,33 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
           *shuffle, "throughput_measurements", "warp_instruction/system_cycle",
           microbench, reader, "simt.shuffle", warpInstructionCurve);
       for (const auto &[warpCount, rate] : warpInstructionCurve)
-        hardware.simt.shuffleLanesPerCycleByWarpCount[warpCount] =
-            hardware.simt.issueWidth * rate;
+        simtProfile.shuffleLanesPerCycleByWarpCount[warpCount] =
+            simtProfile.issueWidth * rate;
     }
     if (const auto *memory = reader.object(*simt, "memory", "simt")) {
-      hardware.simt.loadWarpInstructionsPerCycle = resolveNumberOrMeasurement(
+      simtProfile.loadWarpInstructionsPerCycle = resolveNumberOrMeasurement(
           *memory, "load_warp_instructions_per_system_cycle",
           "load_throughput_measurement", "warp_instruction/system_cycle",
           microbench, reader, "simt.memory");
-      hardware.simt.storeWarpInstructionsPerCycle = resolveNumberOrMeasurement(
+      simtProfile.storeWarpInstructionsPerCycle = resolveNumberOrMeasurement(
           *memory, "store_warp_instructions_per_system_cycle",
           "store_throughput_measurement", "warp_instruction/system_cycle",
           microbench, reader, "simt.memory");
-      readPositiveIntegerMeasurementCurve(
-          *memory, "load_throughput_measurements",
-          "warp_instruction/system_cycle", microbench, reader, "simt.memory",
-          hardware.simt.loadWarpInstructionsPerCycleByWarpCount);
-      readPositiveIntegerMeasurementCurve(
-          *memory, "store_throughput_measurements",
-          "warp_instruction/system_cycle", microbench, reader, "simt.memory",
-          hardware.simt.storeWarpInstructionsPerCycleByWarpCount);
+      readPositiveIntegerMeasurementCurves(
+          *memory, "warp_instruction/system_cycle", microbench, reader,
+          "simt.memory",
+          {{"load_throughput_measurements",
+            &simtProfile.loadWarpInstructionsPerCycleByWarpCount},
+           {"store_throughput_measurements",
+            &simtProfile.storeWarpInstructionsPerCycleByWarpCount}});
       readMaskedStridedCopyCompletion(
           *memory, "masked_strided_load_copy_completion", "simt.memory", reader,
-          hardware.simt.maskedStridedLoadCopyCompletionByStrideBytes);
+          simtProfile.maskedStridedLoadCopyCompletionByStrideBytes);
       readMaskedStridedCopyCompletion(
           *memory, "masked_strided_store_copy_completion", "simt.memory",
-          reader, hardware.simt.maskedStridedStoreCopyCompletionByStrideBytes);
+          reader, simtProfile.maskedStridedStoreCopyCompletionByStrideBytes);
     }
-    readStageResources(reader, *simt, "simt", microbench, hardware.simt);
+    readStageResources(reader, *simt, "simt", microbench, simtProfile);
     if (const auto *resources = simt->getObject("stage_resources")) {
       if (const auto *superblock = resources->getObject("superblock")) {
         hardware.superblockUsefulFactorLimit =
@@ -3145,6 +2952,22 @@ loadCandidateProfile(llvm::StringRef requestedPath) {
     cache[path] = CachedCandidateProfile{*selectionStamp, microbenchmarkPath,
                                          *microbenchmarkStamp, profile};
   return profile;
+}
+
+static double setRouteTotal(StageRoutePlan &plan, size_t owner,
+                            double targetCycles) {
+  targetCycles = std::max(0.0, targetCycles);
+  const double adjustment = targetCycles - plan.totalCycles;
+  plan.totalCycles = targetCycles;
+  if (owner < plan.logicalStageCycles.size())
+    plan.logicalStageCycles[owner] =
+        std::max(0.0, plan.logicalStageCycles[owner] + adjustment);
+  return adjustment;
+}
+
+static void addRouteResidual(StageRoutePlan &plan, size_t owner,
+                             double residual) {
+  setRouteTotal(plan, owner, plan.totalCycles + residual);
 }
 
 static llvm::Expected<StageCostModelSummary> evaluateStageModel(
@@ -3287,8 +3110,9 @@ static llvm::Expected<StageCostModelSummary> evaluateStageModel(
 
   std::optional<size_t> simdRank2StridedDirectOwner;
   int64_t simdRank2StridedDirectElements = 0;
-  const int64_t simdRank2StridedDirectMaximum =
-      profile.kernelTiming.simdRank2StridedDirectLoadMaximumElements;
+  const auto &simdRank2Direct = profile.kernelTiming.simdRank2StridedDirectLoad;
+  const auto &simtRank2Direct = profile.kernelTiming.simtRank2StridedDirectLoad;
+  const int64_t simdRank2StridedDirectMaximum = simdRank2Direct.maximumElements;
   if (simdRank2StridedDirectMaximum > 0) {
     bool exactStructure = true;
     int64_t matchingLoads = 0;
@@ -3319,9 +3143,7 @@ static llvm::Expected<StageCostModelSummary> evaluateStageModel(
           }
           elements *= extent;
         }
-        if (!validShape ||
-            elements < profile.kernelTiming
-                           .simdRank2StridedDirectLoadMinimumElements ||
+        if (!validShape || elements < simdRank2Direct.minimumElements ||
             elements > simdRank2StridedDirectMaximum) {
           exactStructure = false;
           continue;
@@ -3557,163 +3379,26 @@ static llvm::Expected<StageCostModelSummary> evaluateStageModel(
       options.sourceLogicalProgramCountHint;
   costTable->physicalCoreCountHint = physicalCoreCountHint;
   costTable->physicalAiCoreCountHint = physicalAiCoreCountHint;
-  const auto &multiResultScan =
-      profile.kernelTiming.simdMultiResultPrefixScanCompletion;
+  costTable->routeCompletions = profile.kernelTiming.routeCompletions;
+  auto &multiResultScan = costTable->routeCompletions.multiResultPrefixScan;
   if (multiResultScan.enabled) {
-    costTable->simdMultiResultPrefixScanCompletionEnabled = true;
-    costTable->simdMultiResultPrefixScanMinimumPrograms =
-        multiResultScan.minimumPrograms;
-    costTable->simdMultiResultPrefixScanMaximumPrograms =
-        multiResultScan.maximumPrograms;
-    costTable->simdMultiResultPrefixScanMinimumPaddedAxis =
-        multiResultScan.minimumPaddedAxis;
-    costTable->simdMultiResultPrefixScanMaximumPaddedAxis =
-        multiResultScan.maximumPaddedAxis;
-    costTable->simdMultiResultPrefixScanRequiredResultCount =
-        multiResultScan.requiredResultCount;
-    costTable->simdMultiResultPrefixScanRequiredIndependentSequences =
-        multiResultScan.requiredIndependentSequences;
-    costTable->simdMultiResultPrefixScanMinimumActiveRatio =
-        multiResultScan.minimumActiveRatio;
-    costTable->simdMultiResultPrefixScanMaximumActiveRatio =
-        multiResultScan.maximumActiveRatio;
-    costTable->simdMultiResultPrefixScanElapsedInterceptCycles =
-        multiResultScan.elapsedInterceptCycles;
-    costTable->simdMultiResultPrefixScanElapsedSqrtProgramCycles =
-        multiResultScan.elapsedSqrtProgramCycles;
-    costTable->simdMultiResultPrefixScanElapsedInactiveRatioCycles =
-        multiResultScan.elapsedInactiveRatioCycles;
-    costTable->simdMultiResultPrefixScanElapsedPaddedAxisCycles =
-        multiResultScan.elapsedPaddedAxisCycles;
     int64_t argumentCount = 0;
     module.walk([&](Operation *operation) {
-      if (operation->getName().getStringRef() != "tt.func" ||
-          operation->getNumRegions() == 0 || operation->getRegion(0).empty())
-        return;
-      argumentCount = std::max<int64_t>(
-          argumentCount, operation->getRegion(0).front().getNumArguments());
+      if (operation->getName().getStringRef() == "tt.func" &&
+          operation->getNumRegions() != 0 && !operation->getRegion(0).empty())
+        argumentCount = std::max<int64_t>(
+            argumentCount, operation->getRegion(0).front().getNumArguments());
     });
     const int64_t physicalPrograms =
         logicalProgramCountHint > 0 && physicalCoreCountHint > 0
             ? std::min(logicalProgramCountHint, physicalCoreCountHint)
             : logicalProgramCountHint;
-    costTable->simdMultiResultPrefixScanFixedBoundaryCycles =
+    multiResultScan.fixedBoundaryCycles =
         profile.kernelTiming.boundarySystemCycles(kAllSimd, 1,
                                                   physicalPrograms) +
         profile.kernelTiming.globalLoadBoundarySystemCycles(kAllSimd) +
         profile.kernelTiming.runtimeArgumentSetupSystemCycles(kAllSimd,
                                                               argumentCount);
-    costTable->simdMultiResultPrefixScanEvidence = multiResultScan.evidence;
-  }
-  const auto &selectionNetwork =
-      profile.kernelTiming.simtPairwiseSelectionNetworkCompletion;
-  if (selectionNetwork.enabled) {
-    costTable->simtPairwiseSelectionNetworkCompletionEnabled = true;
-    costTable->simtPairwiseSelectionNetworkMinimumInputElements =
-        selectionNetwork.minimumInputElements;
-    costTable->simtPairwiseSelectionNetworkMaximumInputElements =
-        selectionNetwork.maximumInputElements;
-    costTable->simtPairwiseSelectionNetworkMinimumOutputColumns =
-        selectionNetwork.minimumOutputColumns;
-    costTable->simtPairwiseSelectionNetworkMaximumOutputColumns =
-        selectionNetwork.maximumOutputColumns;
-    costTable->simtPairwiseSelectionNetworkMinimumReductionStages =
-        selectionNetwork.minimumReductionStages;
-    costTable->simtPairwiseSelectionNetworkInterceptCycles =
-        selectionNetwork.interceptCycles;
-    costTable->simtPairwiseSelectionNetworkInputElementCycles =
-        selectionNetwork.inputElementCycles;
-    costTable->simtPairwiseSelectionNetworkLog2OutputColumnCycles =
-        selectionNetwork.log2OutputColumnCycles;
-    costTable->simtPairwiseSelectionNetworkEvidence = selectionNetwork.evidence;
-  }
-  const auto &simdLargeScan =
-      profile.kernelTiming.simdLargeSequenceMinmaxScanCompletion;
-  if (simdLargeScan.enabled) {
-    costTable->simdLargeSequenceMinmaxScanCompletionEnabled = true;
-    costTable->simdLargeSequenceMinmaxScanMinimumIndependentSequences =
-        simdLargeScan.minimumIndependentSequences;
-    costTable->simdLargeSequenceMinmaxScanMaximumIndependentSequences =
-        simdLargeScan.maximumIndependentSequences;
-    costTable->simdLargeSequenceMinmaxScanMinimumExtent =
-        simdLargeScan.minimumExtent;
-    costTable->simdLargeSequenceMinmaxScanMaximumExtent =
-        simdLargeScan.maximumExtent;
-    costTable->simdLargeSequenceMinmaxScanPerIndependentSequenceCycles =
-        simdLargeScan.perIndependentSequenceSystemCycles;
-    costTable->simdLargeSequenceMinmaxScanEvidence = simdLargeScan.evidence;
-  }
-  const auto &minmaxScan =
-      profile.kernelTiming.simtMultiSequenceMinmaxScanCompletion;
-  if (minmaxScan.enabled) {
-    costTable->simtMultiSequenceMinmaxScanCompletionEnabled = true;
-    costTable->simtMultiSequenceMinmaxScanMinimumIndependentSequences =
-        minmaxScan.minimumIndependentSequences;
-    costTable->simtMultiSequenceMinmaxScanMaximumIndependentSequences =
-        minmaxScan.maximumIndependentSequences;
-    costTable->simtMultiSequenceMinmaxScanMinimumExtent =
-        minmaxScan.minimumExtent;
-    costTable->simtMultiSequenceMinmaxScanMaximumExtent =
-        minmaxScan.maximumExtent;
-    costTable->simtMultiSequenceMinmaxScanBaseReductionCycles =
-        minmaxScan.baseReductionSystemCycles;
-    costTable
-        ->simtMultiSequenceMinmaxScanPerIndependentSequenceReductionCycles =
-        minmaxScan.perIndependentSequenceReductionSystemCycles;
-    costTable->simtMultiSequenceMinmaxScanMaximumReductionCycles =
-        minmaxScan.maximumReductionSystemCycles;
-    costTable->simtMultiSequenceMinmaxScanLargeMinimumIndependentSequences =
-        minmaxScan.largeMinimumIndependentSequences;
-    costTable->simtMultiSequenceMinmaxScanLargeMaximumIndependentSequences =
-        minmaxScan.largeMaximumIndependentSequences;
-    costTable->simtMultiSequenceMinmaxScanLargeMinimumExtent =
-        minmaxScan.largeMinimumExtent;
-    costTable->simtMultiSequenceMinmaxScanLargeMaximumExtent =
-        minmaxScan.largeMaximumExtent;
-    costTable->simtMultiSequenceMinmaxScanLargeBaseReductionCycles =
-        minmaxScan.largeBaseReductionSystemCycles;
-    costTable
-        ->simtMultiSequenceMinmaxScanLargePerIndependentSequenceReductionCycles =
-        minmaxScan.largePerIndependentSequenceReductionSystemCycles;
-    costTable->simtMultiSequenceMinmaxScanLargeMaximumReductionCycles =
-        minmaxScan.largeMaximumReductionSystemCycles;
-    costTable->simtMultiSequenceMinmaxScanEvidence = minmaxScan.evidence;
-  }
-  const auto &addReduction =
-      profile.kernelTiming.simdStraightLineAddReductionCompletion;
-  if (addReduction.enabled) {
-    costTable->simdStraightLineAddReductionCompletionEnabled = true;
-    costTable->simdStraightLineAddReductionMinimumRows =
-        addReduction.minimumRows;
-    costTable->simdStraightLineAddReductionMaximumRows =
-        addReduction.maximumRows;
-    costTable->simdStraightLineAddReductionMinimumExtent =
-        addReduction.minimumExtent;
-    costTable->simdStraightLineAddReductionMaximumExtent =
-        addReduction.maximumExtent;
-    costTable->simdStraightLineAddReductionSharedCompletionCycles =
-        addReduction.sharedCompletionSystemCycles;
-    costTable->simdStraightLineAddReductionEvidence = addReduction.evidence;
-  }
-  const auto &twoLoopReduction =
-      profile.kernelTiming.simdTwoLoopSingleReductionCompletion;
-  if (twoLoopReduction.enabled) {
-    costTable->simdTwoLoopSingleReductionCompletionEnabled = true;
-    costTable->simdTwoLoopSingleReductionMinimumSourcePrograms =
-        twoLoopReduction.minimumSourcePrograms;
-    costTable->simdTwoLoopSingleReductionMaximumSourcePrograms =
-        twoLoopReduction.maximumSourcePrograms;
-    costTable->simdTwoLoopSingleReductionMinimumRuntimeIterations =
-        twoLoopReduction.minimumRuntimeIterations;
-    costTable->simdTwoLoopSingleReductionMaximumRuntimeIterations =
-        twoLoopReduction.maximumRuntimeIterations;
-    costTable->simdTwoLoopSingleReductionRequiredExtent =
-        twoLoopReduction.requiredReductionExtent;
-    costTable->simdTwoLoopSingleReductionFirstIterationCycles =
-        twoLoopReduction.firstIterationSystemCycles;
-    costTable->simdTwoLoopSingleReductionAdditionalIterationCycles =
-        twoLoopReduction.additionalIterationSystemCycles;
-    costTable->simdTwoLoopSingleReductionEvidence = twoLoopReduction.evidence;
   }
   auto routes = solveStageRoutes(*costTable, hardwareProfile.scopeHandoff);
   if (!routes)
@@ -3731,52 +3416,48 @@ static llvm::Expected<StageCostModelSummary> evaluateStageModel(
     const double residual =
         profile.kernelTiming.scalarizedRank2IndirectLoadResidualSystemCycles(
             routes->allSimd.runtimePhysicalProgramCount);
-    if (residual > 0.0) {
-      routes->allSimd.totalCycles += residual;
-      if (*scalarizedRank2IndirectOwner <
-          routes->allSimd.logicalStageCycles.size())
-        routes->allSimd.logicalStageCycles[*scalarizedRank2IndirectOwner] +=
-            residual;
-    }
+    if (residual > 0.0)
+      addRouteResidual(routes->allSimd, *scalarizedRank2IndirectOwner,
+                       residual);
   }
   if (simdRank2StridedDirectOwner && simdRank2StridedDirectElements > 0 &&
       routes->allSimd.legal &&
       routes->allSimd.runtimePhysicalProgramCount == 1) {
     const double residual =
-        profile.kernelTiming.simdRank2StridedDirectLoadResidualSystemCycles(
-            simdRank2StridedDirectElements);
+        simdRank2Direct.cycles(simdRank2StridedDirectElements);
     if (residual > 0.0) {
-      routes->allSimd.totalCycles += residual;
-      if (*simdRank2StridedDirectOwner <
-          routes->allSimd.logicalStageCycles.size())
-        routes->allSimd.logicalStageCycles[*simdRank2StridedDirectOwner] +=
-            residual;
-      routes->allSimd.simdRank2StridedDirectLoadCompletionApplied = true;
-      routes->allSimd.simdRank2StridedDirectLoadElements =
+      addRouteResidual(routes->allSimd, *simdRank2StridedDirectOwner, residual);
+      routes->allSimd.diagnostic<bool>(
+          "simd_rank2_strided_direct_load_completion_applied") = true;
+      routes->allSimd.diagnostic<int64_t>(
+          "simd_rank2_strided_direct_load_elements") =
           simdRank2StridedDirectElements;
-      routes->allSimd.simdRank2StridedDirectLoadAdjustmentCycles = residual;
-      routes->allSimd.simdRank2StridedDirectLoadEvidence =
-          profile.kernelTiming.simdRank2StridedDirectLoadEvidence;
+      routes->allSimd.diagnostic<double>(
+          "simd_rank2_strided_direct_load_adjustment_system_cycles") = residual;
+      routes->allSimd.diagnostic<std::string>(
+          "simd_rank2_strided_direct_load_evidence") = simdRank2Direct.evidence;
     }
   }
   if (simdRank2StridedDirectOwner && simdRank2StridedDirectElements > 0) {
     const double target =
-        profile.kernelTiming.simtRank2StridedDirectLoadTargetSystemCycles(
-            simdRank2StridedDirectElements);
+        simtRank2Direct.cycles(simdRank2StridedDirectElements);
     auto applyTarget = [&](StageRoutePlan &plan) {
       if (!plan.legal || plan.runtimePhysicalProgramCount != 1 ||
           target <= plan.totalCycles)
         return;
-      const double adjustment = target - plan.totalCycles;
-      plan.totalCycles = target;
-      if (*simdRank2StridedDirectOwner < plan.logicalStageCycles.size())
-        plan.logicalStageCycles[*simdRank2StridedDirectOwner] += adjustment;
-      plan.simtRank2StridedDirectLoadCompletionApplied = true;
-      plan.simtRank2StridedDirectLoadElements = simdRank2StridedDirectElements;
-      plan.simtRank2StridedDirectLoadTargetCycles = target;
-      plan.simtRank2StridedDirectLoadAdjustmentCycles = adjustment;
-      plan.simtRank2StridedDirectLoadEvidence =
-          profile.kernelTiming.simtRank2StridedDirectLoadEvidence;
+      const double adjustment =
+          setRouteTotal(plan, *simdRank2StridedDirectOwner, target);
+      plan.diagnostic<bool>(
+          "simt_rank2_strided_direct_load_completion_applied") = true;
+      plan.diagnostic<int64_t>("simt_rank2_strided_direct_load_elements") =
+          simdRank2StridedDirectElements;
+      plan.diagnostic<double>(
+          "simt_rank2_strided_direct_load_target_system_cycles") = target;
+      plan.diagnostic<double>(
+          "simt_rank2_strided_direct_load_adjustment_system_cycles") =
+          adjustment;
+      plan.diagnostic<std::string>("simt_rank2_strided_direct_load_evidence") =
+          simtRank2Direct.evidence;
     };
     for (auto &[factor, plan] : routes->allSimtFactorPlans)
       applyTarget(plan);
@@ -3800,20 +3481,22 @@ static llvm::Expected<StageCostModelSummary> evaluateStageModel(
       fixedCycles += profile.kernelTiming.runtimeArgumentSetupSystemCycles(
           kAllSimtOnly, kernelArgumentCount);
       const double target = std::max(0.0, elapsedTarget - fixedCycles);
-      const double adjustment = target - plan.totalCycles;
-      plan.totalCycles = target;
-      if (*simtStaticLoopDirectMemoryOwner < plan.logicalStageCycles.size())
-        plan.logicalStageCycles[*simtStaticLoopDirectMemoryOwner] = std::max(
-            0.0, plan.logicalStageCycles[*simtStaticLoopDirectMemoryOwner] +
-                     adjustment);
-      plan.simtStaticLoopDirectMemoryCompletionApplied = true;
-      plan.simtStaticLoopDirectMemoryIterations =
+      const double adjustment =
+          setRouteTotal(plan, *simtStaticLoopDirectMemoryOwner, target);
+      plan.diagnostic<bool>(
+          "simt_static_loop_direct_memory_completion_applied") = true;
+      plan.diagnostic<int64_t>("simt_static_loop_direct_memory_iterations") =
           simtStaticLoopDirectMemoryIterations;
-      plan.simtStaticLoopDirectMemoryLoadCount =
+      plan.diagnostic<int64_t>("simt_static_loop_direct_memory_load_count") =
           simtStaticLoopDirectMemoryLoadCount;
-      plan.simtStaticLoopDirectMemoryElapsedTargetCycles = elapsedTarget;
-      plan.simtStaticLoopDirectMemoryAdjustmentCycles = adjustment;
-      plan.simtStaticLoopDirectMemoryEvidence = staticLoopFit.evidence;
+      plan.diagnostic<double>(
+          "simt_static_loop_direct_memory_elapsed_target_system_cycles") =
+          elapsedTarget;
+      plan.diagnostic<double>(
+          "simt_static_loop_direct_memory_adjustment_system_cycles") =
+          adjustment;
+      plan.diagnostic<std::string>("simt_static_loop_direct_memory_evidence") =
+          staticLoopFit.evidence;
     };
     for (auto &[factor, plan] : routes->allSimtFactorPlans)
       applyTarget(plan);
@@ -3850,17 +3533,22 @@ static llvm::Expected<StageCostModelSummary> evaluateStageModel(
       target = std::max(0.0, target);
       if (target <= plan.totalCycles)
         return;
-      const double adjustment = target - plan.totalCycles;
-      plan.totalCycles = target;
-      if (*rank2InterleavedPrefixScanOwner < plan.logicalStageCycles.size())
-        plan.logicalStageCycles[*rank2InterleavedPrefixScanOwner] += adjustment;
-      plan.rank2InterleavedPrefixScanCompletionApplied = true;
-      plan.rank2InterleavedPrefixScanExtent = rank2InterleavedPrefixScanExtent;
-      plan.rank2InterleavedPrefixScanIndependentSequences =
+      const double adjustment =
+          setRouteTotal(plan, *rank2InterleavedPrefixScanOwner, target);
+      plan.diagnostic<bool>(
+          "rank2_interleaved_prefix_scan_completion_applied") = true;
+      plan.diagnostic<int64_t>("rank2_interleaved_prefix_scan_extent") =
+          rank2InterleavedPrefixScanExtent;
+      plan.diagnostic<int64_t>(
+          "rank2_interleaved_prefix_scan_independent_sequences") =
           rank2InterleavedPrefixScanSequences;
-      plan.rank2InterleavedPrefixScanTargetCycles = target;
-      plan.rank2InterleavedPrefixScanAdjustmentCycles = adjustment;
-      plan.rank2InterleavedPrefixScanEvidence = rank2ScanFit.evidence;
+      plan.diagnostic<double>(
+          "rank2_interleaved_prefix_scan_target_system_cycles") = target;
+      plan.diagnostic<double>(
+          "rank2_interleaved_prefix_scan_adjustment_system_cycles") =
+          adjustment;
+      plan.diagnostic<std::string>("rank2_interleaved_prefix_scan_evidence") =
+          rank2ScanFit.evidence;
     };
     applyTarget(routes->allSimd);
     applyTarget(routes->mixed);
@@ -3872,13 +3560,9 @@ static llvm::Expected<StageCostModelSummary> evaluateStageModel(
     const double residual =
         profile.kernelTiming.subwarpIndirectCompositeResidualSystemCycles(
             subwarpIndirectCompositeElements);
-    if (residual > 0.0) {
-      routes->allSimd.totalCycles += residual;
-      if (*subwarpIndirectCompositeOwner <
-          routes->allSimd.logicalStageCycles.size())
-        routes->allSimd.logicalStageCycles[*subwarpIndirectCompositeOwner] +=
-            residual;
-    }
+    if (residual > 0.0)
+      addRouteResidual(routes->allSimd, *subwarpIndirectCompositeOwner,
+                       residual);
   }
   if (simtRank2IndirectOwner && simtRank2IndirectElements > 0) {
     const double residual =
@@ -4164,9 +3848,7 @@ populateSelectedRouteElapsedPrediction(SimdSimtCostReport &report,
       prediction.fixedSystemCycles += *adjustment;
     }
   }
-  // The profiler measures the complete route-independent residual.  Preserve
-  // the two legacy report fields as an equal accounting split; they are not
-  // claimed as separately observed head and tail measurements.
+  // The profiler measures the complete route-independent residual.
   prediction.scalarPrologueSystemCycles = prediction.fixedSystemCycles / 2.0;
   prediction.scalarEpilogueSystemCycles = prediction.fixedSystemCycles / 2.0;
   prediction.systemCounterFrequencyMHz =

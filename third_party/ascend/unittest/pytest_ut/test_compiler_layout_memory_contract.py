@@ -112,9 +112,17 @@ def compiler_module():
     utils_stub = types.ModuleType(utils_name)
     utils_path = compiler_path.with_name("utils.py")
     utils_tree = ast.parse(utils_path.read_text())
-    mode_helper = next(node for node in utils_tree.body
-                       if isinstance(node, ast.FunctionDef) and node.name == "_multibuffer_mode_to_tuple")
-    exec(compile(ast.Module(body=[mode_helper], type_ignores=[]), str(utils_path), "exec"), utils_stub.__dict__)
+    # Execute the checkout's own helper bodies instead of restating their
+    # values, so the shim cannot drift from the source being validated when
+    # utils.py gains or changes these self-contained helpers.
+    for helper_name in (
+            "_multibuffer_mode_to_tuple",
+            "_get_modeled_superblock_factors",
+            "_get_current_scope_superblock_factors",
+    ):
+        helper = next(node for node in utils_tree.body
+                      if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), str(utils_path), "exec"), utils_stub.__dict__)
     for name in (
             "_check_bishengir_api_change",
             "_check_bishengir_able_save_ir",
@@ -150,7 +158,11 @@ def compiler_module():
     utils_stub.ub_size_in_kbytes_for_arch = _stub_ub_size_in_kbytes_for_arch
 
     class UnusedNPUUtils:
-        pass
+        # The launch-argv path probes the device-limit API.  Keeping the stub
+        # inert guarantees no device-specific core-count flags are injected.
+        @staticmethod
+        def has_device_limit():
+            return False
 
     driver_stub = types.ModuleType(driver_name)
     driver_stub.NPUUtils = UnusedNPUUtils
@@ -321,6 +333,7 @@ def _make_opt(
         disable_fma=disable_fma,
         superblock_factor=superblock_factor,
         compile_on_910_95=compile_on_910_95,
+        enable_partition_and_bind_sub_block="off",
     )
 
 
@@ -398,6 +411,10 @@ def _run_ttir_to_npubin(
         return resolved_simt_stack_limit
 
     monkeypatch.setattr(compiler, "get_simt_stack_limit", get_simt_stack_limit)
+    # The private-stack disassembly publish shells out to whichever
+    # llvm-objdump the host exposes.  Hide it so this argv contract stays
+    # independent of the host toolchain; the compile command is what matters.
+    monkeypatch.setattr(compiler, "_find_backend_llvm_objdump", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(compiler.subprocess, "run", run_bisheng)
 
     result = compiler.ttir_to_npubin(
@@ -465,7 +482,12 @@ def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op
     result = getattr(compiler, function_name)(
         "module {}",
         {},
-        SimpleNamespace(debug=False, target_arch="Ascend950PR", is_pure_simt=False),
+        SimpleNamespace(
+            debug=False,
+            target_arch="Ascend950PR",
+            is_pure_simt=False,
+            enable_partition_and_bind_sub_block="off",
+        ),
     )
     assert result == b"npubin"
     assert len(commands) == 1
@@ -684,6 +706,10 @@ def test_ttir_to_npubin_auto_blockify_argv_matrix(compiler_module, monkeypatch):
         "--disable-fma",
     ]
     auto_blockify_flag = "--enable-auto-blockify-loop"
+    # The Pure-SIMT path always requests CCEC allocator facts so SuperBlock
+    # factor selection can consult register/stack usage; this holds even when
+    # no extra BiSheng options were supplied.
+    resource_usage_flag = "--append-bisheng-options=--cce-res-usage"
 
     for env_enabled, blacklisted, row_applied, superblock in itertools.product(
         (False, True),
@@ -709,7 +735,7 @@ def test_ttir_to_npubin_auto_blockify_argv_matrix(compiler_module, monkeypatch):
         second_injection = env_enabled and not row_applied
         case = f"E={env_enabled}, B={blacklisted}, R={row_applied}, superblock={superblock}"
 
-        expected_options = [*common_options, *pure_simt_prefix]
+        expected_options = [*common_options, *pure_simt_prefix, resource_usage_flag]
         if second_injection:
             expected_options.append(auto_blockify_flag)
             if superblock > 0:
@@ -862,8 +888,14 @@ def test_default_compile_mode_keeps_the_91095_layout_memory_gate_prepared(compil
     assert alias.compile_mode == canonical.compile_mode == "simd_simt_template"
     assert alias.hash() == canonical.hash()
 
-    with pytest.raises(ValueError, match=r"invalid compile_mode='simt_template'"):
-        compiler_module.NPUOptions(arch="Ascend910_9589", compile_mode="simt_template")
+    # ``simt_template`` is the spelling accepted by the BiSheng compiler, so it
+    # must resolve to the same canonical mode instead of being rejected.
+    native_spelling = compiler_module.NPUOptions(arch="Ascend910_9589", compile_mode="simt_template")
+    assert native_spelling.compile_mode == canonical.compile_mode == "simd_simt_template"
+    assert native_spelling.hash() == canonical.hash()
+
+    with pytest.raises(ValueError, match=r"invalid compile_mode='unknown_mode'"):
+        compiler_module.NPUOptions(arch="Ascend910_9589", compile_mode="unknown_mode")
 
     explicit_simd = compiler_module.NPUOptions(arch="Ascend910_9589", compile_mode="simd")
     assert explicit_simd.compile_mode == "simd"

@@ -1102,6 +1102,18 @@ def _publish_route_transform_capability(metadata, opt) -> str:
         source_logical_program_count,
         "logical_program_count_hint":
         transformed_logical_program_count,
+        # Legacy readers still consume these two derived fields.  Keep them
+        # as compatibility views of the facts above; route scheduling remains
+        # owned by the native RouteSolver.
+        "modeled_superblock_factors":
+        modeled_factors,
+        "superblock_runtime_groups": {
+            str(factor): {
+                "full_group_count": transformed_logical_program_count // factor,
+                "tail_count": transformed_logical_program_count % factor,
+            }
+            for factor in modeled_factors
+        },
         "physical_vector_core_count_hint":
         physical_vector_cores,
         "physical_aicore_count_hint":
@@ -1275,6 +1287,10 @@ def _run_ta_auto_blockify_v1(mod, metadata, opt, *, super_block_factor=None) -> 
     return materialized
 
 
+# Compatibility alias for callers predating the TA pass rename.
+_run_ta_simt_auto_blockify_v1 = _run_ta_auto_blockify_v1
+
+
 def _parse_ttir_text(ttir_code: str, context=None):
     """Recreate a TTIR module in ``context`` from an immutable snapshot."""
     if context is None:
@@ -1307,7 +1323,7 @@ def _build_costmodel_analysis_ttir(mod, metadata, opt) -> str:
 
     analysis_mod = _parse_ttir_text(str(mod), getattr(mod, "context", None))
     analysis_metadata = {}
-    materialized = _run_ta_auto_blockify_v1(
+    materialized = _run_ta_simt_auto_blockify_v1(
         analysis_mod,
         analysis_metadata,
         opt,
