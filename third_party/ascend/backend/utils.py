@@ -597,6 +597,33 @@ def _check_bishengir_is_regbased() -> bool:
         return False
 
 
+# grep bishengir-compile's --enable-optimized-metaop option to check if the
+# toolchain accepts it. The option was introduced in the 2.0.0 toolchain; an
+# older toolchain rejects it with "Unknown command line argument", so only
+# forward it when it is supported.
+def _check_bishengir_supports_optimized_metaop() -> bool:
+    bishengir_path, _ = _get_npucompiler_path()
+    if not _is_valid_bishengir_path(bishengir_path):
+        print(f"ERROR: Invalid bishengir path format: {bishengir_path}")
+        return False
+    try:
+        result = subprocess.run(
+            [bishengir_path, "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode == 0 and 'enable-optimized-metaop' in result.stdout:
+            # bishengir-compile accepts the option
+            return True
+        else:
+            # bishengir-compile predates the option
+            return False
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return False
+
+
 @functools.lru_cache(None)
 def _get_ascend_path() -> Path:
     path = os.getenv("ASCEND_HOME_PATH", "")
