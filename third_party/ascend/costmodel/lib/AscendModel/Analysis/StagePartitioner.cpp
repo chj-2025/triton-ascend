@@ -2859,37 +2859,17 @@ static bool isSupportingSemanticKind(StageCostModelKind kind) {
   }
 }
 
-struct SourceStatement {
-  StringAttr file;
-  unsigned line = 0;
-
-  explicit operator bool() const { return file && line != 0; }
-};
-
-static SourceStatement getSourceStatement(Location location) {
-  if (auto file = dyn_cast<FileLineColLoc>(location))
-    return {file.getFilename(), file.getLine()};
-  if (auto name = dyn_cast<NameLoc>(location))
-    return getSourceStatement(name.getChildLoc());
-  if (auto callsite = dyn_cast<CallSiteLoc>(location)) {
-    SourceStatement callee = getSourceStatement(callsite.getCallee());
-    return callee ? callee : getSourceStatement(callsite.getCaller());
-  }
-  if (auto fused = dyn_cast<FusedLoc>(location))
-    for (Location child : fused.getLocations()) {
-      SourceStatement statement = getSourceStatement(child);
-      if (statement)
-        return statement;
-    }
-  return {};
-}
-
-static bool haveSameSourceStatement(Operation *left, Operation *right) {
-  if (!left || !right)
+static bool hasDataDependencyOnStage(ArrayRef<Operation *> stageOperations,
+                                     Operation *candidate) {
+  if (!candidate)
     return false;
-  SourceStatement lhs = getSourceStatement(left->getLoc());
-  SourceStatement rhs = getSourceStatement(right->getLoc());
-  return lhs && rhs && lhs.file == rhs.file && lhs.line == rhs.line;
+  return llvm::any_of(candidate->getOperands(), [&](Value operand) {
+    Operation *producer = operand.getDefiningOp();
+    if (!producer)
+      return false;
+    return llvm::is_contained(stageOperations,
+                              getPartitionSemanticRoot(producer));
+  });
 }
 
 static llvm::Expected<std::vector<int64_t>>
@@ -2978,8 +2958,6 @@ StageBoundaryAnalysis::analyze(const ProgramStructure &structure,
     stage.localSimtMaterializable = anchorGroup >= 0;
     if (stage.localSimtMaterializable)
       stage.localSimtFactors = {1};
-    const bool startsWithSupportingKind = isSupportingSemanticKind(kind);
-    bool absorbedDominantWithoutSource = false;
 
     size_t next = index + 1;
     while (next < structure.rootOperations.size()) {
@@ -2990,23 +2968,19 @@ StageBoundaryAnalysis::analyze(const ProgramStructure &structure,
           scheduleForSemanticRoot(candidate, candidateKind);
       const bool sameCompoundAnchor =
           anchorGroup >= 0 && candidateAnchorGroup == anchorGroup;
-      const bool sourceLocationsUnavailable =
-          !getSourceStatement(stage.operations.back()->getLoc()) &&
-          !getSourceStatement(candidate->getLoc());
-      // TRITON_DISABLE_LINE_INFO deliberately replaces source locations with
-      // unknown.
-      const bool mergeLocationlessSupportingPrefix =
-          startsWithSupportingKind && !absorbedDominantWithoutSource &&
-          sourceLocationsUnavailable &&
+      // Debug/source locations are deliberately excluded from Stage ownership.
+      // Fold heterogeneous supporting work into a dominant resource Stage only
+      // when the IR itself proves a producer-consumer relationship.
+      const bool mergeStructuralSupportingWork =
+          (isSupportingSemanticKind(kind) ||
+           isSupportingSemanticKind(candidateKind)) &&
           schedule == StageScheduleKind::StraightLine &&
-          candidateSchedule == StageScheduleKind::StraightLine;
+          candidateSchedule == StageScheduleKind::StraightLine &&
+          hasDataDependencyOnStage(stage.operations, candidate);
       const bool mergePlainStage =
           anchorGroup < 0 && candidateAnchorGroup < 0 &&
           ((candidateKind == kind && candidateSchedule == schedule) ||
-           (haveSameSourceStatement(stage.operations.back(), candidate) &&
-            (isSupportingSemanticKind(kind) ||
-             isSupportingSemanticKind(candidateKind))) ||
-           mergeLocationlessSupportingPrefix) &&
+           mergeStructuralSupportingWork) &&
           !hasOrderedStageBoundary(stage.operations.back()) &&
           !hasOrderedStageBoundary(candidate);
       if (!sameCompoundAnchor && !mergePlainStage)
@@ -3022,9 +2996,6 @@ StageBoundaryAnalysis::analyze(const ProgramStructure &structure,
         kind = candidateKind;
         schedule = candidateSchedule;
       }
-      if (mergeLocationlessSupportingPrefix &&
-          !isSupportingSemanticKind(candidateKind))
-        absorbedDominantWithoutSource = true;
       ++next;
     }
     stage.costModelKind = kind;

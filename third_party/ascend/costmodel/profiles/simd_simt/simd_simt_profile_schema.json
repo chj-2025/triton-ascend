@@ -1624,24 +1624,17 @@
       "description": "Cost parameters used by stage formulas. This object contains no online route-admission policy.",
       "required": [
         "description",
-        "source"
+        "source",
+        "tiny_dot_flops_max"
       ],
       "properties": {
         "description": {
           "type": "string",
           "description": "Human-readable role and evidence boundary of the complete calibration object."
         },
-        "program_issue_scale": {
-          "type": "number",
-          "exclusiveMinimum": 0,
-          "description": "Multiplier applied after route-specific payload aggregation; SIMD uses its compute-versus-memory roofline maximum, while SIMT serially sums compute, dot, shuffle, memory, and predicate cycles. Setup cost is not multiplied."
-        },
         "source": {
           "type": "string",
           "description": "Workloads, measurements, and rollout boundary from which the route-specific calibration was derived. It is loaded into profile metadata but currently does not affect scoring or reports."
-        },
-        "simd_structural_penalty_ratio": {
-          "$ref": "#/definitions/simd_structural_penalty"
         },
         "tiny_dot_flops_max": {
           "type": [
@@ -1652,20 +1645,7 @@
           "description": "Tiny-dot formula-domain threshold consumed by the current Stage partitioner; null disables the structural threshold in unsupported profiles."
         }
       },
-      "additionalProperties": false,
-      "anyOf": [
-        {
-          "required": [
-            "tiny_dot_flops_max"
-          ]
-        },
-        {
-          "required": [
-            "program_issue_scale",
-            "simd_structural_penalty_ratio"
-          ]
-        }
-      ]
+      "additionalProperties": false
     },
     "simd_memory": {
       "type": "object",
@@ -2221,104 +2201,6 @@
         "vector_measurement": {
           "type": "string",
           "minLength": 1
-        }
-      },
-      "additionalProperties": false
-    },
-    "simd_structural_penalty": {
-      "type": "object",
-      "description": "Parameters for the additive SIMD-only structural residual ratio. The summed ratio multiplies A_SIMD and is added to A_SIMD; it never references A_SIMT.",
-      "required": [
-        "description",
-        "irregular_per_density",
-        "irregular_cap",
-        "tiny_dot_irregular_per_density",
-        "tiny_dot_irregular_cap",
-        "per_mask_rank",
-        "mask_cap",
-        "per_weighted_reduction",
-        "reduction_cap",
-        "per_static_loop_trip",
-        "loop_cap",
-        "control_flow",
-        "rank1_indirect_vector_reduction",
-        "tiny_dot",
-        "tiny_dot_flops_max"
-      ],
-      "properties": {
-        "description": {
-          "type": "string",
-          "description": "Human-readable meaning of the all-SIMD structural residual model."
-        },
-        "irregular_per_density": {
-          "type": "number",
-          "minimum": 0,
-          "description": "All-SIMD penalty ratio per unit of the current rank-based pointer irregularity proxy outside the tiny-dot special case."
-        },
-        "irregular_cap": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Maximum penalty ratio contributed by the rank-based pointer irregularity proxy outside the tiny-dot special case."
-        },
-        "tiny_dot_irregular_per_density": {
-          "type": "number",
-          "minimum": 0,
-          "description": "All-SIMD penalty ratio per unit of the rank-based pointer irregularity proxy for tiny-dot workloads."
-        },
-        "tiny_dot_irregular_cap": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Maximum penalty ratio contributed by the rank-based pointer irregularity proxy for tiny-dot workloads."
-        },
-        "per_mask_rank": {
-          "type": "number",
-          "minimum": 0,
-          "description": "All-SIMD mask-materialization penalty ratio added per unit of mask_rank_sum."
-        },
-        "mask_cap": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Maximum accumulated mask-materialization penalty ratio."
-        },
-        "per_weighted_reduction": {
-          "type": "number",
-          "minimum": 0,
-          "description": "All-SIMD reduction-lowering penalty ratio per loop-execution-weighted tt.reduce."
-        },
-        "reduction_cap": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Maximum accumulated reduction-lowering penalty ratio."
-        },
-        "per_static_loop_trip": {
-          "type": "number",
-          "minimum": 0,
-          "description": "All-SIMD loop-control penalty ratio per statically known loop trip."
-        },
-        "loop_cap": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Maximum accumulated static-loop-control penalty ratio."
-        },
-        "control_flow": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Fixed all-SIMD structural penalty ratio when control flow is present."
-        },
-        "rank1_indirect_vector_reduction": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Fixed all-SIMD penalty ratio for the rank-1 indirect vector-reduction pattern."
-        },
-        "tiny_dot": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Maximum tiny-dot startup penalty ratio, multiplied by the computed underfill fraction."
-        },
-        "tiny_dot_flops_max": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "FLOP count at which tiny-dot underfill and its startup penalty reach zero."
         }
       },
       "additionalProperties": false

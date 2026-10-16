@@ -11,26 +11,9 @@
   "schema_version": 12,
   "score_unit": "system_cycle_selection_score",
   "selection_calibration": {
-    "description": "Cost parameters used by Stage models. They influence numerical cost only; coverage, confidence, Event validation, and gain-margin admission gates are not part of online route selection.",
-    "program_issue_scale": 8.0,
-    "source": "Stage costs are calibrated from shared microbenchmarks and the same-shape, one-physical-core Ascend950PR_9599 solve_tril CaModel runs. Event data is retained outside the online profile as validation evidence, not as a route multiplier or admission gate.",
-    "simd_structural_penalty_ratio": {
-      "description": "Additive SIMD-only residual ratios for irregular addressing, mask materialization, reductions, loops, control flow, tiny dot, and rank-1 indirect reduction patterns. Their sum multiplies A_SIMD; A_SIMT never participates in the all-SIMD cost.",
-      "irregular_per_density": 0.8,
-      "irregular_cap": 0.5,
-      "tiny_dot_irregular_per_density": 0.24,
-      "tiny_dot_irregular_cap": 0.12,
-      "per_mask_rank": 0.022,
-      "mask_cap": 0.35,
-      "per_weighted_reduction": 0.02,
-      "reduction_cap": 0.15,
-      "per_static_loop_trip": 0.008,
-      "loop_cap": 0.15,
-      "control_flow": 0.03,
-      "rank1_indirect_vector_reduction": 0.75,
-      "tiny_dot": 0.06,
-      "tiny_dot_flops_max": 16384
-    }
+    "description": "Structural formula-domain thresholds consumed by Stage classification; numerical Stage costs come from route-specific resource formulas.",
+    "source": "The tiny-dot threshold selects the bounded Stage formula family; it is not a fitted route multiplier or an online route-admission gate.",
+    "tiny_dot_flops_max": 16384
   },
   "simd": {
     "description": "Inputs used to estimate the all-SIMD candidate: SIMD width, setup, operation, memory, and dot costs.",

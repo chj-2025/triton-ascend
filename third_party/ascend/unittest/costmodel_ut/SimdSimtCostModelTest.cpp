@@ -1337,7 +1337,7 @@ TEST(SimdSimtCostModelTest,
 }
 
 TEST(SimdSimtCostModelTest,
-     SameStatementSupportOperationsJoinTheDominantResourceStage) {
+     SourceLocationsDoNotChangeStructuralStagePartitioning) {
   mlir::MLIRContext context;
   context.getOrLoadDialect<mlir::arith::ArithDialect>();
   context.getOrLoadDialect<mlir::func::FuncDialect>();
@@ -1370,16 +1370,35 @@ TEST(SimdSimtCostModelTest,
 
   mlir::ascend::ProgramStructure structure;
   structure.rootOperations.assign(roots.begin(), roots.end());
-  auto result = mlir::ascend::StageBoundaryAnalysis().analyze(
+  auto withSourceLocations = mlir::ascend::StageBoundaryAnalysis().analyze(
       structure, mlir::ascend::SimtAnchorPlan{});
-  if (!result)
-    FAIL() << llvm::toString(result.takeError());
-  ASSERT_EQ(result->stages.size(), 2u);
-  EXPECT_EQ(result->stages.front().operations.size(), 3u);
-  EXPECT_EQ(result->stages.front().costModelKind,
+  if (!withSourceLocations)
+    FAIL() << llvm::toString(withSourceLocations.takeError());
+
+  for (mlir::Operation *operation : roots)
+    operation->setLoc(mlir::UnknownLoc::get(&context));
+  auto withoutSourceLocations = mlir::ascend::StageBoundaryAnalysis().analyze(
+      structure, mlir::ascend::SimtAnchorPlan{});
+  if (!withoutSourceLocations)
+    FAIL() << llvm::toString(withoutSourceLocations.takeError());
+
+  ASSERT_EQ(withSourceLocations->stages.size(), 2u);
+  ASSERT_EQ(withoutSourceLocations->stages.size(),
+            withSourceLocations->stages.size());
+  for (size_t index = 0; index < withSourceLocations->stages.size(); ++index) {
+    const LogicalStage &withSource = withSourceLocations->stages[index];
+    const LogicalStage &withoutSource = withoutSourceLocations->stages[index];
+    EXPECT_EQ(withoutSource.operations.size(), withSource.operations.size());
+    EXPECT_EQ(withoutSource.costModelKind, withSource.costModelKind);
+    EXPECT_EQ(withoutSource.scheduleKind, withSource.scheduleKind);
+  }
+
+  EXPECT_EQ(withSourceLocations->stages.front().operations.size(), 3u);
+  EXPECT_EQ(withSourceLocations->stages.front().costModelKind,
             StageCostModelKind::ScalarLoad);
-  ASSERT_EQ(result->stages.back().operations.size(), 1u);
-  EXPECT_EQ(result->stages.back().operations.front(), roots.back());
+  ASSERT_EQ(withSourceLocations->stages.back().operations.size(), 1u);
+  EXPECT_EQ(withSourceLocations->stages.back().operations.front(),
+            roots.back());
 }
 
 TEST(SimdSimtCostModelTest,
