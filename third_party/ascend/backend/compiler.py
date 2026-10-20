@@ -49,6 +49,7 @@ from triton.backends.ascend.utils import (
     _check_bishengir_api_change,
     _check_bishengir_able_save_ir,
     _check_bishengir_is_regbased,
+    _check_bishengir_supports_optimized_metaop,
     _enable_print_ub_bits,
     _enable_dump_memory_info,
     _enable_msdebug,
@@ -1930,7 +1931,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
 
-        _compile_option_list += [f"--enable-optimized-metaop={is_cann_version_at_least(9, 2, 0)}"]
+        if _check_bishengir_supports_optimized_metaop():
+            _compile_option_list += [f"--enable-optimized-metaop={is_cann_version_at_least(9, 2, 0)}"]
         _compile_option_list += _custom_core_count_options()
 
         if force_disable_ffts(opt.target_arch):
@@ -2203,7 +2205,8 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
 
-        _compile_option_list += [f"--enable-optimized-metaop=false"]
+        if _check_bishengir_supports_optimized_metaop():
+            _compile_option_list += [f"--enable-optimized-metaop=false"]
 
         if _is_ascend_sanitizer_enabled():
             _compile_option_list += ["--enable-sanitizer=true"]
@@ -2373,6 +2376,7 @@ def _get_libdevice_compile_state(arch: str) -> tuple[bool, bool]:
     )
 
 
+_DEFAULT_COMPILE_MODE = "simd_simt_template"
 _CANONICAL_COMPILE_MODES = ("simd", "simd_simt", "simd_simt_template", "simt_only")
 _COMPILE_MODE_ALIASES = {
     "simt_template": "simd_simt_template",
@@ -2390,6 +2394,16 @@ def _normalize_compile_mode(compile_mode, arch: str) -> str:
     Model, which selects the effective mode per kernel.  Pure-SIMT remains an
     Ascend 950-only explicit compile mode.
     """
+    if compile_mode is None:
+        # TorchNPU's Inductor path forwards None when the kernel config does
+        # not record a compile mode; "unspecified" resolves to the default.
+        compile_mode = _DEFAULT_COMPILE_MODE
+    elif not isinstance(compile_mode, str):
+        # Some TorchNPU builds forward the NPUKernelType enum member instead
+        # of its string value, so unwrap the underlying value when present.
+        enum_value = getattr(compile_mode, "value", None)
+        if isinstance(enum_value, str):
+            compile_mode = enum_value
     if not isinstance(compile_mode, str):
         raise ValueError("compile_mode must be a string; expected one of: " + ", ".join(_CANONICAL_COMPILE_MODES))
 
@@ -2503,7 +2517,7 @@ class NPUOptions:
     simt_optimization_mode: int = 0000000
     # Canonical modes: SIMD (D), SIMD with template-SIMT (P), and pure-SIMT
     # (T). ``unstructured_in_simt`` is an equivalent P spelling.
-    compile_mode: str = "simd_simt_template"
+    compile_mode: str = _DEFAULT_COMPILE_MODE
     # disable simt fma optimization to get high precision
     disable_fma: bool = False
 
@@ -2969,7 +2983,12 @@ class AscendBackend(BaseBackend):
         # The binder runs before parse_options. Normalize its option copy so
         # legacy selectors affect alignment specialization and the cache key.
         normalized = _remove_deprecated_npu_options(options, in_place=True)
-        return normalized.get("compile_mode") == "simt_only"
+        # Only suppress alignment specialization for pure SIMD mode. simd_simt
+        # is a mixed mode whose per-kernel route (SIMT kernels become
+        # simt_only) is decided later inside the compiler pipeline; gating on
+        # the module-level compile_mode would strip tt.divisibility from those
+        # SIMT kernels and regress their memory access.
+        return normalized.get("compile_mode") in ("simt_only", "simd_simt")
 
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)

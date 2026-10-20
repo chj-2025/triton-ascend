@@ -127,6 +127,7 @@ def compiler_module():
             "_check_bishengir_api_change",
             "_check_bishengir_able_save_ir",
             "_check_bishengir_is_regbased",
+            "_check_bishengir_supports_optimized_metaop",
             "_enable_print_ub_bits",
             "_enable_dump_memory_info",
             "_enable_msdebug",

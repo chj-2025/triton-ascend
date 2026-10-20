@@ -65,6 +65,7 @@ SIMD_OPTIONS = [
 
 SIMT_OPTIONS = [
     pytest.param({"compile_mode": "simt_only"}, id="simt-only"),
+    pytest.param({"compile_mode": "simd_simt"}, id="simd-simt"),
     pytest.param({"force_simt_only": True}, id="force-simt-only"),
     pytest.param({"compile_mode": "simd", "force_simt_only": True}, id="force-simt-overrides-mode"),
 ]
@@ -248,4 +249,15 @@ def test_annotated_integer_do_not_specialize_keeps_legacy_cache_key(options, val
     second_key = compute_cache_key(cache, second_specialization, second_options)
 
     assert first_specialization == second_specialization == [("i32", None)]
-    assert first_key == second_key
+    # simd_simt cannot keep this legacy key.  AscendBackend.get_runtime_compile_options
+    # records every non-constexpr integer scalar for the native route model, because
+    # the chosen SIMD/SIMT route is materialized into the binary and a later launch
+    # with another value must not reuse it.  The launch value is therefore part of
+    # the key even for a do_not_specialize parameter, while the pure modes still
+    # collapse to a single value-independent key.
+    if first_options.get("auto_simt_runtime_scalar_values"):
+        assert first_options["auto_simt_runtime_scalar_values"] == ((0, values[0]), )
+        assert second_options["auto_simt_runtime_scalar_values"] == ((0, values[1]), )
+        assert first_key != second_key
+    else:
+        assert first_key == second_key
